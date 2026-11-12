@@ -280,10 +280,10 @@ demoSync.onclick = async () => {
     updateAccountStatus();
   }
 };
-const name = asset => ({SKHYNIX:'SK 海力士', GOOGL:'Google（GOOGL）'})[asset] || asset;
-for (const asset of 'ETH BTC SNDK SOXL KORU MU NVDA SOL SKHYNIX QQQ GOOGL SPCX META TSLA AMZN'.split(' ')) {
+const name = asset => ({SKHYNIX:'SK 海力士', SAMSUNG:'三星电子', GOOGL:'Google（GOOGL）'})[asset] || asset;
+for (const asset of 'ETH BTC SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN'.split(' ')) {
   const label = document.createElement('label');
-  const checkbox = Object.assign(document.createElement('input'), {type:'checkbox', name:'asset', value:asset, checked:true});
+  const checkbox = Object.assign(document.createElement('input'), {type:'checkbox', name:'asset', value:asset, checked:asset !== 'SAMSUNG'});
   label.append(checkbox, ' '+name(asset));
   el('assets').append(label);
 }
