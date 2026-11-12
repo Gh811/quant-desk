@@ -59,6 +59,9 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
 #shadow-summary{margin-top:12px}
 #shadow-metrics-note{color:#52647a}
 @media(max-width:690px){#shadow-metrics{grid-template-columns:repeat(auto-fit,minmax(135px,1fr))}}
+.pnl-controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin:8px 0}
+.pnl-controls select,.pnl-controls input{width:auto;margin:0}
+.pnl-controls label{margin:0}
 </style><main><aside><div class="desk-brand"><strong>Quant Desk</strong><small>币安合约模拟盘</small></div>
 <p id="strategy-status" role="status">正在读取后台策略状态…</p>
 <label for="strategy-mode">策略</label>
@@ -158,6 +161,13 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
 <div class="pnl-analysis" id="pnl-analysis" aria-labelledby="pnl-title">
   <h2 id="pnl-title">盈亏分析</h2>
   <small>模拟盘历史 · 已核对平仓净盈亏（USDT），含手续费和资金费</small>
+  <div class="pnl-controls">
+    <label for="pnl-period">统计周期</label>
+    <select id="pnl-period"><option value="all">全部</option><option value="day">日</option><option value="week">周</option><option value="month">月</option></select>
+    <label for="pnl-date" id="pnl-date-label" hidden>选择日期（北京时间）</label>
+    <input id="pnl-date" type="date" hidden>
+    <strong id="pnl-period-total"></strong>
+  </div>
   <p id="pnl-chart-status" role="status">正在读取盈亏数据…</p>
   <ul id="pnl-chart" class="pnl-chart" aria-label="各标的已实现净盈亏"></ul>
 </div>
@@ -186,20 +196,54 @@ function colorPnL(cell, value) {
   cell.classList.toggle('loss', Number(value) < 0);
 }
 const pnlAmount = new Intl.NumberFormat('zh-CN', {maximumFractionDigits:4, signDisplay:'exceptZero'});
+const pnlPeriod = el('pnl-period');
+const pnlDate = el('pnl-date');
+const dayMs = 86400000;
+pnlDate.value = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
+pnlPeriod.addEventListener('change', showSymbolPnL);
+pnlDate.addEventListener('change', showSymbolPnL);
+function selectedSymbolPnL(snapshot) {
+  if (pnlPeriod.value === 'all') return snapshot?.symbols;
+  if (!snapshot?.symbol_days || !pnlDate.value) return null;
+  const anchor = new Date(pnlDate.value + 'T00:00:00Z');
+  let first = anchor.getTime() / dayMs;
+  let last = first + 1;
+  if (pnlPeriod.value === 'week') {
+    first -= (anchor.getUTCDay() + 6) % 7;
+    last = first + 7;
+  } else if (pnlPeriod.value === 'month') {
+    first = Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth(), 1) / dayMs;
+    last = Date.UTC(anchor.getUTCFullYear(), anchor.getUTCMonth() + 1, 1) / dayMs;
+  }
+  const totals = new Map();
+  for (const [day, symbols] of Object.entries(snapshot.symbol_days)) {
+    if (Number(day) < first || Number(day) >= last) continue;
+    for (const [symbol, net] of Object.entries(symbols)) {
+      totals.set(symbol, (totals.get(symbol) ?? 0) + Number(net));
+    }
+  }
+  return Array.from(totals, ([symbol, net]) => ({symbol, net}))
+    .sort((a, b) => b.net - a.net || a.symbol.localeCompare(b.symbol));
+}
 function showSymbolPnL() {
   const panel = el('pnl-analysis');
   panel.hidden = accountMode.value !== 'demo';
-  const rows = realizedReturnSnapshot?.symbols;
+  pnlDate.hidden = el('pnl-date-label').hidden = pnlPeriod.value === 'all';
+  const rows = selectedSymbolPnL(realizedReturnSnapshot);
+  const total = el('pnl-period-total');
+  const net = rows?.reduce((sum, row) => sum + Number(row.net), 0);
+  total.textContent = net == null ? '' : '净盈亏 ' + pnlAmount.format(net) + ' USDT';
+  colorPnL(total, net);
   const chart = el('pnl-chart');
   const status = el('pnl-chart-status');
-  status.textContent = rows?.length ? '' : rows ? '暂无已核对的平仓记录' : '正在读取盈亏数据…';
+  status.textContent = rows?.length ? '' : rows ? '所选周期暂无已核对的平仓记录' : '暂无所选周期数据';
   status.hidden = Boolean(rows?.length);
   const maxAbs = Math.max(0, ...(rows || []).map(row => Math.abs(Number(row.net))));
   chart.replaceChildren(...(rows || []).map(({symbol, net}) => {
     const value = Number(net);
     const item = document.createElement('li');
     const amount = orderElement('strong', '', pnlAmount.format(value));
-    amount.title = net + ' USDT';
+    amount.title = pnlAmount.format(value) + ' USDT';
     colorPnL(amount, value);
     const positive = orderElement('span', 'pnl-bar-track');
     const negative = orderElement('span', 'pnl-bar-track negative');
