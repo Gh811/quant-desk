@@ -755,12 +755,55 @@ def entry_signal(symbol, strategy, bars=None):
     return bars[-1][0], score, volatility, reason
 
 
+def fast_volatility_setup(bars, direction, volatility):
+    ranges = [max(bar[2]-bar[3], abs(bar[2]-prev[4]), abs(bar[3]-prev[4])) / prev[4]
+              for prev, bar in zip(bars[-24:-1], bars[-23:])]
+    baseline = statistics.median(ranges[:-3])
+    _, opened, high, low, close = bars[-1]
+    wick = min(high-max(opened, close), min(opened, close)-low)
+    stressed = (baseline > 0 and max(ranges[-3:]) >= 2 * baseline
+                or high > low and wick >= .25 * (high-low))
+    if not stressed:
+        return False, None
+    tolerance = float(volatility) / 4
+    for offset in range(len(bars)-2, len(bars)-5, -1):
+        prior = bars[offset-STRATEGY_LOOKBACK['fast']:offset]
+        level = max(bar[2] for bar in prior) if direction > 0 else min(bar[3] for bar in prior)
+        touch = low if direction > 0 else high
+        if (direction * (bars[offset][4]/level - 1) > 0
+                and all(direction * (bar[4]/level - 1) >= 0 for bar in bars[offset+1:])
+                and abs(touch/level - 1) <= tolerance
+                and direction * (close/opened - 1) > 0):
+            return True, level
+    return True, None
+
+
+def fast_structure_stop(entry, direction, extreme, volatility, base_stop, contract_type):
+    invalidation = extreme * (1 - direction * volatility / 4)
+    distance = max(base_stop, direction * (1 - invalidation/entry))
+    maximum = Decimal('.025') if contract_type == 'TRADIFI_PERPETUAL' else Decimal('.015')
+    if distance > maximum:
+        raise ValueError(f'结构止损需 {distance:.2%}，超过 {maximum:.2%} 上限')
+    return distance
+
+
 def scan_entry_signal(symbol, mode, *, venue=DEMO_VENUE):
     base, confirm, backdrop = SIGNAL_TIMEFRAMES[mode]
     now = demo_now_ms() if venue == DEMO_VENUE else time.time_ns() // 1_000_000
     bars, raw = closed_demo_bars(symbol, base, now, 49, venue=venue)
     candle, score, volatility, reason = entry_signal(symbol, mode, bars)
-    if score is None:
+    stressed = False
+    retest = None
+    if mode == 'fast' and 0 < volatility <= STRATEGY_MAX_ATR[mode]:
+        direction = next((side for side in (1, -1) if trend_metrics(bars, side)[0]), None)
+        if direction is not None:
+            stressed, retest = fast_volatility_setup(bars, direction, volatility)
+            if stressed and retest is None:
+                return candle, None, volatility, '波动突增 · 等待突破后回踩确认', {}
+            if retest is not None:
+                score = bars[-1][4]/retest - 1
+                reason = '高波动回踩做多' if direction > 0 else '高波动反抽做空'
+    if score is None or score == 0:
         return candle, None, volatility, reason, {}
 
     signal_at = candle + STRATEGY_INTERVALS[mode]
@@ -792,10 +835,13 @@ def scan_entry_signal(symbol, mode, *, venue=DEMO_VENUE):
         return candle, None, volatility, f'{reason} · 触发幅度过大，避免追价', {}
 
     close = bars[-1][4]
+    structure = bars[-2:] if reason in {'回踩做多', '反抽做空'} else bars[-1:]
+    extreme = min(bar[3] for bar in structure) if direction > 0 else max(bar[2] for bar in structure)
     return candle, score, volatility, reason, dict(
+        stressed=stressed, extreme=Decimal(str(extreme)),
         priority=int(aligned) + min(relative_volume, 2.0) / 2 + side_flow
                  + min(abs(score) / float(volatility), 0.75),
-        close=Decimal(str(close)), boundary=Decimal(str(close / (1 + score))),
+        close=Decimal(str(close)), boundary=Decimal(str(retest if retest is not None else close / (1 + score))),
         detail=f'{confirm} 同向 · {backdrop}{" 同向" if aligned else " 中性"} · '
                f'相对成交量 {relative_volume:.2f}× · 同向主动成交 {side_flow:.0%}')
 
@@ -1215,6 +1261,18 @@ class DemoStrategy:
                         filters = {f['filterType']: f for f in item['filters']}
                         lot = filters['LOT_SIZE']
                         direction = 1 if score > 0 else -1
+                        if mode == 'fast' and symbol in {'BTCUSDT', 'ETHUSDT', 'SOLUSDT'}:
+                            peers = {'BTCUSDT', 'ETHUSDT', 'SOLUSDT'} - {symbol}
+                            same_side = entry_side(direction)
+                            if (any(peer in positions and direction*Decimal(positions[peer]['positionAmt']) > 0
+                                    for peer in peers)
+                                    or any(order['symbol'] in peers and not order.get('reduce_only')
+                                           and order.get('side') in {None, same_side} for order in pending)
+                                    or any(order['symbol'] in peers and not order.get('reduceOnly')
+                                           and order.get('side') == same_side for order in open_orders)):
+                                checks[symbol[:-4]] = '跳过 · BTC / ETH / SOL 已有同向持仓或开仓单'
+                                self.checks = checks.copy()
+                                continue
                         try:
                             funding_window = (max_hold_hours or 1) * HOUR
                             fee, funding_cost = demo_entry_cost(symbol, direction, funding_window)
@@ -1225,7 +1283,8 @@ class DemoStrategy:
                             cost = spread + 2 * fee + funding_cost
                             if direction * (midpoint / signal_context['close'] - 1) > volatility / 2:
                                 raise ValueError('盘口已远离信号收盘价，避免追价')
-                            if direction * (midpoint / signal_context['boundary'] - 1) < -volatility / 4:
+                            tolerance = 0 if signal_context['stressed'] else -volatility / 4
+                            if direction * (midpoint / signal_context['boundary'] - 1) < tolerance:
                                 raise ValueError('价格已反向穿过触发位')
                         except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
                             checks[symbol[:-4]] = f'跳过 · 价格核验未通过：{error}'
@@ -1234,6 +1293,15 @@ class DemoStrategy:
                         step = Decimal(lot['stepSize'])
                         equity = Decimal(account['totalMarginBalance'])
                         stop_loss = entry_stop_fraction(symbol[:-4], mode, volatility)
+                        if mode == 'fast':
+                            try:
+                                stop_loss = fast_structure_stop(
+                                    ask if direction > 0 else bid, direction, signal_context['extreme'],
+                                    volatility, stop_loss, item['contractType'])
+                            except ValueError as error:
+                                checks[symbol[:-4]] = f'跳过 · {error}'
+                                self.checks = checks.copy()
+                                continue
                         if cost > stop_loss * Decimal('.75'):
                             checks[symbol[:-4]] = (f'跳过 · 点差与交易成本过高：预估 {cost:.3%}'
                                                    f' · 上限 {stop_loss * Decimal(".75"):.3%}')
@@ -1320,6 +1388,7 @@ class DemoStrategy:
                         if order['status'] in DEMO_ORDER_PENDING:
                             pending_symbols[symbol] = order['status']
                             occupied.add(symbol)
+                            pending.append(dict(symbol=symbol, side=entry_side(direction)))
                             free_margin = max(Decimal(0), free_margin - notional / leverage_target)
                             checks[symbol[:-4]] = ('限价挂单等待成交' if order['status'] == 'NEW' and time_in_force == 'GTX'
                                                    else f'开仓委托待核对 · {order["status"]}')
@@ -1835,6 +1904,7 @@ def demo_realized_return():
     principal, started_at = baseline if baseline is not None else (None, None)
     pnl = Decimal(0)
     by_symbol = {}
+    by_day = {}
     for order in recent_orders(limit=None):
         if not order.get('reduce_only') or order.get('pnl') is None:
             continue
@@ -1842,6 +1912,10 @@ def demo_realized_return():
         if has_order_fill(order):
             symbol = order['symbol']
             by_symbol[symbol] = by_symbol.get(symbol, Decimal(0)) + value
+            if order.get('closed'):
+                day = (int(order['closed']) + 8 * HOUR) // (24 * HOUR)
+                daily = by_day.setdefault(day, {})
+                daily[symbol] = daily.get(symbol, Decimal(0)) + value
         if baseline is None or int(order.get('closed') or 0) <= started_at:
             continue
         return_pnl = order.get('return_pnl')
@@ -1853,7 +1927,9 @@ def demo_realized_return():
                for symbol, net in sorted(by_symbol.items(), key=lambda item: (-item[1], item[0]))]
     return dict(rate=float(pnl/Decimal(principal)) if baseline is not None else None,
                 principal=principal, started_at=started_at,
-                net=str(pnl) if baseline is not None else None, symbols=symbols)
+                net=str(pnl) if baseline is not None else None, symbols=symbols,
+                symbol_days={day: {symbol: str(value) for symbol, value in totals.items()}
+                             for day, totals in by_day.items()})
 
 
 def journal(kind, payload, *, timeout=5):
