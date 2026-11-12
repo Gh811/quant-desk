@@ -40,7 +40,8 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
 .desk-brand{padding:0 0 16px;margin-bottom:16px;border-bottom:1px solid #ced9e6}
 .desk-brand strong{display:block;font-size:clamp(19px,2vw,24px);line-height:1.2;letter-spacing:-.035em;white-space:nowrap;color:#203450}
 .desk-brand small{display:block;margin-top:6px;color:#52647a;font-size:12px}
-.desk-heading{margin:0 0 20px;padding:0 0 16px;border-bottom:1px solid #d5dfeb}
+.desk-heading{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 16px;margin:0 0 20px;padding:0 0 16px;border-bottom:1px solid #d5dfeb}
+.desk-heading a{color:#174f91;border:1px solid #bacbe0;border-radius:6px;padding:7px 12px;text-decoration:none;background:#f8fafc}
 .desk-heading h1{margin:0;font-size:clamp(22px,2.7vw,32px);letter-spacing:-.035em;line-height:1.2}
 .desk-sizing{margin:12px 0}.desk-sizing label{margin:0 0 4px;font-size:13px;font-weight:600}
 .desk-sizing small{display:block;color:#52647a;font-size:12px;line-height:1.45}
@@ -78,7 +79,7 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
 <button id="strategy-start" type="button" disabled>正在同步状态…</button>
 <button id="strategy-entries" type="button" disabled>停止开新仓</button>
 <button id="strategy-stop" type="button" disabled>停止并平仓</button><form id="config"><h3>允许交易的标的</h3><div id="assets"></div></form></aside>
-<section><header class="desk-heading"><h1>量化交易仪表盘</h1></header>
+<section><header class="desk-heading"><h1>量化交易仪表盘</h1><a href="./backtest" target="_blank" rel="noopener">历史回测 ↗</a></header>
 <div class="account" aria-labelledby="account-title">
   <div class="account-header">
     <h2 id="account-title">账户概览</h2>
@@ -1164,3 +1165,146 @@ setInterval(() => {
   if (!statsPanel.hidden) loadStatistics();
 }, 15000);
 </script></html>
+<!-- backtest-page -->
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>历史回测 · Quant Desk</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#edf2f7;color:#23344b;font:15px system-ui,sans-serif}
+main{max-width:1180px;margin:auto;padding:24px clamp(14px,4vw,40px)}
+a{color:#174f91}h1{font-size:28px;margin:14px 0 20px}h2{font-size:17px}
+form,.panel,details{background:#fff;border:1px solid #d4dfeb;border-radius:10px;padding:16px;margin-bottom:14px}
+form{display:flex;flex-wrap:wrap;gap:12px;align-items:end}label{display:grid;gap:5px;color:#435670}
+input,select,button{font:inherit;padding:7px 9px;border:1px solid #b7c8dc;border-radius:6px;background:#fff;color:#22344b}
+button{background:#1756a9;color:#fff;cursor:pointer}button:disabled{opacity:.6;cursor:wait}
+.scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;white-space:nowrap}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #e2e9f0}th{background:#f0f4f9}
+.gain{color:#08754a}.loss{color:#bb3246}small{color:#52647a}
+canvas{display:block;width:100%;height:240px}.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px}
+summary{cursor:pointer;font-weight:600}details .scroll{margin-top:10px}
+</style>
+<main>
+<a href="./">← 返回交易仪表盘</a>
+<h1>历史回测</h1>
+<form id="backtest">
+  <label>标的<select name="asset" id="asset"></select></label>
+  <label>策略<select name="strategy"><option value="all">比较适用策略</option><option value="fast">5 分钟双向</option><option value="intraday">15 分钟双向</option><option value="swing">1 小时双向</option><option value="us_open">美股双向</option></select></label>
+  <label>历史行情<select name="source"><option value="demo">币安模拟盘</option><option value="live">币安实盘公开行情</option></select></label>
+  <label>开始日期<input type="date" name="start" required></label>
+  <label>结束日期<input type="date" name="end" required></label>
+  <label>事件时间（可选，北京时间）<input type="datetime-local" name="event_at"></label>
+  <button type="submit">运行回测</button>
+</form>
+<p id="status" role="status">日期按北京时间，最多 7 天。每个策略以 10,000 USDT 虚拟本金独立运行。</p>
+<div id="results"></div>
+<details><summary>数据与成交假设</summary>
+  <p>5 分钟策略用 5 分钟找信号、15 分钟确认、1 小时过滤逆势。15 分钟和美股双向用 15 分钟、1 小时、4 小时。1 小时策略用 1 小时、4 小时、日线。信号还用成交量、主动成交占比和波动。</p>
+  <p>信号只看已收盘 K 线。下一分钟开盘价加估算滑点入场，止盈止损用 1 分钟标记价判断，同一根同时碰到两条线时按止损计算。按单边手续费 0.05%、单边滑点 0.03% 和可取得的历史资金费计账。</p>
+  <p>移动止损按 1 分钟收盘近似更新。填写已知事件时间后，前后 15 分钟跳过新的入场信号，已有仓位继续管理。历史盘口排队、动态止盈、组合仓位限制与自动新闻数据尚未接入。结果用于比较规则在相同假设下的表现。</p>
+</details>
+</main>
+<script>
+const form = document.getElementById('backtest');
+const status = document.getElementById('status');
+const results = document.getElementById('results');
+const colors = ['#1c589d','#08756c','#aa6322','#8151a6'];
+const amount = new Intl.NumberFormat('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2});
+const percent = v => v == null ? '—' : (v*100).toFixed(2)+'%';
+const formatTime = t => new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hourCycle:'h23'}).format(t);
+function element(tag, value) {
+  const node = document.createElement(tag);
+  if (value != null) node.textContent = value;
+  return node;
+}
+function table(headings, rows, pnlColumn) {
+  const container = element('div');
+  container.className = 'scroll';
+  const grid = element('table');
+  const head = grid.createTHead().insertRow();
+  headings.forEach(text => head.append(element('th',text)));
+  const body = grid.createTBody();
+  for (const row of rows) {
+    const tr = body.insertRow();
+    row.forEach((value,i) => {
+      const cell = tr.insertCell();
+      cell.textContent = i === pnlColumn ? amount.format(value) : value;
+      if (i === pnlColumn) cell.className = value > 0 ? 'gain' : value < 0 ? 'loss' : '';
+    });
+  }
+  container.append(grid);
+  return container;
+}
+function draw(canvas, data, start, end) {
+  const points = data.flatMap(item => item.curve.map(point => point.equity));
+  const low = Math.min(...points), high = Math.max(...points);
+  const w = canvas.clientWidth, h = canvas.clientHeight, scale = window.devicePixelRatio || 1;
+  if (!w) return;
+  canvas.width=w*scale; canvas.height=h*scale;
+  const ctx=canvas.getContext('2d');
+  ctx.scale(scale,scale);
+  const x=t=>66+(t-start)/(end-start)*(w-82);
+  const y=v=>16+(high-v)/(high-low || 1)*(h-48)+(high===low ? (h-48)/2 : 0);
+  ctx.font='12px system-ui'; ctx.fillStyle='#52647a'; ctx.strokeStyle='#d8e2ed';
+  for (const level of new Set([low, high, (low+high)/2])) {
+    ctx.beginPath(); ctx.moveTo(66,y(level)); ctx.lineTo(w-16,y(level)); ctx.stroke();
+    ctx.fillText(amount.format(level),0,y(level)+4);
+  }
+  ctx.fillText(formatTime(start),66,h-8);
+  ctx.textAlign='right'; ctx.fillText(formatTime(end),w-16,h-8);
+  data.forEach((item,i)=>{
+    ctx.strokeStyle=colors[i];ctx.lineWidth=2;ctx.beginPath();
+    item.curve.forEach((p,j)=>j?ctx.lineTo(x(p.time),y(p.equity)):ctx.moveTo(x(p.time),y(p.equity)));
+    ctx.stroke();
+  });
+}
+let chart;
+function render(data) {
+  results.replaceChildren();
+  const panel=element('div');panel.className='panel';
+  panel.append(element('h2','策略对比'),table(['策略','净盈亏 USDT','收益率','最大回撤','胜率','交易笔数','事件过滤信号'],
+    data.results.map(r=>[r.name,r.net,percent(r.roi),percent(r.drawdown),percent(r.win_rate),r.count,r.event_skips]),1));
+  panel.append(element('h2','估算权益曲线'));
+  const canvas=element('canvas');canvas.setAttribute('aria-label','回测权益随时间变化');
+  const legend=element('div');legend.className='legend';
+  data.results.forEach((r,i)=>{const label=element('small',r.name);label.style.color=colors[i];legend.append(label)});
+  panel.append(canvas,legend);results.append(panel);
+  chart=()=>draw(canvas,data.results,data.start,data.end);
+  chart();
+  for (const r of data.results) {
+    const details=element('details');
+    details.append(element('summary',r.name+' · 成交明细（'+r.count+'）'));
+    if (r.trades.length) details.append(table(['入场','出场','方向','入场价','出场价','净盈亏 USDT','退出原因'],
+      r.trades.map(t=>[formatTime(t.opened),formatTime(t.closed),t.direction>0?'多':'空',t.entry,t.exit,t.net,t.reason]),5));
+    else details.append(element('p','区间内无成交'));
+    results.append(details);
+  }
+}
+const today = new Date(Date.now()+8*3600000).toISOString().slice(0,10);
+const previous = days => new Date(Date.parse(today)-days*86400000).toISOString().slice(0,10);
+form.elements.start.value=previous(3);form.elements.end.value=previous(1);
+form.elements.start.max=today;form.elements.end.max=today;
+for (const symbol of 'ETH BTC SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN'.split(' ')) {
+  const option=element('option',symbol==='SAMSUNG'?'三星电子':symbol);option.value=symbol;
+  form.elements.asset.append(option);
+}
+form.elements.asset.value='BTC';
+window.addEventListener('resize',()=>chart?.());
+form.onsubmit=async event=>{
+  event.preventDefault();
+  const button=form.querySelector('button');button.disabled=true;
+  status.textContent='正在读取历史数据并回测…';
+  try {
+    const response=await fetch('./backtest/results?'+new URLSearchParams(new FormData(form)),{signal:AbortSignal.timeout(55000)});
+    const data=await response.json();
+    if (!response.ok) throw Error(data.error || 'HTTP '+response.status);
+    render(data);
+    status.textContent=data.asset+'USDT · '+data.venue+' · '+formatTime(data.start)+' 至 '+formatTime(data.end)+
+      '（北京时间） · 资金费记录 '+data.funding_samples+' 条';
+  } catch(error) {
+    status.textContent='回测失败：'+error.message;
+  } finally {
+    button.disabled=false;
+  }
+};
+</script></html>
+
