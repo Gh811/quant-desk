@@ -131,6 +131,7 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
     <div class="card">当前估算权益<strong id="shadow-equity">—</strong></div>
   </div>
   <small id="shadow-metrics-note">初始资金取币安模拟盘的起算本金。</small>
+  <p id="shadow-missed" role="status" hidden></p>
   <div id="shadow-summary" class="order-grid"></div>
   <details><summary>虚拟成交和未成交记录</summary><div id="shadow-records" class="decision-list"></div></details>
 </div>
@@ -1006,6 +1007,11 @@ function renderShadow() {
     return card;
   });
   el('shadow-summary').replaceChildren(...holdings);
+  const missed = el('shadow-missed');
+  const latestMiss = state.notes[0];
+  missed.hidden = !latestMiss;
+  missed.textContent = latestMiss ? '最近未跟随 · ' + date(latestMiss.time) + ' · ' +
+    latestMiss.symbol + ' · ' + latestMiss.text : '';
   const checks = state.notes.map(note => orderElement('p', '', date(note.time) + ' · ' + note.symbol + ' · ' + note.text));
   const trades = state.trades.map(t => {
     const item = orderElement('article', 'decision-item');
