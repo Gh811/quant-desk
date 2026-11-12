@@ -37,14 +37,30 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
 .pnl-bar-track.negative{align-items:start;border-top:1px solid #a8b7c9}
 .pnl-bar{width:42%;border-radius:4px 4px 0 0;background:#198554}
 .pnl-bar-track.negative .pnl-bar{border-radius:0 0 4px 4px;background:#c44855}
-</style><main><aside><h1>Quant Desk</h1><small>币安合约模拟盘</small>
+.desk-brand{padding:0 0 16px;margin-bottom:16px;border-bottom:1px solid #ced9e6}
+.desk-brand strong{display:block;font-size:clamp(19px,2vw,24px);line-height:1.2;letter-spacing:-.035em;white-space:nowrap;color:#203450}
+.desk-brand small{display:block;margin-top:6px;color:#52647a;font-size:12px}
+.desk-heading{margin:0 0 20px;padding:0 0 16px;border-bottom:1px solid #d5dfeb}
+.desk-heading h1{margin:0;font-size:clamp(22px,2.7vw,32px);letter-spacing:-.035em;line-height:1.2}
+.desk-sizing{margin:12px 0}.desk-sizing label{margin:0 0 4px;font-size:13px;font-weight:600}
+.desk-sizing small{display:block;color:#52647a;font-size:12px;line-height:1.45}
+</style><main><aside><div class="desk-brand"><strong>Quant Desk</strong><small>币安合约模拟盘</small></div>
 <p id="strategy-status" role="status">正在读取后台策略状态…</p>
 <label for="strategy-mode">策略</label>
 <select id="strategy-mode" disabled><option value="swing">1 小时双向</option><option value="intraday">15 分钟双向</option><option value="fast">5 分钟双向</option><option value="us_open">美股双向测试</option></select>
+<div class="desk-sizing">
+  <label for="strategy-sizing">单笔仓位</label>
+  <select id="strategy-sizing" disabled><option value="capital">按账户本金计算</option><option value="fixed">固定 USDT 名义仓位</option></select>
+  <div id="strategy-notional-field" hidden>
+    <label for="strategy-notional">单笔目标金额（USDT）</label>
+    <input id="strategy-notional" type="number" min="0.01" max="1000000000" step="0.01" inputmode="decimal" placeholder="例如 100" disabled>
+    <small>名义金额包含杠杆，实际下单仍受保证金和风险上限约束。</small>
+  </div>
+</div>
 <button id="strategy-start" type="button" disabled>正在同步状态…</button>
 <button id="strategy-entries" type="button" disabled>停止开新仓</button>
 <button id="strategy-stop" type="button" disabled>停止并平仓</button><form id="config"><h3>允许交易的标的</h3><div id="assets"></div></form></aside>
-<section><h1>量化交易仪表盘</h1>
+<section><header class="desk-heading"><h1>量化交易仪表盘</h1></header>
 <div class="account" aria-labelledby="account-title">
   <div class="account-header">
     <h2 id="account-title">账户概览</h2>
@@ -255,6 +271,10 @@ function writeSaved(key, value) {
 const config = el('config');
 const preferences = readSaved('config');
 const strategyMode = el('strategy-mode');
+const strategySizing = el('strategy-sizing');
+const strategyNotional = el('strategy-notional');
+strategySizing.value = preferences?.sizing === 'fixed' ? 'fixed' : 'capital';
+strategyNotional.value = preferences?.notional ?? '';
 const strategyNames = Object.fromEntries([...strategyMode.options].map(option => [option.value, option.textContent]));
 if (Object.hasOwn(strategyNames, preferences?.strategy)) strategyMode.value = preferences.strategy;
 if (Array.isArray(preferences?.assets)) {
@@ -263,10 +283,16 @@ if (Array.isArray(preferences?.assets)) {
   }
 }
 function savePreferences() {
-  writeSaved('config', {assets:new FormData(config).getAll('asset'), strategy:strategyMode.value});
+  writeSaved('config', {assets:new FormData(config).getAll('asset'), strategy:strategyMode.value,
+    sizing:strategySizing.value, notional:strategyNotional.value});
 }
 config.addEventListener('change', savePreferences);
 strategyMode.addEventListener('change', savePreferences);
+strategySizing.addEventListener('change', () => {
+  savePreferences();
+  renderStrategyControls();
+});
+strategyNotional.addEventListener('input', savePreferences);
 function orderElement(tag, className, text) {
   return Object.assign(document.createElement(tag), {className, textContent:text || ''});
 }
@@ -721,6 +747,9 @@ function renderStrategyControls() {
   const blocked = Boolean(strategyState?.switch_blocked);
   const locked = !strategyState || running || stopping || blocked || strategyAction !== null;
   strategyMode.disabled = locked;
+  strategySizing.disabled = locked;
+  el('strategy-notional-field').hidden = strategySizing.value !== 'fixed';
+  strategyNotional.disabled = locked || strategySizing.value !== 'fixed';
   start.disabled = locked;
   start.dataset.running = String(running && !stopping);
   if (stopping) start.textContent = '正在停止策略…';
@@ -813,7 +842,11 @@ async function refreshStrategyStatus() {
       : state.checked_at
         ? '最近一轮 ' + date(state.checked_at) + ' · 耗时 ' + (state.scan_ms/1000).toFixed(1) + ' 秒'
         : '';
-    if (state.running || state.switch_blocked) strategyMode.value = state.mode;
+    if (state.running || state.switch_blocked) {
+      strategyMode.value = state.mode;
+      strategySizing.value = state.fixed_notional == null ? 'capital' : 'fixed';
+      if (state.fixed_notional != null) strategyNotional.value = state.fixed_notional;
+    }
     if (state.running && Array.isArray(state.assets)) {
       let selectionChanged = false;
       for (const checkbox of config.querySelectorAll('[name=asset]')) {
@@ -840,6 +873,17 @@ for (const control of ['start','stop','entries']) {
     if (action === 'stop' && !confirm('停止后台策略并平掉币安模拟盘的所有单向持仓？')) return;
     const params = new URLSearchParams(new FormData(config));
     params.set('strategy', strategyMode.value);
+    if (action === 'start') {
+      params.set('sizing', strategySizing.value);
+      if (strategySizing.value === 'fixed') {
+        if (!strategyNotional.value || !strategyNotional.checkValidity()) {
+          el('strategy-status').textContent = '请输入有效的单笔目标金额（USDT）';
+          strategyNotional.focus();
+          return;
+        }
+        params.set('notional', strategyNotional.value);
+      }
+    }
     strategyAction = action;
     renderStrategyControls();
     let actionError;
