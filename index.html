@@ -45,10 +45,20 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
 .desk-sizing{margin:12px 0}.desk-sizing label{margin:0 0 4px;font-size:13px;font-weight:600}
 .desk-sizing small{display:block;color:#52647a;font-size:12px;line-height:1.45}
 .shadow-panel{border:1px solid #d5dfeb;border-radius:9px;background:#f8fafc;padding:10px 14px;margin-bottom:16px}
-#shadow-metrics{margin:12px 0}
+#shadow-panel{padding:16px 18px}
+.shadow-header{display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px 16px}
+.shadow-header h2{margin:0 0 4px;font-size:17px}
+.shadow-header p{margin:0;color:#52647a;font-size:13px}
+.shadow-actions{display:flex;gap:8px;flex-wrap:wrap}
+#shadow-metrics{grid-template-columns:repeat(3,minmax(0,1fr));margin:14px 0 10px}
 #shadow-metrics .card{background:#eaf0f8}
-#shadow-metrics .card strong{white-space:normal}
-@media(max-width:690px){#shadow-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
+#shadow-metrics .card strong{white-space:normal;font-variant-numeric:tabular-nums}
+#shadow-metrics .card:nth-child(2){background:#e8f2ee}
+.shadow-balances{display:flex;flex-wrap:wrap;gap:6px 20px;margin:0 0 8px;font-size:13px}
+.shadow-balances strong{margin-left:6px;font-variant-numeric:tabular-nums}
+#shadow-summary{margin-top:12px}
+#shadow-metrics-note{color:#52647a}
+@media(max-width:690px){#shadow-metrics{grid-template-columns:repeat(auto-fit,minmax(135px,1fr))}}
 </style><main><aside><div class="desk-brand"><strong>Quant Desk</strong><small>币安合约模拟盘</small></div>
 <p id="strategy-status" role="status">正在读取后台策略状态…</p>
 <label for="strategy-mode">策略</label>
@@ -120,17 +130,26 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
   <nav id="runtime-pages" class="pagination" aria-label="运行日志分页" hidden></nav>
 </div>
 <div id="shadow-panel" class="shadow-panel" hidden>
-  <button id="shadow-start" class="compact-button" type="button" disabled>开启跟随</button>
-  <button id="shadow-pause" class="compact-button" type="button" disabled>关闭跟随</button>
-  <p id="shadow-status" role="status">正在读取跟随状态…</p>
-  <small>跟随模拟盘的成交和保护价，用实盘盘口估算成交。单边手续费估算 0.05%。</small>
-  <div id="shadow-metrics" class="account-metrics">
-    <div class="card">初始资金<strong id="shadow-principal">—</strong></div>
-    <div class="card">已实现净盈亏<strong id="shadow-realized">—</strong></div>
-    <div class="card">持仓浮盈亏<strong id="shadow-floating">—</strong></div>
-    <div class="card">当前估算权益<strong id="shadow-equity">—</strong></div>
+  <div class="shadow-header">
+    <div>
+      <h2>实盘行情跟随</h2>
+      <p id="shadow-status" role="status">正在读取跟随状态…</p>
+    </div>
+    <div class="shadow-actions">
+      <button id="shadow-start" class="compact-button" type="button" disabled>开启跟随</button>
+      <button id="shadow-pause" class="compact-button" type="button" disabled>关闭跟随</button>
+    </div>
   </div>
-  <small id="shadow-metrics-note">初始资金取币安模拟盘的起算本金。</small>
+  <div id="shadow-metrics" class="account-metrics">
+    <div class="card">初始本金<strong id="shadow-principal">—</strong></div>
+    <div class="card">累计虚拟净盈亏<strong id="shadow-realized">—</strong></div>
+    <div class="card">累计已实现收益率<strong id="shadow-return">—</strong></div>
+  </div>
+  <div class="shadow-balances">
+    <span>持仓浮盈亏<strong id="shadow-floating">—</strong></span>
+    <span>当前估算权益<strong id="shadow-equity">—</strong></span>
+  </div>
+  <small id="shadow-metrics-note">本金沿用模拟盘起算本金，收益率按已实现净盈亏计算。</small>
   <p id="shadow-missed" role="status" hidden></p>
   <div id="shadow-summary" class="order-grid"></div>
   <details><summary>虚拟成交和未成交记录</summary><div id="shadow-records" class="decision-list"></div></details>
@@ -964,6 +983,7 @@ setInterval(loadOrders, 10000);
 let shadowRequest = false;
 let shadowAction = false;
 let shadowState;
+const shadowPercent = new Intl.NumberFormat('zh-CN', {style:'percent', minimumFractionDigits:2, maximumFractionDigits:2, signDisplay:'exceptZero'});
 function renderShadow() {
   const status = el('shadow-status');
   const state = shadowState;
@@ -978,6 +998,10 @@ function renderShadow() {
   const baseline = realizedReturnSnapshot?.principal;
   const principal = baseline == null ? null : Number(baseline);
   const realized = Number(state.realized);
+  const rate = principal > 0 && Number.isFinite(principal) ? realized / principal : null;
+  const returnField = el('shadow-return');
+  returnField.textContent = Number.isFinite(rate) ? shadowPercent.format(rate) : '—';
+  colorPnL(returnField, rate);
   const open = state.positions.filter(position => !position.closed);
   const floating = open.some(position => position.floating == null)
     ? null : open.reduce((sum, position) => sum + Number(position.floating), 0);
@@ -995,8 +1019,8 @@ function renderShadow() {
     if (signed) colorPnL(field, value);
   }
   el('shadow-metrics-note').textContent = pending
-    ? '有平仓尚未核对，当前权益待更新。'
-    : '初始资金取币安模拟盘的起算本金。估算权益 = 初始资金 + 已实现净盈亏 + 持仓浮盈亏。';
+    ? '有平仓尚未核对，当前权益待更新。收益率仅统计已结算的虚拟交易。'
+    : '本金沿用模拟盘起算本金。收益率 = 累计虚拟净盈亏 ÷ 初始本金。单边手续费估算 0.05%。';
   const holdings = state.positions.map(p => {
     const card = orderElement('article', 'order-card');
     card.append(orderElement('strong', '', p.symbol + ' · ' + (p.direction > 0 ? '虚拟多仓' : '虚拟空仓')),
