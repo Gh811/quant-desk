@@ -7,7 +7,6 @@ import threading
 import sys
 import sqlite3
 from contextlib import closing
-from datetime import datetime
 import uuid
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 import statistics
@@ -19,17 +18,9 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import Request, urlopen
-from zoneinfo import ZoneInfo
 
 ASSETS = 'ETH BTC SNDK SOXL KORU MU NVDA SOL SKHYNIX QQQ GOOGL SPCX META TSLA AMZN'.split()
 US_EQUITY_ASSETS = set('SNDK SOXL KORU MU NVDA QQQ GOOGL SPCX META TSLA AMZN'.split())
-NEW_YORK = ZoneInfo('America/New_York')
-US_MARKET_HOLIDAYS = {
-    2026: {101, 119, 216, 403, 525, 619, 703, 907, 1126, 1225},
-    2027: {101, 118, 215, 326, 531, 618, 705, 906, 1125, 1224},
-    2028: {117, 221, 414, 529, 619, 704, 904, 1123, 1225},
-}
-US_MARKET_EARLY_CLOSE = {2026: {1127, 1224}, 2027: {1126}, 2028: {703, 1124}}
 HOSTS = {'OKX': 'https://openapi.okx.com', 'Binance': 'https://fapi.binance.com'}
 DEMO_VENUE = 'Binance 模拟盘'
 HOSTS[DEMO_VENUE] = 'https://demo-fapi.binance.com'
@@ -666,7 +657,7 @@ STRATEGY_NAMES = {
     'swing': '中长线 · 1 小时双向突破与回踩',
     'intraday': '短线 · 15 分钟双向突破与回踩',
     'fast': '短线 · 5 分钟双向突破与回踩',
-    'us_open': '美股开盘测试',
+    'us_open': '美股双向测试',
 }
 SIGNAL_TIMEFRAMES = {
     'fast': ('5m', '15m', '1h'),
@@ -681,27 +672,6 @@ STRATEGY_MAX_ATR = {'fast': Decimal('.008'), 'intraday': Decimal('.012'), 'swing
                     'us_open': Decimal('.015')}
 ENTRY_EQUITY_RISK = {'fast': Decimal('.005'), 'intraday': Decimal('.0065'), 'swing': Decimal('.0075'),
                      'us_open': Decimal('.004')}
-
-
-def entry_session_block(asset, mode, now, order_window=0):
-    if mode == 'us_open' and asset not in US_EQUITY_ASSETS:
-        return '此策略仅测试美股和美股 ETF'
-    if asset not in US_EQUITY_ASSETS or mode not in {'fast', 'us_open'}:
-        return None
-    eastern = datetime.fromtimestamp(now / 1000, NEW_YORK)
-    day = eastern.month * 100 + eastern.day
-    if eastern.year not in US_MARKET_HOLIDAYS:
-        return '美股休市日历待更新'
-    if eastern.weekday() >= 5 or day in US_MARKET_HOLIDAYS[eastern.year]:
-        return '美股休市，暂停新开仓'
-    start = eastern.replace(hour=10, minute=0, second=0, microsecond=0)
-    close_hour = 13 if day in US_MARKET_EARLY_CLOSE[eastern.year] else 16
-    end = eastern.replace(hour=11 if mode == 'us_open' else close_hour-1,
-                          minute=0 if mode == 'us_open' else 50, second=0, microsecond=0)
-    if not start <= eastern or now + order_window >= end.timestamp() * 1000:
-        return ('等待美东时间 10:00–11:00 开仓窗口' if mode == 'us_open'
-                else '美股盘前、开盘前 30 分钟或临近收盘，暂停新开仓')
-    return None
 
 
 def entry_stop_fraction(asset, mode, volatility):
@@ -1152,7 +1122,6 @@ class DemoStrategy:
                             prepare_at_start = False
                             self.status = '正在检查行情与入场信号'
                         jobs = {}
-                        scan_time = demo_now_ms()
                         for asset in sorted(assets):
                             symbol = asset + 'USDT'
                             item = listed.get(symbol)
@@ -1166,8 +1135,6 @@ class DemoStrategy:
                             elif (item['status'] != 'TRADING' or item['contractType'] not in
                                   {'PERPETUAL', 'TRADIFI_PERPETUAL'}):
                                 checks[asset] = '模拟盘合约当前不可交易'
-                            elif (session_block := entry_session_block(asset, mode, scan_time)):
-                                checks[asset] = session_block
                             else:
                                 checks[asset] = '正在读取行情'
                                 jobs[pool.submit(scan_entry_signal, symbol, mode)] = (asset, item)
@@ -1275,10 +1242,6 @@ class DemoStrategy:
                             self.checks = checks.copy()
                             continue
                         order_window = ENTRY_WAIT_SECONDS[mode] * 1000 if time_in_force == 'GTX' else 0
-                        if (session_block := entry_session_block(symbol[:-4], mode, now, order_window)):
-                            checks[symbol[:-4]] = f'跳过 · {session_block}'
-                            self.checks = checks.copy()
-                            continue
                         if not 0 <= now - signal_at < STRATEGY_INTERVALS[mode] - order_window:
                             checks[symbol[:-4]] = '跳过 · 信号即将过期，等待下一根已收盘 K 线'
                             self.checks = checks.copy()
