@@ -913,6 +913,7 @@ class DemoStrategy:
         self.wake = threading.Event()
         self.status = '未启动'
         self.mode = 'swing'
+        self.fixed_notional = None
         self.assets = []
         self.checks = {}
         self.checked_at = None
@@ -945,7 +946,7 @@ class DemoStrategy:
             finally:
                 self.draining = False
 
-    def run(self, assets, mode):
+    def run(self, assets, mode, fixed_notional=None):
         short_term = mode != 'swing'
         max_positions = self.FAST_MAX_POSITIONS if mode == 'fast' else self.MAX_POSITIONS
         max_hold_hours = {'intraday': 4, 'swing': 48, 'us_open': 1.5}.get(mode)
@@ -1240,8 +1241,11 @@ class DemoStrategy:
                         margin_budget = free_margin * Decimal('.95') / (max_positions - len(occupied))
                         budget = max(Decimal(0), min((equity if short_term else 3 * equity), leverage_target * margin_budget))
                         risk_budget = equity * ENTRY_EQUITY_RISK[mode] / (stop_loss + cost)
+                        budget = min(budget, risk_budget)
+                        if fixed_notional is not None:
+                            budget = min(budget, fixed_notional)
                         price, amount, time_in_force = select_demo_entry(
-                            direction, book, bid, ask, min(budget, risk_budget), step, stop_loss, cost)
+                            direction, book, bid, ask, budget, step, stop_loss, cost)
                         attempt = (candle, direction, demo_now_ms(), price, time_in_force, cost)
                         retry_block = entry_retry_block(entry_attempts.get(symbol), attempt,
                                                         ENTRY_RETRY_COOLDOWN_SECONDS[mode])
@@ -1298,6 +1302,8 @@ class DemoStrategy:
                         detail = f'{execution} · 信号幅度 {abs(score):.3%} · ATR {volatility:.3%} · 计划止损 {stop_loss:.3%}'
                         detail += (f' · {signal_context["detail"]} · 点差 {spread:.3%} · '
                                    f'预估双边手续费 {2 * fee:.3%} · 下一次不利资金费 {funding_cost:.3%}')
+                        if fixed_notional is not None:
+                            detail += f' · 目标仓位 {fixed_notional:f} USDT · 本单名义金额 {notional:.2f} USDT'
                         if time_in_force == 'GTX':
                             maker_reason = '吃单成本偏高' if cost > stop_loss / 2 else '对手盘一档数量不足'
                             detail += f' · {maker_reason}，改为限价挂单'
@@ -1671,6 +1677,20 @@ class Handler(BaseHTTPRequestHandler):
             if mode not in STRATEGY_NAMES:
                 self.send(400, 'application/json', '{"error":"未知策略"}'.encode())
                 return
+            sizing = params.get('sizing', ['capital'])[0]
+            fixed_notional = None
+            try:
+                if sizing == 'fixed':
+                    fixed_notional = Decimal(params.get('notional', [''])[0])
+                    if (not fixed_notional.is_finite() or not Decimal('.01') <= fixed_notional <= Decimal('1000000000')
+                            or fixed_notional != fixed_notional.quantize(Decimal('.01'))):
+                        raise ValueError('固定名义金额无效')
+                    fixed_notional = fixed_notional.quantize(Decimal('.01'))
+                elif sizing != 'capital':
+                    raise ValueError('未知仓位模式')
+            except (ValueError, InvalidOperation):
+                self.send(400, 'application/json', json.dumps({'error': '请选择仓位模式并输入有效的固定名义金额'}).encode())
+                return
             if mode == 'us_open':
                 assets &= US_EQUITY_ASSETS
             with strategy.control:
@@ -1681,12 +1701,13 @@ class Handler(BaseHTTPRequestHandler):
                 strategy.entries_paused.clear()
                 strategy.wake.clear()
                 strategy.mode = mode
+                strategy.fixed_notional = fixed_notional
                 strategy.assets = sorted(assets)
                 strategy.checks = {}
                 strategy.checked_at = None
                 strategy.scan_ms = None
                 strategy.status = '正在核对模拟账户'
-                threading.Thread(target=strategy.run, args=(assets, mode), daemon=True).start()
+                threading.Thread(target=strategy.run, args=(assets, mode, fixed_notional), daemon=True).start()
         else:
             self.send(404, 'text/plain', b'Not found')
             return
@@ -1721,6 +1742,8 @@ class Handler(BaseHTTPRequestHandler):
                                                                     running=self.server.strategy.lock.locked() or self.server.strategy.draining,
                                                                     draining=self.server.strategy.draining, assets=self.server.strategy.assets,
                                                                     entries_paused=self.server.strategy.entries_paused.is_set(),
+                                                                    fixed_notional=(str(self.server.strategy.fixed_notional)
+                                                                                    if self.server.strategy.fixed_notional is not None else None),
                                                                     switch_blocked=self.server.strategy.switch_blocked,
                                                                     checks=self.server.strategy.checks,
                                                                     checked_at=self.server.strategy.checked_at,
