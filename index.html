@@ -156,7 +156,7 @@ demoSync.onclick = async () => {
   demoSync.disabled = true;
   updateAccountStatus();
   try {
-    const response = await fetch('/account/binance-demo', {cache:'no-store', signal:AbortSignal.timeout(18000)});
+    const response = await fetch('./account/binance-demo', {cache:'no-store', signal:AbortSignal.timeout(18000)});
     const data = await response.json();
     if (!response.ok) throw Error(data.error);
     accountSnapshot = {...data, syncedAt: Date.now()};
@@ -374,7 +374,7 @@ async function updateProtection(symbol, kind, current) {
   renderOrderCards();
   try {
     const params = new URLSearchParams({symbol, kind, price:input.trim()});
-    const response = await fetch('/strategy/protection?' + params, {
+    const response = await fetch('./strategy/protection?' + params, {
       method:'POST', headers:{'X-Quant-Demo':'strategy'}
     });
     const result = await response.json();
@@ -419,7 +419,7 @@ function protectionPanel(position, snapshot) {
 }
 async function loadStatistics() {
   try {
-    const response = await fetch('/account/demo-statistics');
+    const response = await fetch('./account/demo-statistics');
     const rows = await response.json();
     if (!response.ok) throw Error(rows.error);
     const cards = rows.map(stat => {
@@ -497,7 +497,7 @@ let renderedHistory;
 async function loadHistory(page) {
   if (page == null && historyRequest) return;
   const requestedPage = page ?? el('history-pages').dataset.page ?? 1;
-  const request = fetch('/account/demo-history?page=' + requestedPage, {signal:AbortSignal.timeout(6000)});
+  const request = fetch('./account/demo-history?page=' + requestedPage, {signal:AbortSignal.timeout(6000)});
   historyRequest = request;
   const status = el('order-status');
   try {
@@ -575,7 +575,7 @@ async function loadRuntimeLogs() {
   runtimeRequestPending = true;
   const status = el('runtime-status');
   try {
-    const response = await fetch('/strategy/logs', {cache:'no-store', signal:AbortSignal.timeout(6000)});
+    const response = await fetch('./strategy/logs', {cache:'no-store', signal:AbortSignal.timeout(6000)});
     if (!response.ok) throw Error('HTTP ' + response.status);
     const events = await response.json();
     const signature = JSON.stringify(events);
@@ -593,13 +593,13 @@ async function loadRuntimeLogs() {
 }
 async function loadOrders() {
   try {
-    const response = await fetch('/account/demo-orders');
+    const response = await fetch('./account/demo-orders');
     const orders = await response.json();
     if (!response.ok) throw Error(orders.error);
     latestOrders = orders;
     renderOrderCards();
     if (!el('decisions-panel').hidden) renderDecisions();
-    const returns = await fetch('/account/demo-realized-return');
+    const returns = await fetch('./account/demo-realized-return');
     if (returns.ok) {
       realizedReturnSnapshot = await returns.json();
       showRealizedReturn();
@@ -693,7 +693,7 @@ function strategyStatus() {
 }
 async function refreshStrategyStatus() {
   try {
-    const response = await fetch('/strategy', {cache:'no-store', signal:AbortSignal.timeout(6000)});
+    const response = await fetch('./strategy', {cache:'no-store', signal:AbortSignal.timeout(6000)});
     if (!response.ok) throw Error('HTTP ' + response.status);
     const state = await response.json();
     strategyChecks = state.checks || {};
@@ -745,7 +745,7 @@ for (const action of ['start','stop']) {
     renderStrategyControls();
     let actionError;
     try {
-      const response = await fetch('/strategy/' + action + '?' + params, {
+      const response = await fetch('./strategy/' + action + '?' + params, {
         method:'POST', headers:{'X-Quant-Demo':'strategy'}, signal:AbortSignal.timeout(6000)
       });
       if (!response.ok) throw Error((await response.json()).error);
@@ -778,7 +778,7 @@ function renderMarketRows() {
 config.addEventListener('change', renderMarketRows);
 async function loadMarketStatus() {
   try {
-    const response = await fetch('/strategy/markets');
+    const response = await fetch('./strategy/markets');
     const markets = await response.json();
     if (!response.ok) throw Error(markets.error);
     marketCatalog = markets;
