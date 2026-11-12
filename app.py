@@ -1501,19 +1501,28 @@ def demo_return_baseline(wallet_balance=None):
 
 def demo_realized_return():
     baseline = demo_return_baseline()
-    if baseline is None:
-        return dict(rate=None, principal=None, started_at=None, net=None)
-    principal, started_at = baseline
+    principal, started_at = baseline if baseline is not None else (None, None)
     pnl = Decimal(0)
+    by_symbol = {}
     for order in recent_orders(limit=None):
-        if not order.get('reduce_only') or order.get('pnl') is None or int(order.get('closed') or 0) <= started_at:
+        if not order.get('reduce_only') or order.get('pnl') is None:
             continue
-        value = order.get('return_pnl')
-        if value is not None:
-            pnl += Decimal(value)
+        value = Decimal(order['pnl'])
+        if has_order_fill(order):
+            symbol = order['symbol']
+            by_symbol[symbol] = by_symbol.get(symbol, Decimal(0)) + value
+        if baseline is None or int(order.get('closed') or 0) <= started_at:
+            continue
+        return_pnl = order.get('return_pnl')
+        if return_pnl is not None:
+            pnl += Decimal(return_pnl)
         elif int(order.get('opened') or 0) >= started_at:
-            pnl += Decimal(order['pnl'])
-    return dict(rate=float(pnl/Decimal(principal)), principal=principal, started_at=started_at, net=str(pnl))
+            pnl += value
+    symbols = [dict(symbol=symbol, net=str(net))
+               for symbol, net in sorted(by_symbol.items(), key=lambda item: (-item[1], item[0]))]
+    return dict(rate=float(pnl/Decimal(principal)) if baseline is not None else None,
+                principal=principal, started_at=started_at,
+                net=str(pnl) if baseline is not None else None, symbols=symbols)
 
 
 def journal(kind, payload, *, timeout=5):
