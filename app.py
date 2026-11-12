@@ -42,6 +42,7 @@ TRADIFI_QUOTE_MAX_AGE_MS = 30_000
 TRADIFI_QUOTE_MAX_DEVIATION = Decimal('.03')
 ENTRY_WAIT_SECONDS = {'fast': 60, 'intraday': 90, 'swing': 120, 'us_open': 60}
 ENTRY_QUOTE_MAX_AGE_MS = 5_000
+ENTRY_RETRY_COOLDOWN_SECONDS = {'fast': 20, 'intraday': 30, 'swing': 60, 'us_open': 30}
 demo_clock_lock = threading.Lock()
 demo_clock_sample = None
 
@@ -146,6 +147,21 @@ def select_demo_entry(direction, book, bid, ask, budget, step, stop_loss, cost):
         return price, amount, 'IOC'
     price = bid if direction > 0 else ask
     return price, (budget / price // step) * step, 'GTX'
+
+
+def entry_retry_block(previous, current, cooldown_seconds):
+    if previous is None or previous[:2] != current[:2]:
+        return None
+    _, direction, now, price, time_in_force, cost = current
+    _, _, last_at, last_price, last_time_in_force, last_cost = previous
+    if now - last_at < cooldown_seconds * 1000:
+        return '短暂冷却，之后继续复查盘口'
+    if direction * (price - last_price) > 0:
+        return '价格较上次委托不利，等待更合适的盘口'
+    if (price == last_price and not (last_time_in_force == 'GTX' and time_in_force == 'IOC')
+            and cost >= last_cost * Decimal('.9')):
+        return '同价委托已尝试，等待成交条件改善'
+    return None
 
 
 def demo_entry_cost(symbol, direction, funding_window):
@@ -748,14 +764,12 @@ def entry_signal(symbol, strategy, bars=None):
     return bars[-1][0], score, volatility, reason
 
 
-def scan_entry_signal(symbol, mode, handled_candle=None):
+def scan_entry_signal(symbol, mode):
     base, confirm, backdrop = SIGNAL_TIMEFRAMES[mode]
     bars, raw = closed_demo_bars(symbol, base, demo_now_ms(), 49)
     candle, score, volatility, reason = entry_signal(symbol, mode, bars)
     if score is None:
         return candle, None, volatility, reason, {}
-    if candle == handled_candle:
-        return candle, score, volatility, reason, {}
 
     signal_at = candle + STRATEGY_INTERVALS[mode]
     direction = 1 if score > 0 else -1
@@ -945,7 +959,7 @@ class DemoStrategy:
         max_positions = self.FAST_MAX_POSITIONS if mode == 'fast' else self.MAX_POSITIONS
         max_hold_hours = {'intraday': 4, 'swing': 48, 'us_open': 1.5}.get(mode)
         holdings = {}
-        seen = {}
+        entry_attempts = {}
         peaks = {}
         protection_errors = {}
         ticks = {}
@@ -1111,7 +1125,6 @@ class DemoStrategy:
                     self.status = '正在检查行情与入场信号'
                     candidates = []
                     listed = {item['symbol']: item for item in catalog}
-                    previous_checks = self.checks
                     checks = {}
                     with ThreadPoolExecutor(max_workers=max(1, len(assets))) as pool:
                         if prepare_at_start:
@@ -1157,7 +1170,7 @@ class DemoStrategy:
                                 checks[asset] = session_block
                             else:
                                 checks[asset] = '正在读取行情'
-                                jobs[pool.submit(scan_entry_signal, symbol, mode, seen.get(symbol))] = (asset, item)
+                                jobs[pool.submit(scan_entry_signal, symbol, mode)] = (asset, item)
                         self.checks = checks.copy()
                         for job in as_completed(jobs):
                             asset, item = jobs[job]
@@ -1165,15 +1178,9 @@ class DemoStrategy:
                             try:
                                 candle, score, volatility, reason, signal_context = job.result()
                                 if score is not None:
-                                    if seen.get(symbol) != candle:
-                                        candidates.append((signal_context.get('priority', abs(score)), symbol,
-                                                           candle, volatility, reason, item, score, signal_context))
-                                        reason = f'信号成立 · {reason} · 等待下单检查'
-                                    else:
-                                        previous = previous_checks.get(asset, '')
-                                        reason = previous if previous.startswith('跳过 ·') else '本根 K 线已处理'
-                                else:
-                                    seen[symbol] = candle
+                                    candidates.append((signal_context['priority'], symbol, candle, volatility,
+                                                       reason, item, score, signal_context))
+                                    reason = f'信号成立 · {reason} · 等待下单检查'
                             except (OSError, ValueError, KeyError, IndexError, TypeError, ArithmeticError) as error:
                                 reason = f'行情不可用 · {error}'
                             checks[asset] = reason
@@ -1190,7 +1197,6 @@ class DemoStrategy:
                             candidates, key=lambda candidate: candidate[0], reverse=True):
                         if self.stop.is_set() or len(occupied) >= max_positions:
                             break
-                        seen[symbol] = candle
                         filters = {f['filterType']: f for f in item['filters']}
                         lot = filters['LOT_SIZE']
                         direction = 1 if score > 0 else -1
@@ -1226,6 +1232,13 @@ class DemoStrategy:
                         risk_budget = equity * ENTRY_EQUITY_RISK[mode] / (stop_loss + cost)
                         price, amount, time_in_force = select_demo_entry(
                             direction, book, bid, ask, min(budget, risk_budget), step, stop_loss, cost)
+                        attempt = (candle, direction, demo_now_ms(), price, time_in_force, cost)
+                        retry_block = entry_retry_block(entry_attempts.get(symbol), attempt,
+                                                        ENTRY_RETRY_COOLDOWN_SECONDS[mode])
+                        if retry_block:
+                            checks[symbol[:-4]] = f'等待复查 · {retry_block}'
+                            self.checks = checks.copy()
+                            continue
                         notional = amount * price
                         minimum = Decimal(filters.get('MIN_NOTIONAL', {}).get('notional', '0'))
                         if not Decimal(lot['minQty']) <= amount <= Decimal(lot['maxQty']) or notional < minimum or not amount:
@@ -1284,6 +1297,7 @@ class DemoStrategy:
                             detail += f' · {maker_reason}，改为限价挂单'
                         decision = dict(reason=reason,
                                         detail=detail, signal_at=signal_at)
+                        entry_attempts[symbol] = (candle, direction, now, price, time_in_force, cost)
                         order = submit_demo_limit_entry(symbol, amount, price, leverage_target, mode,
                                                         stop_loss, tick, self.stop, decision,
                                                         side=entry_side(direction), time_in_force=time_in_force)
