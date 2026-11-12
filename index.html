@@ -134,6 +134,7 @@ function showAccount() {
   }
   showRealizedReturn();
   renderOrderCards();
+  renderMarketRows();
   updateAccountStatus();
 }
 function updateAccountStatus() {
@@ -767,9 +768,13 @@ for (const action of ['start','stop']) {
 function renderMarketRows() {
   if (!marketCatalog) return;
   const selected = new Set([...config.querySelectorAll('[name=asset]:checked')].map(checkbox => checkbox.value));
+  const heldSymbols = new Set((accountSnapshot?.holdings || [])
+    .filter(position => Number(position.quantity) !== 0)
+    .map(position => position.symbol));
+  const markets = marketCatalog.filter(market => selected.has(market.asset));
+  markets.sort((a, b) => Number(heldSymbols.has(b.symbol)) - Number(heldSymbols.has(a.symbol)));
   el('market-rows').replaceChildren();
-  for (const market of marketCatalog) {
-    if (!selected.has(market.asset)) continue;
+  for (const market of markets) {
     const tradeable = market.status === 'TRADING' &&
       ['PERPETUAL', 'TRADIFI_PERPETUAL'].includes(market.contract_type);
     const status = tradeable ? '可交易' : market.status ?? '目录未匹配此代码';
