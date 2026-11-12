@@ -1471,6 +1471,31 @@ class LiveMarketSimulation:
             raise ValueError('实盘盘口无效或已过期')
         return book, bid, ask
 
+    def estimate_fill(self, symbol, buy, amount):
+        try:
+            book, bid, ask = self.quote(symbol)
+            quantity = Decimal(book['askQty' if buy else 'bidQty'])
+            if quantity.is_finite() and quantity >= amount:
+                return ask if buy else bid, int(book['time'])
+        except SHADOW_DATA_ERRORS:
+            pass
+
+        depth = request('Binance', '/fapi/v1/depth', symbol=symbol, limit=20)
+        quoted_at = int(depth['T'])
+        if not -1000 <= time.time_ns() // 1_000_000 - quoted_at <= 5000:
+            raise ValueError('实盘盘口深度已过期')
+        remaining, value = amount, Decimal(0)
+        for raw_price, raw_quantity in depth['asks' if buy else 'bids']:
+            price, quantity = Decimal(raw_price), Decimal(raw_quantity)
+            if not price.is_finite() or not quantity.is_finite() or price <= 0 or quantity <= 0:
+                raise ValueError('实盘盘口深度数据无效')
+            filled = min(quantity, remaining)
+            value += price * filled
+            remaining -= filled
+            if not remaining:
+                return value / amount, quoted_at
+        raise ValueError('实盘前 20 档深度不足')
+
     def apply(self, event_id, recorded_at, kind, payload):
         intent = payload.get('intent', {})
         response = payload.get('response', {})
@@ -1512,19 +1537,17 @@ class LiveMarketSimulation:
                 return
             direction = 1 if intent['side'] == 'BUY' else -1
         try:
-            observed_at = time.time_ns() // 1_000_000
-            if observed_at - int(response.get('updateTime') or recorded_at) > 15_000:
+            source_time = int(response.get('updateTime') or recorded_at)
+            if time.time_ns() // 1_000_000 - source_time > 15_000:
                 raise ValueError('模拟盘成交回报已超过 15 秒')
-            book, bid, ask = self.quote(symbol)
-            buy = (direction > 0) != closing
-            price = ask if buy else bid
-            depth = Decimal(book['askQty' if buy else 'bidQty'])
-            if not depth.is_finite() or depth < delta:
-                raise ValueError('实盘一档深度不足')
-            quoted_at = int(book['time'])
+            price, quoted_at = self.estimate_fill(symbol, (direction > 0) != closing, delta)
+            if not -5000 <= quoted_at - source_time <= 15_000:
+                raise ValueError('实盘报价时间与模拟盘成交相隔过久')
         except SHADOW_DATA_ERRORS as error:
             with self.lock:
-                note = dict(symbol=symbol, time=recorded_at, text=f'{"平仓" if closing else "开仓"}未估算成交 · {error}')
+                action = '平仓' if closing else '开仓'
+                note = dict(symbol=symbol, time=recorded_at,
+                            text=f'{action}未估算成交 · 模拟盘开仓单 {opening_id} · 数量 {delta:f} · {error}')
                 changes = dict(notes=[note, *self.state['notes']][:30], cursor=event_id)
                 if position:
                     changes['positions'] = {**self.state['positions'], key: dict(
