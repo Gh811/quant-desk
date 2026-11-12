@@ -283,8 +283,9 @@ def set_initial_protection(symbol, entry, stop_loss, tick, context, *, direction
 def align_strategy_protection(symbol, entry, mark, stop_loss, stop, tick, context, *, direction=1, take=None):
     if min(entry, mark, tick) <= 0:
         raise ValueError('保护单价格数据无效')
+    initial_take = protection_price(entry, 2*stop_loss, tick, direction=direction, kind='take')
     if take is None:
-        take = protection_price(entry, 2*stop_loss, tick, direction=direction, kind='take')
+        take = initial_take
     if min(stop, take) <= 0 or not direction*stop < direction*mark < direction*take:
         raise ValueError('标记价格已到达保护区间边界')
     with protection_lock:
@@ -303,7 +304,23 @@ def align_strategy_protection(symbol, entry, mark, stop_loss, stop, tick, contex
                 keep = (max if kind == 'stop' else min)(
                     valid, key=lambda order: direction*Decimal(order['triggerPrice']))
             else:
-                place_protection(symbol, kind, target, context, direction=direction)
+                initial = (protection_price(entry, -stop_loss, tick, direction=direction, kind='stop')
+                           if kind == 'stop' else initial_take)
+                movement = target != initial
+                if movement:
+                    action = '移动止损' if kind == 'stop' else '移动止盈'
+                    previous = '、'.join(str(order['triggerPrice']) for order in matching) or '无已确认挂单'
+                    detail = f'{previous} → {target:f} · 标记价 {mark:f}'
+                    event = dict(mode=context['strategy'], scope='protection', symbol=symbol)
+                    record_runtime(f'{action}已发起', detail=detail, **event)
+                try:
+                    place_protection(symbol, kind, target, context, direction=direction)
+                except (OSError, ValueError, KeyError, ArithmeticError, sqlite3.Error) as error:
+                    if movement:
+                        record_runtime(f'{action}未确认', detail=f'{detail} · {error}', **event)
+                    raise
+                if movement:
+                    record_runtime(f'{action}已确认', detail=detail, **event)
                 keep = None
             for order in matching:
                 if order is not keep:
@@ -940,6 +957,7 @@ class DemoStrategy:
         prepare_at_start = mode == 'fast'
         recovering = True
         last_scan_log = None
+        next_entry_scan = 0
         try:
             record_runtime('收到启动请求', mode=mode, detail='、'.join(sorted(assets)))
             while not self.stop.is_set():
@@ -1018,19 +1036,21 @@ class DemoStrategy:
                             breakeven = net_breakeven_price(entry_price, amount, tick, *costs)
                         except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
                             breakeven = None
-                        if (breakeven is not None and direction*(candidate-breakeven) >= 0
-                                and direction*(mark-candidate) > 0 and direction*(candidate-stop) > 0):
-                            stop = candidate
+                        if breakeven is not None:
+                            candidate = (max if direction > 0 else min)(candidate, breakeven)
+                            if direction*(mark-candidate) >= 2*tick and direction*(candidate-stop) > 0:
+                                stop = candidate
                     trailing = stop != minimum_stop and direction*(mark-stop) <= 0
                     missing_stop = False
                     if not (timed_out or fixed_exit or trailing):
                         take = None
+                        reviewed_window = None
                         if stop != minimum_stop and price_return >= stop_loss:
                             window = demo_now_ms() // STRATEGY_INTERVALS[mode]
                             if take_reviewed.get(symbol) != window:
                                 try:
                                     candle, signal, _, assessment = entry_signal(symbol, mode)
-                                    take_reviewed[symbol] = min(window, (candle + STRATEGY_INTERVALS[mode]) // STRATEGY_INTERVALS[mode])
+                                    reviewed_window = min(window, (candle + STRATEGY_INTERVALS[mode]) // STRATEGY_INTERVALS[mode])
                                 except (OSError, ValueError, KeyError, IndexError, ArithmeticError):
                                     pass
                                 else:
@@ -1044,6 +1064,8 @@ class DemoStrategy:
                             align_strategy_protection(symbol, entry_price, mark, stop_loss, stop, tick,
                                                       dict(opening_id=opening_id, opened=int(opened*1000),
                                                            leverage=leverage, strategy=mode), direction=direction, take=take)
+                            if reviewed_window is not None:
+                                take_reviewed[symbol] = reviewed_window
                             if stop != minimum_stop:
                                 trailing_stops[symbol] = stop
                             protection_errors.pop(symbol, None)
@@ -1091,7 +1113,9 @@ class DemoStrategy:
                         self.checks = {**self.checks, symbol[:-4]: f'已平仓 · {reason}'}
                         closed = True
                 if (not closed and not closed_symbols and not self.stop.is_set()
-                        and (prepare_at_start or len(holdings) < max_positions)):
+                        and (prepare_at_start or len(holdings) < max_positions)
+                        and (not holdings or time.monotonic() >= next_entry_scan)):
+                    next_entry_scan = time.monotonic() + (3 if pending_symbols else 10 if mode == 'fast' else 30)
                     self.status = '正在核对模拟盘普通挂单'
                     open_orders = demo_signed('/fapi/v1/openOrders')
                     occupied = positions.keys() | pending_entries | {order['symbol'] for order in open_orders
@@ -1343,7 +1367,7 @@ class DemoStrategy:
                     self.status += f' · {len(protection_errors)} 个持仓的保护单待核对'
                 if pending_partial_entry:
                     continue
-                if protection_errors:
+                if holdings or protection_errors:
                     self.stop.wait(2)
                 else:
                     self.stop.wait(3 if pending_symbols else 10 if mode == 'fast' else 30)
@@ -1437,6 +1461,9 @@ class Handler(BaseHTTPRequestHandler):
                                                                     checks=self.server.strategy.checks,
                                                                     checked_at=self.server.strategy.checked_at,
                                                                     scan_ms=self.server.strategy.scan_ms)).encode())
+                return
+            if parsed.path == '/strategy/protection-decisions':
+                self.send(200, 'application/json', json.dumps(protection_decisions()).encode())
                 return
             if parsed.path == '/strategy/logs':
                 self.send(200, 'application/json', json.dumps(runtime_logs()).encode())
@@ -1548,9 +1575,11 @@ def journal(kind, payload, *, timeout=5):
                          (int(time.time()*1000), kind, json.dumps(payload, ensure_ascii=False)))
 
 
-def record_runtime(message, *, mode=None, detail=None, at=None):
+def record_runtime(message, *, mode=None, detail=None, at=None, scope='system', symbol=None):
     event = dict(at=at if at is not None else demo_now_ms(), message=message,
-                 mode=mode, detail=detail, scope='system')
+                 mode=mode, detail=detail, scope=scope)
+    if symbol is not None:
+        event['symbol'] = symbol
     try:
         journal('demo_runtime', event, timeout=0.15)
     except (OSError, sqlite3.Error) as error:
@@ -1574,6 +1603,18 @@ def runtime_logs():
             )
             ORDER BY id DESC LIMIT 200
             """
+        )
+        return [json.loads(payload) for (payload,) in rows]
+
+
+def protection_decisions():
+    path = journal_path()
+    if not path.exists():
+        return []
+    with closing(sqlite3.connect(path)) as database:
+        rows = database.execute(
+            "SELECT payload FROM events WHERE kind = 'demo_runtime' "
+            "AND json_extract(payload, '$.scope') = 'protection' ORDER BY id DESC LIMIT 200"
         )
         return [json.loads(payload) for (payload,) in rows]
 
