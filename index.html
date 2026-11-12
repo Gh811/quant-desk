@@ -44,6 +44,10 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
 .desk-heading h1{margin:0;font-size:clamp(22px,2.7vw,32px);letter-spacing:-.035em;line-height:1.2}
 .desk-sizing{margin:12px 0}.desk-sizing label{margin:0 0 4px;font-size:13px;font-weight:600}
 .desk-sizing small{display:block;color:#52647a;font-size:12px;line-height:1.45}
+.shadow-panel{border:1px solid #d5dfeb;border-radius:9px;background:#f8fafc;padding:10px 14px;margin-bottom:16px}
+.shadow-panel>summary{cursor:pointer;font-weight:650;color:#253b56}
+.shadow-panel>summary small{margin-left:8px;font-weight:400;color:#52647a}
+.shadow-panel #shadow-mode{max-width:280px}
 </style><main><aside><div class="desk-brand"><strong>Quant Desk</strong><small>币安合约模拟盘</small></div>
 <p id="strategy-status" role="status">正在读取后台策略状态…</p>
 <label for="strategy-mode">策略</label>
@@ -80,8 +84,8 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
   </div>
 
 </div>
-<div class="orders" aria-labelledby="shadow-title">
-  <h2 id="shadow-title">实盘行情模拟</h2>
+<details class="shadow-panel">
+  <summary>实盘行情模拟 <small id="shadow-indicator"></small></summary>
   <p>使用币安实盘公开行情，虚拟成交。每笔目标名义金额 100 USDT，估算单边手续费 0.05%。</p>
   <label for="shadow-mode">模拟策略</label>
   <select id="shadow-mode"><option value="fast">5 分钟双向</option><option value="intraday">15 分钟双向</option><option value="swing">1 小时双向</option><option value="us_open">美股双向测试</option></select>
@@ -90,13 +94,7 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
   <p id="shadow-status" role="status">正在读取模拟状态…</p>
   <div id="shadow-summary" class="order-grid"></div>
   <details><summary>信号与虚拟成交记录</summary><div id="shadow-records" class="decision-list"></div></details>
-</div>
-<div class="pnl-analysis" id="pnl-analysis" aria-labelledby="pnl-title">
-  <h2 id="pnl-title">盈亏分析</h2>
-  <small>模拟盘历史 · 已核对平仓净盈亏（USDT），含手续费和资金费</small>
-  <p id="pnl-chart-status" role="status">正在读取盈亏数据…</p>
-  <ul id="pnl-chart" class="pnl-chart" aria-label="各标的已实现净盈亏"></ul>
-</div>
+</details>
 <div class="orders"><button id="stats-toggle" class="compact-button" type="button" aria-expanded="false" aria-controls="stats-panel">查看策略统计</button>
 <div id="stats-panel" hidden>
 <small>胜率按已核对净收益的平仓计算。夏普估算基于 UTC 日已实现净损益，按固定本金、零无风险利率年化；至少 10 个完整日。</small>
@@ -108,6 +106,7 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
   <button class="compact-button" type="button" aria-pressed="false" aria-controls="history-panel">交易历史</button>
   <button class="compact-button" type="button" aria-pressed="false" aria-controls="decisions-panel">决策日志</button>
   <button class="compact-button" type="button" aria-pressed="false" aria-controls="runtime-panel">运行日志</button>
+  <button class="compact-button" type="button" aria-pressed="false" aria-controls="pnl-panel">盈亏分析</button>
 </div>
 <div id="positions-panel">
   <p id="protection-status" role="status" hidden></p>
@@ -128,6 +127,14 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
   <p id="runtime-status" role="status">正在读取运行日志…</p>
   <div id="runtime-events"></div>
   <nav id="runtime-pages" class="pagination" aria-label="运行日志分页" hidden></nav>
+</div>
+<div id="pnl-panel" hidden>
+<div class="pnl-analysis" id="pnl-analysis" aria-labelledby="pnl-title">
+  <h2 id="pnl-title">盈亏分析</h2>
+  <small>模拟盘历史 · 已核对平仓净盈亏（USDT），含手续费和资金费</small>
+  <p id="pnl-chart-status" role="status">正在读取盈亏数据…</p>
+  <ul id="pnl-chart" class="pnl-chart" aria-label="各标的已实现净盈亏"></ul>
+</div>
 </div>
 </div>
 <div class="orders">
@@ -958,6 +965,7 @@ function renderShadow() {
   el('shadow-pause').disabled = shadowAction || !state.enabled;
   el('shadow-mode').disabled = state.enabled || state.positions.length > 0;
   if (el('shadow-mode').disabled) el('shadow-mode').value = state.mode;
+  el('shadow-indicator').textContent = state.enabled ? '运行中' : state.positions.length ? '管理虚拟持仓中' : '已停止';
   status.textContent = [
     state.enabled ? '运行中 · ' + strategyNames[state.mode] + ' · ' + state.assets.map(name).join('、')
       : state.positions.length ? '已停止开新虚拟仓 · 继续管理现有虚拟仓位' : '已停止',
