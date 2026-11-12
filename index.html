@@ -42,6 +42,7 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
 <label for="strategy-mode">策略</label>
 <select id="strategy-mode" disabled><option value="swing">1 小时双向</option><option value="intraday">15 分钟双向</option><option value="fast">5 分钟双向</option><option value="us_open">美股双向测试</option></select>
 <button id="strategy-start" type="button" disabled>正在同步状态…</button>
+<button id="strategy-entries" type="button" disabled>停止开新仓</button>
 <button id="strategy-stop" type="button" disabled>停止并平仓</button><form id="config"><h3>允许交易的标的</h3><div id="assets"></div></form></aside>
 <section><h1>量化交易仪表盘</h1>
 <div class="account" aria-labelledby="account-title">
@@ -703,6 +704,7 @@ let marketCatalog = null;
 function renderStrategyControls() {
   const start = el('strategy-start');
   const stop = el('strategy-stop');
+  const entries = el('strategy-entries');
   const running = Boolean(strategyState?.running);
   const stopping = strategyAction === 'stop' || Boolean(strategyState?.draining);
   const blocked = Boolean(strategyState?.switch_blocked);
@@ -718,6 +720,8 @@ function renderStrategyControls() {
   else start.textContent = strategyStatusFailed ? '后台状态暂不可用' : '正在同步状态…';
   stop.disabled = !strategyState || stopping || strategyAction !== null;
   stop.textContent = stopping ? '正在停止并平仓…' : '停止并平仓';
+  entries.disabled = typeof strategyState?.entries_paused !== 'boolean' || !running || stopping || strategyAction !== null;
+  entries.textContent = strategyState?.entries_paused ? '恢复开新仓' : '停止开新仓';
   for (const checkbox of config.querySelectorAll('[name=asset]')) checkbox.disabled = locked;
 }
 function setMarketPill(cell, label, tone) {
@@ -817,10 +821,11 @@ async function refreshStrategyStatus() {
     el('strategy-status').textContent = '无法读取策略状态：' + error.message;
   }
 }
-for (const action of ['start','stop']) {
-  const button = el('strategy-' + action);
+for (const control of ['start','stop','entries']) {
+  const button = el('strategy-' + control);
   button.onclick = async () => {
     if (button.disabled || strategyAction) return;
+    const action = control === 'entries' ? (strategyState.entries_paused ? 'resume-entries' : 'pause-entries') : control;
     if (action === 'stop' && !confirm('停止后台策略并平掉币安模拟盘的所有单向持仓？')) return;
     const params = new URLSearchParams(new FormData(config));
     params.set('strategy', strategyMode.value);
