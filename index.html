@@ -64,6 +64,17 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
   </div>
 
 </div>
+<div class="orders" aria-labelledby="shadow-title">
+  <h2 id="shadow-title">实盘行情模拟</h2>
+  <p>使用币安实盘公开行情，虚拟成交。每笔目标名义金额 100 USDT，估算单边手续费 0.05%。</p>
+  <label for="shadow-mode">模拟策略</label>
+  <select id="shadow-mode"><option value="fast">5 分钟双向</option><option value="intraday">15 分钟双向</option><option value="swing">1 小时双向</option><option value="us_open">美股双向测试</option></select>
+  <button id="shadow-start" class="compact-button" type="button" disabled>用左侧选中标的启动</button>
+  <button id="shadow-pause" class="compact-button" type="button" disabled>停止开新虚拟仓</button>
+  <p id="shadow-status" role="status">正在读取模拟状态…</p>
+  <div id="shadow-summary" class="order-grid"></div>
+  <details><summary>信号与虚拟成交记录</summary><div id="shadow-records" class="decision-list"></div></details>
+</div>
 <div class="pnl-analysis" id="pnl-analysis" aria-labelledby="pnl-title">
   <h2 id="pnl-title">盈亏分析</h2>
   <small>模拟盘历史 · 已核对平仓净盈亏（USDT），含手续费和资金费</small>
@@ -892,6 +903,85 @@ setInterval(() => {
 setInterval(updateAccountStatus, 1000);
 loadOrders();
 setInterval(loadOrders, 10000);
+let shadowRequest = false;
+let shadowAction = false;
+let shadowState;
+function renderShadow() {
+  const status = el('shadow-status');
+  const state = shadowState;
+  if (!state) return;
+  el('shadow-start').disabled = shadowAction || state.enabled;
+  el('shadow-pause').disabled = shadowAction || !state.enabled;
+  el('shadow-mode').disabled = state.enabled || state.positions.length > 0;
+  if (el('shadow-mode').disabled) el('shadow-mode').value = state.mode;
+  status.textContent = [
+    state.enabled ? '运行中 · ' + strategyNames[state.mode] + ' · ' + state.assets.map(name).join('、')
+      : state.positions.length ? '已停止开新虚拟仓 · 继续管理现有虚拟仓位' : '已停止',
+    state.error
+  ].filter(Boolean).join(' · ');
+  const total = orderElement('article', 'order-card');
+  total.append(orderElement('strong', '', '累计虚拟净盈亏 ' + pnlAmount.format(Number(state.realized)) + ' USDT'));
+  const holdings = state.positions.map(p => {
+    const card = orderElement('article', 'order-card');
+    card.append(orderElement('strong', '', p.symbol + ' · ' + (p.direction > 0 ? '虚拟多仓' : '虚拟空仓')),
+      orderElement('p', '', '入场 ' + p.entry + ' · 数量 ' + p.amount),
+      orderElement('small', '', p.exit ? '已估算出场，资金费待核对' :
+        '止损距离 ' + (Number(p.risk)*100).toFixed(2) + '% · ' + date(p.opened)));
+    return card;
+  });
+  el('shadow-summary').replaceChildren(total, ...holdings);
+  const checks = Object.entries(state.checks).map(([symbol, reason]) => orderElement('p', '', symbol + ' · ' + reason));
+  const trades = state.trades.map(t => {
+    const item = orderElement('article', 'decision-item');
+    const net = orderElement('strong', '', t.symbol + ' · ' + (t.direction > 0 ? '多' : '空') +
+      ' · ' + pnlAmount.format(Number(t.net)) + ' USDT');
+    colorPnL(net, t.net);
+    item.append(net, orderElement('p', '', t.reason + ' · ' + t.entry + ' → ' + t.exit),
+      orderElement('small', '', date(t.closed) + ' · 手续费 ' + pnlAmount.format(Number(t.fees)) +
+        ' · 资金费 ' + pnlAmount.format(Number(t.funding))));
+    return item;
+  });
+  el('shadow-records').replaceChildren(...checks, ...trades);
+}
+async function loadShadow() {
+  if (shadowRequest) return;
+  shadowRequest = true;
+  try {
+    const response = await fetch('./shadow', {cache:'no-store', signal:AbortSignal.timeout(6000)});
+    if (!response.ok) throw Error('HTTP ' + response.status);
+    shadowState = await response.json();
+    renderShadow();
+  } catch (error) {
+    el('shadow-status').textContent = '读取实盘行情模拟状态失败 · ' + error.message;
+  } finally {
+    shadowRequest = false;
+  }
+}
+for (const action of ['start', 'pause']) {
+  el('shadow-' + action).onclick = async () => {
+    if (shadowAction) return;
+    shadowAction = true;
+    renderShadow();
+    const params = new URLSearchParams({strategy:el('shadow-mode').value});
+    for (const checkbox of config.querySelectorAll('[name=asset]:checked')) params.append('asset', checkbox.value);
+    let errorMessage;
+    try {
+      const response = await fetch('./shadow/' + action + '?' + params, {
+        method:'POST', headers:{'X-Quant-Demo':'strategy'}, signal:AbortSignal.timeout(6000)
+      });
+      if (!response.ok) throw Error((await response.json()).error || 'HTTP ' + response.status);
+    } catch (error) {
+      errorMessage = error.message;
+    } finally {
+      shadowAction = false;
+      renderShadow();
+      await loadShadow();
+      if (errorMessage) el('shadow-status').textContent = errorMessage;
+    }
+  };
+}
+loadShadow();
+setInterval(loadShadow, 3000);
 const positionTabs = [...document.querySelectorAll('.position-tabs button')];
 for (const tab of positionTabs) {
   tab.onclick = () => {
