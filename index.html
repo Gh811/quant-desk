@@ -1,0 +1,832 @@
+<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Quant Desk</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#edf2f7;color:#19283c;font:15px system-ui}main{display:grid;grid-template-columns:240px 1fr;min-height:100vh}aside,section{padding:28px}aside{background:white;border-right:1px solid #d5dfeb}h1{margin-top:0}label{display:block;margin:10px 0}select,input,button{font:inherit}input[type=number],select,button{width:100%;padding:9px;margin:4px 0;border:1px solid #bdcadd;border-radius:5px}button{background:#1756a9;color:white;cursor:pointer}button:disabled{opacity:.6}.cards{display:flex;gap:12px;flex-wrap:wrap;margin:18px 0}.card,table{background:white;border:1px solid #d5dfeb;border-radius:8px}.card{flex:1;min-width:140px;padding:16px}.card strong{display:block;font-size:25px;margin-top:6px}table{width:100%;border-collapse:collapse;margin-bottom:24px}td,th{padding:11px;text-align:left;border-bottom:1px solid #e1e7ef}small,#message{color:#4a5b72} @media(max-width:690px){main{display:block}section{overflow:auto}}
+.tabs{display:flex;gap:8px}.tabs button{width:auto;padding:9px 16px;background:white;color:#19283c}.tabs button[aria-pressed=true]{background:#1756a9;color:white}
+.account{background:#f8fafc;border:1px solid #d5dfeb;border-radius:10px;padding:18px;margin-bottom:22px}.account-header{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}.account-header h2{margin:0;font-size:20px}.account-header label{margin:0}.account-header select{width:auto;margin-left:8px}.account-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:12px;margin-top:12px}.account-metrics .card{min-width:0}.account-metrics strong{font-size:20px;font-variant-numeric:tabular-nums}
+.account-metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.account-metrics .card{border-top:3px solid #adc3de}.account-metrics .card:nth-child(4n+2){border-top-color:#8abeb5}.account-metrics .card:nth-child(4n+3){border-top-color:#c2a9dc}.account-metrics .card:nth-child(4n+4){border-top-color:#d7b380}.account-metrics strong{overflow-wrap:anywhere}.gain{color:#08754a}.loss{color:#bd283c}#demo-sync{width:auto;padding-inline:14px} .account-table{overflow:auto;margin-top:14px}.account-table table{margin-bottom:0}@media(max-width:1050px){.account-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}
+body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,1fr)}aside{background:#e7edf4}section{min-width:0}.account{background:transparent;padding:0;border:0}.account-metrics .card{background:#eaf0f8;border:0;border-radius:5px}.account-metrics .card:nth-child(4n+2){background:#e8f2ee}.account-metrics .card:nth-child(4n+3){background:#eeeaf5}.account-metrics .card:nth-child(4n+4){background:#f7eee3}table{background:transparent;border:0}thead{background:#e2e8f0;color:#43546b}tbody tr:nth-child(even){background:#eaf0f5}td,th{padding:8px 10px}tbody tr:hover{background:#dce8f6}.orders{overflow:auto;margin:16px 0 24px}.orders h2{font-size:17px}.orders table{min-width:660px}.tabs button{background:#e2e9f2}@media(max-width:690px){main{display:block}}
+#strategy-stop{background:#b93546}#strategy-status{font-size:13px;color:#43546b}
+.market-meta{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin:8px 0 12px;font-size:13px;color:#52647a}.market-meta p{margin:0}.market-pulse{display:inline-flex;align-items:center;gap:6px;font-weight:600}.market-pulse::before{content:'';width:7px;height:7px;border-radius:50%;background:currentColor}.market-pulse[data-tone=live]{color:#147757}.market-pulse[data-tone=error]{color:#b93546}.market-pill{display:inline-flex;align-items:center;gap:6px;padding:3px 8px;border-radius:6px;font-size:12px;font-weight:600;color:#4a5b72;background:#e2e9f2}.market-pill[data-tone=live]{color:#08754a;background:#dcefe6}.market-pill[data-tone=warn]{color:#805819;background:#faedce}.market-pill[data-tone=error]{color:#a12e41;background:#f7e2e6}.market-pill[data-tone=busy]{color:#245994;background:#deebfb}.market-pill[data-tone=busy]::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor;animation:market-pulse 1.4s ease-out infinite}.market-pill.updated{animation:market-update .6s ease-out}@keyframes market-pulse{50%{opacity:.35}}@keyframes market-update{from{box-shadow:0 0 0 4px #7ba6da66}to{box-shadow:0 0 0 0 #7ba6da00}}@media(prefers-reduced-motion:reduce){.market-pill,.market-pill::before{animation:none!important}}
+
+.market-pill[data-tone=trend]{color:#614293;background:#efe6fa;border:1px solid #dfcef2}
+.market-pill[data-tone=breakout]{color:#90520e;background:#fff0dc;border:1px solid #f5d6aa}
+.market-pill[data-tone=volatility]{color:#9a3562;background:#fae5ef;border:1px solid #efc7dc}
+.market-pill[data-tone=signal]{color:#24633e;background:#e5f2d8;border:1px solid #cde6bc}
+.market-pill[data-tone=holding]{color:#087065;background:#dcf2ef;border:1px solid #bce4dd}
+.market-pill[data-tone=submit]{color:#244fa0;background:#dfe8fc;border:1px solid #bdcff4}
+.market-pill[data-tone=handled]{color:#4d5870;background:#e8ecf3;border:1px solid #d6dce8}
+.market-pill[data-tone=skip]{color:#756009;background:#f8efbd;border:1px solid #ead987}
+.market-pill[data-tone=submit]::before{content:'';width:6px;height:6px;border-radius:50%;background:currentColor;animation:market-pulse 1.4s ease-out infinite}
+.order-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,350px),1fr));gap:12px}.order-card{min-width:0;padding:14px 16px;border:1px solid #d7e2ee;border-left:3px solid #5885bd;border-radius:9px;background:#f8fafc}.order-card[data-side=sell]{border-left-color:#b3784d}.order-card-header{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.order-card-header h3{font-size:17px;margin:0}.order-badges{display:flex;gap:5px}.order-strategy{font-size:12px;color:#53667d;margin:5px 0 12px}.order-metrics,.order-times{display:grid;grid-template-columns:repeat(auto-fit,minmax(105px,1fr));gap:8px;margin:0}.order-metrics>div{padding:7px 8px;background:#edf2f8;border-radius:5px}.order-card dt{font-size:11px;color:#54667c}.order-card dd{margin:3px 0 0;font-size:13px;font-weight:600;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.order-times{margin-top:10px}.order-card details{margin-top:10px;border-top:1px solid #dfe7f0;padding-top:8px;color:#53667d;font-size:12px}.order-card summary{cursor:pointer}.order-card code{display:block;margin-top:7px;overflow-wrap:anywhere}
+.protection-card{margin-top:10px}.protection-card h3{margin:0 0 8px;font-size:15px}.protection-line{display:flex;align-items:center;gap:8px;margin-top:5px;flex-wrap:wrap}.protection-line button{width:auto;margin-left:auto;padding:4px 8px;font-size:12px}.protection-line strong{font-variant-numeric:tabular-nums}
+.compact-button{width:auto;padding-inline:16px}#stats-panel{margin-top:8px}.order-protection{margin-top:10px;padding:8px 10px;background:#eaf0f7;border-radius:6px}.order-protection h4{margin:0;font-size:12px;color:#425670}
+.order-grid{align-items:start}.order-profit{margin:0 0 12px;padding:10px 12px;background:#eaf0f7;border-radius:6px}.order-profit small{display:block}.order-profit strong{font-size:22px;font-variant-numeric:tabular-nums}
+.position-tabs{display:flex;flex-wrap:wrap;gap:7px;margin-bottom:12px}.position-tabs button[aria-pressed=false]{color:#425670;background:#e4ebf4}.position-tabs button[aria-pressed=true]{font-weight:700}.position-metrics{margin-top:8px}
+.position-direction{display:inline-grid;place-items:center;width:27px;height:27px;border-radius:4px;font-size:13px;font-weight:700}.position-direction[data-direction=long]{color:#08754a;background:#dcefe6}.position-direction[data-direction=short]{color:#a12e41;background:#f7e2e6}.position-direction[data-direction=unknown]{color:#53667d;background:#e2e9f2}
+.order-metrics>div,.order-times>div{min-width:0}.order-metrics .trade-price{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.decision-list{margin-top:12px}.decision-item{padding:12px 14px;margin-bottom:8px;border-left:3px solid #7098c8;border-radius:6px;background:#eaf0f7}.decision-item strong{font-size:14px}.decision-item p{margin:6px 0 0}.decision-item small{display:block;color:#506279}.decision-item time{font-variant-numeric:tabular-nums}
+#strategy-start[data-running=true]{background:#dcefe6;border-color:#a3cfb9;color:#075a3b;opacity:1;cursor:default;font-weight:700}
+.pagination{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:12px}.pagination[hidden]{display:none}.pagination button{width:auto;min-width:32px;padding:4px 8px;margin:0;background:#f8fafc;color:#253248}.pagination button[aria-current=page]{background:#1756a9;border-color:#1756a9;color:white;font-weight:700}
+</style><main><aside><h1>Quant Desk</h1><small>币安合约模拟盘</small>
+<p id="strategy-status" role="status">正在读取后台策略状态…</p>
+<label for="strategy-mode">策略</label>
+<select id="strategy-mode" disabled><option value="swing">中长线 · 1 小时趋势突破</option><option value="intraday">短线 · 15 分钟趋势突破</option><option value="fast">短线 · 5 分钟双向突破与回踩</option></select>
+<button id="strategy-start" type="button" disabled>正在同步状态…</button>
+<button id="strategy-stop" type="button" disabled>停止并平仓</button><form id="config"><h3>允许交易的标的</h3><div id="assets"></div></form></aside>
+<section><h1>量化交易仪表盘</h1>
+<div class="account" aria-labelledby="account-title">
+  <div class="account-header">
+    <h2 id="account-title">账户概览</h2>
+    <label>查看账户<select id="account-mode"><option value="demo">模拟盘</option><option value="live">实盘</option></select></label>
+  </div>
+  <button id="demo-sync" type="button">重新同步</button>
+  <p id="account-status" class="market-pulse" role="status">模拟盘未连接 · 最近同步 —</p>
+  <div class="account-metrics">
+    <div class="card">账户权益<strong data-account="equity">—</strong></div>
+    <div class="card">账户余额<strong data-account="balance">—</strong></div>
+    <div class="card">可用余额<strong data-account="available">—</strong></div>
+    <div class="card">持仓浮盈亏<strong data-account="pnl">—</strong></div>
+    <div class="card" title="起算以来已核对的平仓净收益 ÷ 固定起始本金">累计已实现收益率<strong id="realized-return">—</strong><small id="realized-base"></small></div>
+    <div class="card">持仓数<strong data-account="count">—</strong></div>
+    <div class="card">保证金占用<strong data-account="margin">—</strong></div>
+    <div class="card">账户接口延迟<strong data-account="latency">—</strong></div>
+  </div>
+
+</div>
+<div class="orders"><button id="stats-toggle" class="compact-button" type="button" aria-expanded="false" aria-controls="stats-panel">查看策略统计</button>
+<div id="stats-panel" hidden>
+<small>胜率按已核对净收益的平仓计算。夏普估算基于 UTC 日已实现净损益，按固定本金、零无风险利率年化；至少 10 个完整日。</small>
+<p id="stats-status" role="status"></p>
+<div id="strategy-stats" class="order-grid"></div></div></div>
+<div class="orders">
+<div class="position-tabs" aria-label="模拟盘记录">
+  <button class="compact-button" type="button" aria-pressed="true" aria-controls="positions-panel">当前持仓</button>
+  <button class="compact-button" type="button" aria-pressed="false" aria-controls="history-panel">交易历史</button>
+  <button class="compact-button" type="button" aria-pressed="false" aria-controls="decisions-panel">决策日志</button>
+  <button class="compact-button" type="button" aria-pressed="false" aria-controls="runtime-panel">运行日志</button>
+</div>
+<div id="positions-panel">
+  <p id="protection-status" role="status" hidden></p>
+  <div id="current-orders" class="order-grid"></div>
+  <nav id="positions-pages" class="pagination" aria-label="当前持仓分页" hidden></nav>
+</div>
+<div id="history-panel" hidden>
+  <small>平仓净收益已扣开平仓手续费，并计入资金费。</small>
+  <p id="order-status" role="status">正在读取交易历史…</p>
+  <div id="demo-orders" class="order-grid"></div>
+  <nav id="history-pages" class="pagination" aria-label="交易历史分页" hidden></nav>
+</div>
+<div id="decisions-panel" class="decision-list" hidden>
+  <div id="decision-events"></div>
+  <nav id="decisions-pages" class="pagination" aria-label="决策日志分页" hidden></nav>
+</div>
+<div id="runtime-panel" class="decision-list" hidden>
+  <p id="runtime-status" role="status">正在读取运行日志…</p>
+  <div id="runtime-events"></div>
+  <nav id="runtime-pages" class="pagination" aria-label="运行日志分页" hidden></nav>
+</div>
+</div>
+<div class="orders">
+<h2>标的状态</h2>
+<div class="market-meta">
+  <span id="market-pulse" class="market-pulse" role="status">正在连接</span>
+  <p id="market-status">正在读取币安模拟盘合约目录…</p>
+  <p id="scan-status"></p>
+</div>
+<table><thead><tr><th>标的</th><th>核对代码</th><th>模拟盘状态</th><th>合约类型</th><th>最近策略判断</th></tr></thead><tbody id="market-rows"></tbody></table>
+</div></section></main>
+<script>
+const el = id => document.getElementById(id);
+const accountMode = el('account-mode');
+const demoSync = el('demo-sync');
+const accountFields = [...document.querySelectorAll('[data-account]')];
+let accountSnapshot;
+let accountSyncError;
+let realizedReturnSnapshot;
+const oneDecimal = new Intl.NumberFormat('zh-CN', {minimumFractionDigits:1, maximumFractionDigits:1});
+function colorPnL(cell, value) {
+  cell.classList.toggle('gain', Number(value) > 0);
+  cell.classList.toggle('loss', Number(value) < 0);
+}
+function showRealizedReturn() {
+  const data = accountMode.value === 'demo' ? realizedReturnSnapshot : null;
+  const field = el('realized-return');
+  field.textContent = data?.rate == null ? '—' : (data.rate*100).toFixed(2) + '%';
+  colorPnL(field, data?.rate);
+  const basis = el('realized-base');
+  basis.textContent = data?.principal == null ? '' : '起始本金 ' + oneDecimal.format(data.principal) + ' USD 等值';
+  basis.title = data?.started_at ? '起算时间 ' + date(data.started_at) : '';
+}
+function showAccount() {
+  const demo = accountMode.value === 'demo';
+  const snapshot = demo && accountSnapshot;
+  demoSync.hidden = !demo;
+  for (const field of accountFields) {
+    const key = field.dataset.account;
+    const unit = key === 'count' ? '' : key === 'latency' ? ' ms' : ' USD 等值';
+    const value = snapshot && snapshot[key];
+    field.textContent = snapshot ? (key === 'count' || key === 'latency' ? value : oneDecimal.format(value)) + unit : '—';
+    if (key === 'pnl') colorPnL(field, value);
+  }
+  showRealizedReturn();
+  renderOrderCards();
+  updateAccountStatus();
+}
+function updateAccountStatus() {
+  const status = el('account-status');
+  if (accountMode.value !== 'demo') {
+    status.dataset.tone = '';
+    status.textContent = '实盘未连接';
+    return;
+  }
+  const age = accountSnapshot ? Math.floor((Date.now()-accountSnapshot.syncedAt)/1000) : null;
+  const delayed = age !== null && age >= 15;
+  status.dataset.tone = accountSyncError || delayed ? 'error' : age === null ? '' : 'live';
+  status.textContent = (age === null
+    ? (demoSync.disabled ? '正在连接币安模拟账户' : '币安模拟账户未连接')
+    : '币安模拟盘 · ' + (delayed ? '更新延迟 · ' : '') + age + ' 秒前同步')
+    + (accountSyncError ? ' · ' + accountSyncError : '');
+}
+accountMode.addEventListener('change', () => {
+  showAccount();
+  if (accountMode.value === 'demo' && !demoSync.disabled) demoSync.click();
+});
+demoSync.onclick = async () => {
+  if (demoSync.disabled || accountMode.value !== 'demo') return;
+  demoSync.disabled = true;
+  updateAccountStatus();
+  try {
+    const response = await fetch('/account/binance-demo', {cache:'no-store', signal:AbortSignal.timeout(18000)});
+    const data = await response.json();
+    if (!response.ok) throw Error(data.error);
+    accountSnapshot = {...data, syncedAt: Date.now()};
+    accountSyncError = null;
+    showAccount();
+  } catch (error) {
+    accountSyncError = '同步失败：' + error.message;
+  } finally {
+    demoSync.disabled = false;
+    updateAccountStatus();
+  }
+};
+const name = asset => ({SKHYNIX:'SK 海力士', GOOGL:'Google（GOOGL）'})[asset] || asset;
+for (const asset of 'ETH BTC SNDK SOXL KORU MU NVDA SOL SKHYNIX QQQ GOOGL SPCX META TSLA AMZN'.split(' ')) {
+  const label = document.createElement('label');
+  const checkbox = Object.assign(document.createElement('input'), {type:'checkbox', name:'asset', value:asset, checked:true});
+  label.append(checkbox, ' '+name(asset));
+  el('assets').append(label);
+}
+function row(table, values) {
+  const item = el(table).insertRow();
+  values.forEach(value => { item.insertCell().textContent = value; });
+  return item;
+}
+const date = timestamp => timestamp ? new Date(Number(timestamp)).toLocaleString() : '—';
+function readSaved(key) {
+  try { return JSON.parse(localStorage.getItem('quant-desk:' + key)); }
+  catch { return null; }
+}
+function writeSaved(key, value) {
+  try { localStorage.setItem('quant-desk:' + key, JSON.stringify(value)); }
+  catch { el('strategy-status').textContent = '标的选择保存失败'; }
+}
+const config = el('config');
+const preferences = readSaved('config');
+const strategyMode = el('strategy-mode');
+const strategyNames = Object.fromEntries([...strategyMode.options].map(option => [option.value, option.textContent]));
+if (Object.hasOwn(strategyNames, preferences?.strategy)) strategyMode.value = preferences.strategy;
+if (Array.isArray(preferences?.assets)) {
+  for (const checkbox of config.querySelectorAll('[name=asset]')) {
+    checkbox.checked = preferences.assets.includes(checkbox.value);
+  }
+}
+function savePreferences() {
+  writeSaved('config', {assets:new FormData(config).getAll('asset'), strategy:strategyMode.value});
+}
+config.addEventListener('change', savePreferences);
+strategyMode.addEventListener('change', savePreferences);
+function orderElement(tag, className, text) {
+  return Object.assign(document.createElement(tag), {className, textContent:text || ''});
+}
+const pageSize = 9;
+function pageItems(items, navigationId, render) {
+  const navigation = el(navigationId);
+  const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
+  const page = Math.min(Number(navigation.dataset.page || 1), pageCount);
+  renderPagination(navigationId, page, pageCount, number => {
+    navigation.dataset.page = number;
+    render();
+  });
+  const start = (page - 1) * pageSize;
+  return items.slice(start, start + pageSize);
+}
+function renderPagination(navigationId, page, pageCount, selectPage) {
+  const navigation = el(navigationId);
+  navigation.dataset.page = page;
+  navigation.hidden = pageCount === 1;
+
+  let numbers = [];
+  if (pageCount > 1 && pageCount <= 9) {
+    numbers = Array.from({length:pageCount}, (_, index) => index + 1);
+  } else if (pageCount > 9) {
+    const start = Math.max(2, Math.min(page - 2, pageCount - 5));
+    numbers = [1, ...Array.from({length:5}, (_, index) => start + index), pageCount];
+  }
+  const pagesKey = numbers.join(',');
+  if (navigation.dataset.pages !== pagesKey) {
+    const focused = navigation.contains(document.activeElement);
+    const buttons = [];
+    let previousNumber = 0;
+    for (const number of numbers) {
+      if (number - previousNumber > 1) {
+        const gap = orderElement('span', '', '…');
+        gap.setAttribute('aria-hidden', 'true');
+        buttons.push(gap);
+      }
+      const button = orderElement('button', '', String(number));
+      button.type = 'button';
+      button.dataset.page = number;
+      button.setAttribute('aria-label', '第 ' + number + ' 页');
+      button.onclick = () => selectPage(number);
+      buttons.push(button);
+      previousNumber = number;
+    }
+    navigation.replaceChildren(...buttons);
+    navigation.dataset.pages = pagesKey;
+    if (focused) navigation.querySelector('button[data-page="' + page + '"]')?.focus();
+  }
+  const current = navigation.querySelector('button[data-page="' + page + '"]');
+  const previous = navigation.querySelector('[aria-current]');
+  if (previous !== current) {
+    previous?.removeAttribute('aria-current');
+    current?.setAttribute('aria-current', 'page');
+  }
+}
+function tradePrice(value) {
+  if (value == null || value === '' || !Number.isFinite(Number(value))) return '—';
+  const magnitude = Math.abs(Number(value));
+  const digits = magnitude >= 1 ? 2 : magnitude >= .01 ? 4 : 8;
+  return new Intl.NumberFormat('zh-CN', {maximumFractionDigits:digits}).format(value) + ' USDT';
+}
+function showPricePrecision(node, value) {
+  node.classList.add('trade-price');
+  if (value != null && value !== '') node.title = String(value) + ' USDT';
+}
+function holdingMetrics(position, leverage) {
+  const metrics = orderElement('dl', 'order-metrics position-metrics');
+  const money = value => value == null ? '—' : oneDecimal.format(value) + ' USDT';
+  const quantity = position.quantity + (position.notional == null ? '' : '（' + money(position.notional) + '）');
+  for (const [label, value, pnl, rawPrice] of [
+    ['开仓时间', date(position.opened)],
+    ['开仓均价', tradePrice(position.entry_price), null, position.entry_price],
+    ['当前标记价', tradePrice(position.mark_price), null, position.mark_price],
+    ['持仓数量', quantity],
+    ...(leverage == null ? [] : [['杠杆', leverage + '×']]),
+    ['浮盈亏', money(position.pnl), position.pnl],
+    ['浮盈亏率', position.roi == null ? '—' : oneDecimal.format(position.roi*100) + '%', position.roi],
+    ['预计平仓手续费', money(position.fee)]
+  ]) {
+    const field = document.createElement('div');
+    const data = orderElement('dd', '', value);
+    if (rawPrice != null) showPricePrecision(data, rawPrice);
+    if (pnl != null) colorPnL(data, pnl);
+    field.append(orderElement('dt', '', label), data);
+    metrics.append(field);
+  }
+  return metrics;
+}
+function positionDirection(quantity) {
+  const badge = orderElement('span', 'position-direction', quantity > 0 ? '多' : quantity < 0 ? '空' : '—');
+  badge.dataset.direction = quantity > 0 ? 'long' : quantity < 0 ? 'short' : 'unknown';
+  return badge;
+}
+function holdingStatus() {
+  const badge = orderElement('span', 'market-pill', '持仓中');
+  badge.dataset.tone = 'live';
+  return badge;
+}
+function orderCard(order, position, snapshot) {
+  const money = value => value == null || value === '' ? '—' : oneDecimal.format(value) + ' USDT';
+  const card = orderElement('article', 'order-card');
+  const direction = position ? Number(position.quantity) : ({SELL:1, BUY:-1}[order.side] || 0);
+  if (direction) card.dataset.side = direction > 0 ? 'buy' : 'sell';
+  const header = orderElement('header', 'order-card-header');
+  const badges = orderElement('div', 'order-badges');
+  badges.append(positionDirection(direction));
+  if (!position) {
+    const closed = orderElement('span', 'market-pill', '已平仓');
+    closed.dataset.tone = 'submit';
+    badges.append(closed);
+    const status = orderElement('span', 'market-pill', order.status === 'FILLED' ? '已成交' : order.status);
+    status.dataset.tone = order.status === 'FILLED' ? 'live' : 'warn';
+    badges.append(status);
+  } else {
+    badges.append(holdingStatus());
+  }
+  header.append(orderElement('h3', '', order.symbol), badges);
+
+  const metrics = orderElement('dl', 'order-metrics');
+  const times = orderElement('dl', 'order-times');
+  const add = (list, label, value, pnl, rawPrice) => {
+    const field = document.createElement('div');
+    const data = orderElement('dd', '', value);
+    if (rawPrice != null) showPricePrecision(data, rawPrice);
+    if (pnl != null) colorPnL(data, pnl);
+    field.append(orderElement('dt', '', label), data);
+    list.append(field);
+  };
+  const pending = order.reduce_only && order.status === 'FILLED' && order.pnl == null;
+  if (!position) {
+    add(metrics, '委托名义金额', money(order.notional));
+    add(metrics, '已成交金额', money(order.filled));
+    add(metrics, '杠杆', order.leverage == null ? '—' : order.leverage + '×');
+    const profit = orderElement('div', 'order-profit');
+    const amount = orderElement('strong', '', pending ? '待核对' : money(order.pnl));
+    colorPnL(amount, order.pnl);
+    profit.append(orderElement('small', '', '净收益'), amount);
+    card.append(header, orderElement('p', 'order-strategy', strategyNames[order.strategy] || '—'), profit);
+    add(metrics, '开仓均价', tradePrice(order.entry_price), null, order.entry_price);
+    add(metrics, '平仓均价', tradePrice(order.exit_price), null, order.exit_price);
+    add(metrics, '净收益率', order.roi == null ? '—' : oneDecimal.format(order.roi*100) + '%', order.roi);
+    add(metrics, '手续费', money(order.fees));
+    add(metrics, '资金费净额', money(order.funding));
+  } else {
+    card.append(header, orderElement('p', 'order-strategy', strategyNames[order.strategy] || '—'));
+  }
+  add(times, '开仓时间', date(order.opened));
+  if (!position) add(times, '平仓时间', date(order.closed));
+  add(times, '记录时间', date(order.time));
+  const details = document.createElement('details');
+  details.append(orderElement('summary', '', '客户端订单号'), orderElement('code', '', order.clientOrderId || '—'));
+  if (position) card.append(holdingMetrics(position, order.leverage), protectionPanel(position, snapshot));
+  else card.append(metrics, times);
+  card.append(details);
+  return card;
+}
+let protectionBusy = false;
+let protectionMessage = '';
+async function updateProtection(symbol, kind, current) {
+  const label = kind === 'stop' ? '止损' : '止盈';
+  const input = prompt(symbol + ' · 输入新的' + label + '触发价', current || '');
+  if (input == null || !input.trim() || protectionBusy) return;
+  protectionBusy = true;
+  protectionMessage = '正在向币安提交' + label + '更新…';
+  renderOrderCards();
+  try {
+    const params = new URLSearchParams({symbol, kind, price:input.trim()});
+    const response = await fetch('/strategy/protection?' + params, {
+      method:'POST', headers:{'X-Quant-Demo':'strategy'}
+    });
+    const result = await response.json();
+    if (!response.ok) throw Error(result.error);
+    protectionMessage = symbol + ' · ' + label + '已更新';
+  } catch (error) {
+    protectionMessage = symbol + ' · 更新未确认：' + error.message;
+  } finally {
+    protectionBusy = false;
+    renderOrderCards();
+    demoSync.click();
+  }
+}
+function protectionPanel(position, snapshot) {
+  const card = orderElement('div', 'order-protection');
+  card.append(orderElement('h4', '', '止盈止损'));
+  card.append(orderElement('small', '', '策略管理的仓位以策略保护范围为准。条件单触发成交后才核算交易手续费。'));
+  for (const [kind, type, label] of [
+    ['stop','STOP_MARKET','止损'], ['take','TAKE_PROFIT_MARKET','止盈']
+  ]) {
+    const line = orderElement('div', 'protection-line');
+    const orders = (position.protection || []).filter(order => order.type === type);
+    line.append(orderElement('span', '', label));
+    for (const order of orders) {
+      line.append(orderElement('strong', '', order.trigger));
+      const status = orderElement('span', 'market-pill', order.status === 'NEW' ? '已挂单' : order.status);
+      status.dataset.tone = order.status === 'NEW' ? 'live' : 'warn';
+      line.append(status);
+    }
+    if (!orders.length) line.append(orderElement('span', 'market-pill', snapshot.protection_error ? '未能核对' : '未挂单'));
+    if (Number(position.quantity) !== 0 && !snapshot.protection_error) {
+      const own = orders.filter(order => order.owned);
+      const button = orderElement('button', '', own.length ? '改价' : '挂单');
+      button.type = 'button';
+      button.disabled = protectionBusy || own.length > 1 || orders.length !== own.length;
+      button.onclick = () => updateProtection(position.symbol, kind, own[0]?.trigger);
+      line.append(button);
+    }
+    card.append(line);
+  }
+  return card;
+}
+async function loadStatistics() {
+  try {
+    const response = await fetch('/account/demo-statistics');
+    const rows = await response.json();
+    if (!response.ok) throw Error(rows.error);
+    const cards = rows.map(stat => {
+      const card = orderElement('article', 'order-card');
+      const heading = orderElement('h3', '', stat.name);
+      const metrics = orderElement('dl', 'order-metrics');
+      const fields = [
+        ['成交开仓', stat.opens], ['已核对平仓', stat.settled], ['平仓待核对', stat.pending],
+        ['累计净收益', stat.settled ? oneDecimal.format(stat.net) + ' USDT' : '—'],
+        ['胜率', stat.win_rate == null ? '—' : oneDecimal.format(stat.win_rate * 100) + '%'],
+        ['已实现损益夏普', stat.sharpe == null ? '—' : stat.sharpe.toFixed(2)]
+      ];
+      for (const [label, value] of fields) {
+        const field = document.createElement('div');
+        const data = orderElement('dd', '', String(value));
+        if (label === '累计净收益' && stat.settled) colorPnL(data, stat.net);
+        field.append(orderElement('dt', '', label), data);
+        metrics.append(field);
+      }
+      card.append(heading, metrics);
+      return card;
+    });
+    el('strategy-stats').replaceChildren(...cards);
+    el('stats-status').textContent = '';
+  } catch (error) {
+    el('stats-status').textContent = '读取统计失败：' + error.message;
+  }
+}
+let renderedOrders;
+let latestOrders = [];
+function renderOrderCards() {
+  const snapshot = accountMode.value === 'demo' ? accountSnapshot : null;
+  const message = el('protection-status');
+  message.hidden = !snapshot || (!protectionMessage && !snapshot.protection_error);
+  message.textContent = [protectionMessage, snapshot?.protection_error &&
+    '币安条件单查询失败：' + snapshot.protection_error].filter(Boolean).join(' · ');
+
+  const holdings = snapshot?.holdings || [];
+  const visibleHoldings = pageItems(holdings, 'positions-pages', renderOrderCards);
+  const signature = JSON.stringify([latestOrders, visibleHoldings, snapshot?.protection_error, protectionBusy]);
+  if (signature === renderedOrders) return;
+  const current = el('current-orders');
+  const open = new Set([...current.querySelectorAll('details[open] code')]
+    .map(node => node.textContent));
+  const activeCards = visibleHoldings.map(position => {
+    const side = Number(position.quantity) > 0 ? 'BUY' : 'SELL';
+    const entry = latestOrders.find(order => !order.reduce_only && order.side === side &&
+      order.symbol === position.symbol &&
+      (order.status === 'FILLED' || ((order.maker_only || order.time_in_force === 'IOC') && Number(order.executed_qty) > 0)) &&
+      (position.opening_order_id != null
+        ? String(position.opening_order_id) === String(order.exchange_order_id)
+        : position.opened && Number(position.opened) === Number(order.opened)));
+    if (entry) {
+      const card = orderCard(entry, position, snapshot);
+      card.querySelector('details').open = open.has(entry.clientOrderId);
+      return card;
+    }
+    const card = orderElement('article', 'order-card protection-card');
+    const header = orderElement('header', 'order-card-header');
+    const badges = orderElement('div', 'order-badges');
+    badges.append(positionDirection(Number(position.quantity)), holdingStatus());
+    header.append(orderElement('h3', '', position.symbol), badges);
+    card.append(header,
+      holdingMetrics(position),
+      protectionPanel(position, snapshot));
+    return card;
+  });
+  current.replaceChildren(...(activeCards.length ? activeCards :
+    [orderElement('p', 'order-strategy', snapshot ? '当前无持仓' : '等待账户同步')]));
+
+  renderedOrders = signature;
+}
+let historyRequest;
+let renderedHistory;
+async function loadHistory(page) {
+  if (page == null && historyRequest) return;
+  const requestedPage = page ?? el('history-pages').dataset.page ?? 1;
+  const request = fetch('/account/demo-history?page=' + requestedPage, {signal:AbortSignal.timeout(6000)});
+  historyRequest = request;
+  const status = el('order-status');
+  try {
+    const response = await request;
+    const history = await response.json();
+    if (historyRequest !== request) return;
+    if (!response.ok) throw Error(history.error || 'HTTP ' + response.status);
+    renderPagination('history-pages', history.page, history.pages, loadHistory);
+    const signature = JSON.stringify(history.orders);
+    if (signature !== renderedHistory) {
+      const grid = el('demo-orders');
+      const open = new Set([...grid.querySelectorAll('details[open] code')].map(node => node.textContent));
+      const cards = history.orders.map(order => {
+        const card = orderCard(order);
+        card.querySelector('details').open = open.has(order.clientOrderId);
+        return card;
+      });
+      grid.replaceChildren(...cards);
+      renderedHistory = signature;
+    }
+    status.textContent = history.orders.length ? '' : '暂无本程序记录的已平仓交易';
+  } catch (error) {
+    if (historyRequest === request) status.textContent = '读取交易历史失败：' + error.message;
+  } finally {
+    if (historyRequest === request) historyRequest = null;
+  }
+}
+function renderDecisions() {
+  const items = pageItems(latestOrders, 'decisions-pages', renderDecisions).map(order => {
+    const item = orderElement('article', 'decision-item');
+    const action = order.reduce_only
+      ? (order.side === 'BUY' ? '平空' : '平多')
+      : (order.side === 'SELL' ? '开空' : '开多');
+    const decision = order.decision;
+    const orderLabels = {FILLED:'已成交', NEW:'已挂单', PARTIALLY_FILLED:'部分成交 · 待核对',
+      CANCELED:'已撤单', EXPIRED:'已到期', EXPIRED_IN_MATCH:'撮合失效', REJECTED:'已拒单'};
+    const endedWithFill = ['CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH'].includes(order.status) && Number(order.executed_qty) > 0;
+    const status = endedWithFill ? '部分成交 · 剩余委托已结束' : (orderLabels[order.status] || order.status);
+    item.append(orderElement('strong', '', order.symbol + ' · ' + action + ' · ' + status),
+      orderElement('p', '', decision?.reason || '旧订单未记录决策原因'),
+      orderElement('small', '', [strategyNames[order.strategy], date(decision?.signal_at || order.closed || order.opened || order.time),
+        order.limit_price ? '限价 ' + order.limit_price : '', decision?.detail].filter(Boolean).join(' · ')));
+    if (order.status_reason || (order.status === 'NEW' && order.entry_expires_at)) {
+      item.append(orderElement('p', '', [order.status_reason, order.status === 'NEW' && order.entry_expires_at &&
+        '计划撤单时间 ' + date(order.entry_expires_at)].filter(Boolean).join(' · ')));
+    }
+    return item;
+  });
+  el('decision-events').replaceChildren(...(items.length ? items : [orderElement('p', '', '暂无决策记录')]));
+}
+const runtimeTimeFormat = new Intl.DateTimeFormat('zh-CN', {
+  year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit',
+  second:'2-digit', fractionalSecondDigits:3, hourCycle:'h23'
+});
+let runtimeRequestPending = false;
+let renderedRuntimeLogs;
+let latestRuntimeLogs = [];
+function renderRuntimeLogs() {
+  const items = pageItems(latestRuntimeLogs, 'runtime-pages', renderRuntimeLogs).map(event => {
+    const item = orderElement('article', 'decision-item');
+    const time = orderElement('time', '', runtimeTimeFormat.format(event.at));
+    time.dateTime = new Date(event.at).toISOString();
+    const meta = orderElement('small', '');
+    meta.append(time);
+    if (strategyNames[event.mode]) meta.append(' · ' + strategyNames[event.mode]);
+    item.append(orderElement('strong', '', event.message));
+    if (event.detail) item.append(orderElement('p', '', event.detail));
+    item.append(meta);
+    return item;
+  });
+  el('runtime-events').replaceChildren(...items);
+}
+async function loadRuntimeLogs() {
+  if (runtimeRequestPending) return;
+  runtimeRequestPending = true;
+  const status = el('runtime-status');
+  try {
+    const response = await fetch('/strategy/logs', {cache:'no-store', signal:AbortSignal.timeout(6000)});
+    if (!response.ok) throw Error('HTTP ' + response.status);
+    const events = await response.json();
+    const signature = JSON.stringify(events);
+    if (signature !== renderedRuntimeLogs) {
+      latestRuntimeLogs = events;
+      renderRuntimeLogs();
+      renderedRuntimeLogs = signature;
+    }
+    status.textContent = events.length ? '' : '暂无运行记录';
+  } catch (error) {
+    status.textContent = '读取运行日志失败：' + error.message;
+  } finally {
+    runtimeRequestPending = false;
+  }
+}
+async function loadOrders() {
+  try {
+    const response = await fetch('/account/demo-orders');
+    const orders = await response.json();
+    if (!response.ok) throw Error(orders.error);
+    latestOrders = orders;
+    renderOrderCards();
+    if (!el('decisions-panel').hidden) renderDecisions();
+    const returns = await fetch('/account/demo-realized-return');
+    if (returns.ok) {
+      realizedReturnSnapshot = await returns.json();
+      showRealizedReturn();
+    }
+  } catch (error) {
+    console.error('读取订单失败：', error);
+  }
+}
+let strategyChecks = {};
+let statusRequest = null;
+let statusReceivedAt = null;
+let lastProgressAt = Date.now();
+let progressKey = '';
+let strategyState = null;
+let strategyAction = null;
+let strategyStatusFailed = false;
+let marketCatalog = null;
+function renderStrategyControls() {
+  const start = el('strategy-start');
+  const stop = el('strategy-stop');
+  const running = Boolean(strategyState?.running);
+  const stopping = strategyAction === 'stop' || Boolean(strategyState?.draining);
+  const blocked = Boolean(strategyState?.switch_blocked);
+  const locked = !strategyState || running || stopping || blocked || strategyAction !== null;
+  strategyMode.disabled = locked;
+  start.disabled = locked;
+  start.dataset.running = String(running && !stopping);
+  if (stopping) start.textContent = '正在停止策略…';
+  else if (running) start.textContent = '✓ 策略运行中';
+  else if (strategyAction === 'start') start.textContent = '正在启动策略…';
+  else if (blocked) start.textContent = '平仓待确认';
+  else if (strategyState) start.textContent = '启动模拟策略';
+  else start.textContent = strategyStatusFailed ? '后台状态暂不可用' : '正在同步状态…';
+  stop.disabled = !strategyState || stopping || strategyAction !== null;
+  stop.textContent = stopping ? '正在停止并平仓…' : '停止并平仓';
+  for (const checkbox of config.querySelectorAll('[name=asset]')) checkbox.disabled = locked;
+}
+function setMarketPill(cell, label, tone) {
+  if (cell.firstElementChild?.textContent === label && cell.firstElementChild.dataset.tone === tone) return;
+  const pill = document.createElement('span');
+  pill.className = 'market-pill updated';
+  pill.dataset.tone = tone;
+  pill.textContent = label;
+  cell.replaceChildren(pill);
+}
+function renderStrategyCheck(item) {
+  const label = strategyChecks[item.dataset.asset];
+  const tones = [
+    [/委托待核对|挂单等待成交/, 'warn'],
+    [/信号成立.*等待下单检查/, 'signal'],
+    [/均线|趋势未确认/, 'trend'],
+    [/突破.*最高价|等待突破/, 'breakout'],
+    [/ATR/, 'volatility'],
+    [/正在提交|设置杠杆/, 'submit'],
+    [/正在读取行情/, 'busy'],
+    [/已成交/, 'live'],
+    [/已平仓|仓位关闭/, 'handled'],
+    [/保护单待核对/, 'warn'],
+    [/持仓/, 'holding'],
+    [/不可用|不可交易|未匹配/, 'error'],
+    [/跳过/, 'skip'],
+    [/信号成立|入场候选/, 'signal'],
+    [/已处理/, 'handled']
+  ];
+  const tone = tones.find(([pattern]) => pattern.test(label || ''))?.[1] || '';
+  setMarketPill(item.cells[4], label || '—', tone);
+}
+function renderStatusConnection() {
+  const age = statusReceivedAt === null ? null : Math.floor((Date.now() - statusReceivedAt)/1000);
+  const pulse = el('market-pulse');
+  const idleSeconds = Math.floor((Date.now() - lastProgressAt)/1000);
+  if (age !== null && age < 10 && strategyState?.running && idleSeconds >= 90) {
+    pulse.dataset.tone = 'error';
+    pulse.textContent = '本地服务在线 · 策略 ' + idleSeconds + ' 秒无新进度';
+    return;
+  }
+  pulse.dataset.tone = age !== null && age < 10 ? 'live' : age === null && statusRequest ? '' : 'error';
+  pulse.textContent = age === null
+    ? (statusRequest ? '正在连接' : '尚未取得策略状态')
+    : age < 10 ? '自动更新 · ' + age + ' 秒前' : '状态更新延迟 · ' + age + ' 秒未收到';
+}
+function strategyStatus() {
+  if (!statusRequest) {
+    statusRequest = refreshStrategyStatus().finally(() => {
+      statusRequest = null;
+      renderStrategyControls();
+      renderStatusConnection();
+    });
+  }
+  return statusRequest;
+}
+async function refreshStrategyStatus() {
+  try {
+    const response = await fetch('/strategy', {cache:'no-store', signal:AbortSignal.timeout(6000)});
+    if (!response.ok) throw Error('HTTP ' + response.status);
+    const state = await response.json();
+    strategyChecks = state.checks || {};
+    const wasRunning = strategyState?.running;
+    strategyState = state;
+    strategyStatusFailed = false;
+    if (wasRunning && !state.running && accountMode.value === 'demo' && !demoSync.disabled) demoSync.click();
+    const nextKey = JSON.stringify([state.status, state.checked_at, strategyChecks, state.running]);
+    if (nextKey !== progressKey) {
+      progressKey = nextKey;
+      lastProgressAt = Date.now();
+    }
+    statusReceivedAt = Date.now();
+    for (const item of el('market-rows').rows) renderStrategyCheck(item);
+    const checks = Object.values(strategyChecks);
+    const pending = checks.filter(label => label === '正在读取行情').length;
+    el('scan-status').textContent = state.running && pending
+      ? '正在检查 ' + (checks.length - pending) + '/' + checks.length
+      : state.checked_at
+        ? '最近一轮 ' + date(state.checked_at) + ' · 耗时 ' + (state.scan_ms/1000).toFixed(1) + ' 秒'
+        : '';
+    if (state.running || state.switch_blocked) strategyMode.value = state.mode;
+    if (state.running && Array.isArray(state.assets)) {
+      let selectionChanged = false;
+      for (const checkbox of config.querySelectorAll('[name=asset]')) {
+        const selected = state.assets.includes(checkbox.value);
+        if (checkbox.checked !== selected) {
+          checkbox.checked = selected;
+          selectionChanged = true;
+        }
+      }
+      if (selectionChanged) renderMarketRows();
+    }
+    el('strategy-status').textContent = state.running
+      ? strategyNames[state.mode] + ' · ' + state.status : state.status;
+  } catch (error) {
+    strategyStatusFailed = true;
+    el('strategy-status').textContent = '无法读取策略状态：' + error.message;
+  }
+}
+for (const action of ['start','stop']) {
+  const button = el('strategy-' + action);
+  button.onclick = async () => {
+    if (button.disabled || strategyAction) return;
+    if (action === 'stop' && !confirm('停止后台策略并平掉币安模拟盘的所有单向持仓？')) return;
+    const params = new URLSearchParams(new FormData(config));
+    params.set('strategy', strategyMode.value);
+    strategyAction = action;
+    renderStrategyControls();
+    let actionError;
+    try {
+      const response = await fetch('/strategy/' + action + '?' + params, {
+        method:'POST', headers:{'X-Quant-Demo':'strategy'}, signal:AbortSignal.timeout(6000)
+      });
+      if (!response.ok) throw Error((await response.json()).error);
+    } catch (error) {
+      actionError = error.message;
+    } finally {
+      if (statusRequest) await statusRequest;
+      await strategyStatus();
+      strategyAction = null;
+      renderStrategyControls();
+      if (actionError) el('strategy-status').textContent = actionError;
+    }
+  };
+}
+function renderMarketRows() {
+  if (!marketCatalog) return;
+  const selected = new Set([...config.querySelectorAll('[name=asset]:checked')].map(checkbox => checkbox.value));
+  el('market-rows').replaceChildren();
+  for (const market of marketCatalog) {
+    if (!selected.has(market.asset)) continue;
+    const tradeable = market.status === 'TRADING' &&
+      ['PERPETUAL', 'TRADIFI_PERPETUAL'].includes(market.contract_type);
+    const status = tradeable ? '可交易' : market.status ?? '目录未匹配此代码';
+    const item = row('market-rows', [name(market.asset), market.symbol, status, market.contract_type ?? '—', strategyChecks[market.asset] || '—']);
+    item.dataset.asset = market.asset;
+    setMarketPill(item.cells[2], status, tradeable ? 'live' : market.status ? 'warn' : '');
+    renderStrategyCheck(item);
+  }
+}
+config.addEventListener('change', renderMarketRows);
+async function loadMarketStatus() {
+  try {
+    const response = await fetch('/strategy/markets');
+    const markets = await response.json();
+    if (!response.ok) throw Error(markets.error);
+    marketCatalog = markets;
+    renderMarketRows();
+    el('market-status').textContent = '币安模拟盘目录 · ' + date(Date.now());
+  } catch (error) {
+    el('market-status').textContent += ' · 本次未能验证：' + error.message;
+  }
+}
+renderStrategyControls();
+loadMarketStatus();
+strategyStatus();
+setInterval(strategyStatus, 2500);
+setInterval(renderStatusConnection, 1000);
+demoSync.click();
+setInterval(() => {
+  if (accountMode.value === 'demo' && !demoSync.disabled) demoSync.click();
+}, 5000);
+setInterval(updateAccountStatus, 1000);
+loadOrders();
+setInterval(loadOrders, 10000);
+const positionTabs = [...document.querySelectorAll('.position-tabs button')];
+for (const tab of positionTabs) {
+  tab.onclick = () => {
+    for (const item of positionTabs) {
+      item.setAttribute('aria-pressed', String(item === tab));
+      el(item.getAttribute('aria-controls')).hidden = item !== tab;
+    }
+    if (tab.getAttribute('aria-controls') === 'decisions-panel') renderDecisions();
+    if (tab.getAttribute('aria-controls') === 'runtime-panel') loadRuntimeLogs();
+    if (tab.getAttribute('aria-controls') === 'history-panel') loadHistory();
+  };
+}
+setInterval(() => {
+  if (!el('runtime-panel').hidden) loadRuntimeLogs();
+}, 2500);
+setInterval(() => {
+  if (!el('history-panel').hidden) loadHistory();
+}, 10000);
+const statsToggle = el('stats-toggle');
+const statsPanel = el('stats-panel');
+statsToggle.onclick = () => {
+  statsPanel.hidden = !statsPanel.hidden;
+  statsToggle.setAttribute('aria-expanded', String(!statsPanel.hidden));
+  statsToggle.textContent = statsPanel.hidden ? '查看策略统计' : '收起策略统计';
+  if (!statsPanel.hidden) loadStatistics();
+};
+setInterval(() => {
+  if (!statsPanel.hidden) loadStatistics();
+}, 15000);
+</script></html>
