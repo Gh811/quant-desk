@@ -984,8 +984,10 @@ class DemoStrategy:
                     details = '：' + '、'.join(sorted(unmatched)) if unmatched else ''
                     raise ValueError('账户持仓无法与所选策略的开仓成交核对' + details)
                 self.checks = {**self.checks, **{symbol[:-4]: ('限价挂单等待成交' if symbol in resting_entries
+                                                            else f'平仓委托待核对 · {status}' if symbol in pending_closes
                                                             else f'委托待核对 · {status}')
-                               for symbol, status in pending_symbols.items() if symbol[:-4] in assets}}
+                               for symbol, status in pending_symbols.items()
+                               if symbol[:-4] in assets and (symbol not in protection_errors or symbol in pending_closes)}}
                 closed = False
                 pending_partial_entry = False
                 for symbol, (amount, opened, leverage, stop_loss, opening_id) in list(holdings.items()):
@@ -1047,12 +1049,17 @@ class DemoStrategy:
                             protection_errors.pop(symbol, None)
                             self.checks = {**self.checks, symbol[:-4]: '持仓监控中'}
                         except (OSError, ValueError, KeyError, ArithmeticError, sqlite3.Error) as error:
-                            protection_errors[symbol] = str(error)
-                            self.checks = {**self.checks, symbol[:-4]: '持仓中 · 保护单待核对'}
+                            detail = str(error)
+                            if protection_errors.get(symbol) != detail:
+                                record_runtime('保护单核对异常', mode=mode, detail=f'{symbol} · {detail}')
+                            protection_errors[symbol] = detail
                             try:
                                 missing_stop = not confirmed_strategy_stop(symbol, minimum_stop, direction=direction)
                             except (OSError, ValueError, KeyError, ArithmeticError):
                                 missing_stop = True
+                            label = ('止损未确认 · 等待开仓余单核对' if missing_stop
+                                     else '止损有效 · 保护单待核对')
+                            self.checks = {**self.checks, symbol[:-4]: label}
                     if timed_out or fixed_exit or trailing or missing_stop:
                         if symbol in pending_entries:
                             continue
@@ -1068,6 +1075,7 @@ class DemoStrategy:
                         else:
                             reason, threshold = '无法确认有效止损，保护性退出', protection_errors.get(symbol, '')
                         decision = dict(reason=reason, detail=f'判断时浮动收益率 {price_return:.3%} · {threshold}')
+                        self.checks = {**self.checks, symbol[:-4]: f'正在提交平仓 · {reason}'}
                         order = close_strategy_position(symbol, amount, opened, leverage, opening_id, mode, decision)
                         if order and order['status'] in DEMO_ORDER_PENDING:
                             pending_symbols[symbol] = order['status']
@@ -1126,10 +1134,15 @@ class DemoStrategy:
                             symbol = asset + 'USDT'
                             item = listed.get(symbol)
                             if symbol in pending_symbols:
-                                checks[asset] = ('限价挂单等待成交' if symbol in resting_entries
-                                                 else f'委托待核对 · {pending_symbols[symbol]}')
+                                if symbol in pending_closes:
+                                    checks[asset] = f'平仓委托待核对 · {pending_symbols[symbol]}'
+                                elif symbol in protection_errors and asset in self.checks:
+                                    checks[asset] = self.checks[asset]
+                                else:
+                                    checks[asset] = ('限价挂单等待成交' if symbol in resting_entries
+                                                     else f'委托待核对 · {pending_symbols[symbol]}')
                             elif symbol in holdings:
-                                checks[asset] = ('持仓中 · 保护单待核对' if symbol in protection_errors else '持仓监控中')
+                                checks[asset] = self.checks.get(asset, '持仓监控中')
                             elif not item:
                                 checks[asset] = '模拟盘目录未匹配'
                             elif (item['status'] != 'TRADING' or item['contractType'] not in
@@ -1330,7 +1343,10 @@ class DemoStrategy:
                     self.status += f' · {len(protection_errors)} 个持仓的保护单待核对'
                 if pending_partial_entry:
                     continue
-                self.stop.wait(3 if pending_symbols else 10 if mode == 'fast' else 30)
+                if protection_errors:
+                    self.stop.wait(2)
+                else:
+                    self.stop.wait(3 if pending_symbols else 10 if mode == 'fast' else 30)
             self.status = '已停止' + (' · 仍有持仓，请手动管理' if holdings else '')
         except HTTPError as error:
             endpoint = urlsplit(error.url or '').path
