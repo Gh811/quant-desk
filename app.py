@@ -700,10 +700,10 @@ def entry_stop_fraction(asset, mode, volatility):
     return min(high, max(low, 2 * volatility))
 
 
-def closed_demo_bars(symbol, interval, cutoff, required):
+def closed_demo_bars(symbol, interval, cutoff, required, *, venue=DEMO_VENUE):
     minutes = TIMEFRAME_MINUTES[interval]
     duration = minutes * 60000
-    raw = request(DEMO_VENUE, '/fapi/v1/klines', symbol=symbol, interval=interval, limit=65)
+    raw = request(venue, '/fapi/v1/klines', symbol=symbol, interval=interval, limit=65)
     closed = [row for row in raw if int(row[6]) < cutoff][-required:]
     bars = [(int(row[0]), *map(float, row[1:5])) for row in closed]
     if (len(bars) < required or cutoff - int(closed[-1][6]) > duration + 15000
@@ -751,19 +751,20 @@ def entry_signal(symbol, strategy, bars=None):
     return bars[-1][0], score, volatility, reason
 
 
-def scan_entry_signal(symbol, mode):
+def scan_entry_signal(symbol, mode, *, venue=DEMO_VENUE):
     base, confirm, backdrop = SIGNAL_TIMEFRAMES[mode]
-    bars, raw = closed_demo_bars(symbol, base, demo_now_ms(), 49)
+    now = demo_now_ms() if venue == DEMO_VENUE else time.time_ns() // 1_000_000
+    bars, raw = closed_demo_bars(symbol, base, now, 49, venue=venue)
     candle, score, volatility, reason = entry_signal(symbol, mode, bars)
     if score is None:
         return candle, None, volatility, reason, {}
 
     signal_at = candle + STRATEGY_INTERVALS[mode]
     direction = 1 if score > 0 else -1
-    confirmation, _ = closed_demo_bars(symbol, confirm, signal_at, 48)
+    confirmation, _ = closed_demo_bars(symbol, confirm, signal_at, 48, venue=venue)
     if not trend_metrics(confirmation, direction)[0]:
         return candle, None, volatility, f'{reason} · {confirm} 趋势未确认', {}
-    background, _ = closed_demo_bars(symbol, backdrop, signal_at, 48)
+    background, _ = closed_demo_bars(symbol, backdrop, signal_at, 48, venue=venue)
     if trend_metrics(background, -direction)[0]:
         return candle, None, volatility, f'{reason} · {backdrop} 趋势反向', {}
     aligned = trend_metrics(background, direction)[0]
@@ -1399,6 +1400,225 @@ class DemoStrategy:
             self.lock.release()
 
 
+SHADOW_FEE = Decimal('.0005')
+SHADOW_NOTIONAL = Decimal('100')
+SHADOW_DATA_ERRORS = (OSError, ValueError, KeyError, TypeError, ArithmeticError)
+
+
+class LiveMarketSimulation:
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.wake = threading.Event()
+        self.generation = 0
+        self.checks = {}
+        self.error = None
+        self.state = (json.loads(path.read_text()) if path.exists() else
+                      dict(enabled=False, mode='fast', assets=[], positions={}, trades=[], last_entry={}))
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def save(self, **changes):
+        state = dict(self.state, **changes)
+        temporary = self.path.with_suffix('.tmp')
+        with temporary.open('w', encoding='utf-8') as stream:
+            json.dump(state, stream, ensure_ascii=False)
+        temporary.replace(self.path)
+        self.state = state
+
+    def configure(self, enabled, mode, assets):
+        with self.lock:
+            if enabled and self.state['positions'] and (
+                    mode != self.state['mode'] or not set(self.state['positions']) <= {a+'USDT' for a in assets}):
+                raise ValueError('请等虚拟持仓结束再切换策略或移除持仓标的')
+            changes = dict(enabled=enabled)
+            if enabled:
+                changes.update(mode=mode, assets=sorted(assets))
+            self.save(**changes)
+            self.checks = {}
+            self.generation += 1
+            self.wake.set()
+
+    def snapshot(self):
+        with self.lock:
+            return dict(enabled=self.state['enabled'], mode=self.state['mode'],
+                        assets=self.state['assets'], positions=list(self.state['positions'].values()),
+                        trades=self.state['trades'][:30], checks=self.checks.copy(), error=self.error,
+                        realized=str(sum((Decimal(t['net']) for t in self.state['trades']), Decimal(0))))
+
+    @staticmethod
+    def quote(symbol):
+        book = request('Binance', '/fapi/v1/ticker/bookTicker', symbol=symbol)
+        bid, ask = Decimal(book['bidPrice']), Decimal(book['askPrice'])
+        now = time.time_ns() // 1_000_000
+        if (book['symbol'] != symbol or not 0 < bid <= ask
+                or not -1000 <= now - int(book['time']) <= 5000):
+            raise ValueError('实盘盘口无效或已过期')
+        return book, bid, ask
+
+    def check_position(self, position):
+        symbol = position['symbol']
+        direction = position['direction']
+        amount, entry = Decimal(position['amount']), Decimal(position['entry'])
+        exit_price, closed, reason = position.get('exit'), position.get('closed'), position.get('reason')
+        if exit_price is None:
+            reference = request('Binance', '/fapi/v1/premiumIndex', symbol=symbol)
+            mark = Decimal(reference['markPrice'])
+            now = time.time_ns() // 1_000_000
+            if (reference['symbol'] != symbol or not mark.is_finite() or mark <= 0
+                    or not -1000 <= now - int(reference['time']) <= 10_000):
+                raise ValueError('实盘标记价无效或已过期')
+            change = direction * (mark / entry - 1)
+            risk = Decimal(position['risk'])
+            if change <= -risk:
+                reason = '止损'
+            elif change >= 2 * risk:
+                reason = '止盈'
+            elif position['expires'] is not None and now >= position['expires']:
+                reason = '最长持仓时间'
+            else:
+                return
+            book, bid, ask = self.quote(symbol)
+            if Decimal(book['bidQty' if direction > 0 else 'askQty']) < amount:
+                raise ValueError(f'{reason}已触发，但一档深度不足，成交未确认')
+            exit_price, closed = str(bid if direction > 0 else ask), int(book['time'])
+            position = dict(position, exit=exit_price, closed=closed, reason=reason)
+            with self.lock:
+                self.save(positions={**self.state['positions'], symbol: position})
+
+        rows = request('Binance', '/fapi/v1/fundingRate', symbol=symbol,
+                       startTime=position['opened'] + 1, endTime=closed, limit=1000) if closed > position['opened'] else []
+        if not isinstance(rows, list) or len(rows) >= 1000:
+            raise ValueError('资金费明细待核对')
+        funding = -direction * amount * sum(
+            (Decimal(row['fundingRate']) * Decimal(row['markPrice']) for row in rows), Decimal(0))
+        price = Decimal(exit_price)
+        fees = SHADOW_FEE * amount * (entry + price)
+        net = direction * amount * (price - entry) - fees + funding
+        with self.lock:
+            positions = self.state['positions'].copy()
+            positions.pop(symbol)
+            self.save(positions=positions, trades=[dict(position, net=str(net), funding=str(funding),
+                                                        fees=str(fees)), *self.state['trades']])
+
+    def scan(self, generation, mode, assets):
+        catalog = {item['symbol']: item for item in request('Binance', '/fapi/v1/exchangeInfo')['symbols']}
+        candidates = []
+        checks = {}
+        with self.lock:
+            occupied = set(self.state['positions'])
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            jobs = {}
+            for asset in assets:
+                symbol = asset + 'USDT'
+                if symbol in occupied:
+                    continue
+                item = catalog.get(symbol)
+                if not item or item['status'] != 'TRADING' or item['contractType'] not in {'PERPETUAL', 'TRADIFI_PERPETUAL'}:
+                    checks[symbol] = '实盘合约当前不可交易或未找到'
+                    continue
+                jobs[pool.submit(scan_entry_signal, symbol, mode, venue='Binance')] = (asset, item)
+            for job in as_completed(jobs):
+                asset, item = jobs[job]
+                symbol = item['symbol']
+                try:
+                    candle, score, volatility, reason, signal = job.result()
+                    checks[symbol] = reason
+                    if score is not None:
+                        candidates.append((signal['priority'], candle, score, volatility, signal, asset, item))
+                except SHADOW_DATA_ERRORS as error:
+                    checks[symbol] = f'实盘行情不可用 · {error}'
+        for _, candle, score, volatility, signal, asset, item in sorted(candidates, key=lambda x: x[0], reverse=True):
+            symbol = item['symbol']
+            with self.lock:
+                if generation != self.generation or not self.state['enabled']:
+                    return
+                if len(self.state['positions']) >= (5 if mode == 'fast' else 3):
+                    checks[symbol] = '虚拟持仓已满'
+                    continue
+                if self.state['last_entry'].get(f'{mode}:{symbol}') == candle:
+                    checks[symbol] = '本根 K 线已有虚拟成交'
+                    continue
+            try:
+                book, bid, ask = self.quote(symbol)
+                direction = 1 if score > 0 else -1
+                midpoint = (bid + ask) / 2
+                if (direction * (midpoint / signal['close'] - 1) > volatility / 2
+                        or direction * (midpoint / signal['boundary'] - 1) < -volatility / 4):
+                    checks[symbol] = '盘口偏离信号或已反穿触发位'
+                    continue
+                risk = entry_stop_fraction(asset, mode, volatility)
+                hours = {'fast': 1, 'intraday': 4, 'swing': 48, 'us_open': 1.5}[mode]
+                reference = request('Binance', '/fapi/v1/premiumIndex', symbol=symbol)
+                now = time.time_ns() // 1_000_000
+                if not -1000 <= now - int(book['time']) <= 5000:
+                    checks[symbol] = '盘口过期，等下轮重查'
+                    continue
+                if not 0 <= now - (candle + STRATEGY_INTERVALS[mode]) < STRATEGY_INTERVALS[mode]:
+                    checks[symbol] = '信号已过期'
+                    continue
+                funding_at = int(reference['nextFundingTime'])
+                if reference['symbol'] != symbol or not -1000 <= now-int(reference['time']) <= 10_000 or (
+                        funding_at and funding_at < now-1000):
+                    raise ValueError('实盘资金费参考数据过期')
+                funding = (max(Decimal(0), direction * Decimal(reference['lastFundingRate']))
+                           if funding_at and funding_at <= now + hours * HOUR else Decimal(0))
+                cost = (ask - bid) / midpoint + 2 * SHADOW_FEE + funding
+                filters = {f['filterType']: f for f in item['filters']}
+                lot = filters['LOT_SIZE']
+                step = Decimal(lot['stepSize'])
+                price, amount, tif = select_demo_entry(direction, book, bid, ask, SHADOW_NOTIONAL, step, risk, cost)
+                if tif != 'IOC':
+                    checks[symbol] = '限价排队 · 成交未确认'
+                    continue
+                if (not Decimal(lot['minQty']) <= amount <= Decimal(lot['maxQty'])
+                        or price * amount < Decimal(filters.get('MIN_NOTIONAL', {}).get('notional', '0'))):
+                    checks[symbol] = '虚拟委托数量或金额低于合约要求'
+                    continue
+                opened = int(book['time'])
+                position = dict(symbol=symbol, direction=direction, amount=str(amount), entry=str(price),
+                                risk=str(risk), opened=opened, expires=None if mode == 'fast' else opened+int(hours*HOUR), mode=mode)
+                with self.lock:
+                    if generation != self.generation or not self.state['enabled']:
+                        return
+                    self.save(positions={**self.state['positions'], symbol: position},
+                              last_entry={**self.state['last_entry'], f'{mode}:{symbol}': candle})
+                checks[symbol] = '已估算虚拟成交'
+            except SHADOW_DATA_ERRORS as error:
+                checks[symbol] = f'实盘入场数据不可用 · {error}'
+        with self.lock:
+            if generation == self.generation:
+                self.checks = checks
+
+    def run(self):
+        next_scan = 0
+        last_generation = -1
+        while True:
+            with self.lock:
+                self.wake.clear()
+                enabled, mode, assets = (self.state[key] for key in ('enabled', 'mode', 'assets'))
+                positions = list(self.state['positions'].values())
+                generation = self.generation
+            if not enabled and not positions:
+                self.wake.wait()
+                continue
+            errors = []
+            try:
+                for position in positions:
+                    try:
+                        self.check_position(position)
+                    except SHADOW_DATA_ERRORS as error:
+                        errors.append(f"{position['symbol']} · {error}")
+                if enabled and (generation != last_generation or time.monotonic() >= next_scan):
+                    last_generation = generation
+                    next_scan = time.monotonic() + 20
+                    self.scan(generation, mode, assets)
+            except SHADOW_DATA_ERRORS as error:
+                errors.append(str(error))
+            with self.lock:
+                self.error = '；'.join(errors) or None
+            self.wake.wait(3)
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         if (self.headers.get('Origin') != 'http://127.0.0.1:8765'
@@ -1408,7 +1628,21 @@ class Handler(BaseHTTPRequestHandler):
             return
         parsed = urlsplit(self.path)
         strategy = self.server.strategy
-        if parsed.path == '/strategy/protection':
+        if parsed.path in {'/shadow/start', '/shadow/pause'}:
+            params = parse_qs(parsed.query)
+            enabled = parsed.path == '/shadow/start'
+            mode = params.get('strategy', ['fast'])[0]
+            assets = set(params.get('asset', ())) & set(ASSETS)
+            if mode == 'us_open':
+                assets &= US_EQUITY_ASSETS
+            try:
+                if enabled and (mode not in STRATEGY_NAMES or not assets):
+                    raise ValueError('请选择策略和至少一个适用标的')
+                self.server.shadow.configure(enabled, mode, assets)
+            except (ValueError, OSError) as error:
+                self.send(409, 'application/json', json.dumps({'error':str(error)}).encode())
+                return
+        elif parsed.path == '/strategy/protection':
             params = parse_qs(parsed.query)
             try:
                 replace_protection(params['symbol'][0], params['kind'][0], params['price'][0])
@@ -1478,6 +1712,9 @@ class Handler(BaseHTTPRequestHandler):
                                      status=item['status'] if item else None,
                                      contract_type=item['contractType'] if item else None))
                 self.send(200, 'application/json', json.dumps(rows).encode())
+                return
+            if parsed.path == '/shadow':
+                self.send(200, 'application/json', json.dumps(self.server.shadow.snapshot()).encode())
                 return
             if parsed.path == '/strategy':
                 self.send(200, 'application/json', json.dumps(dict(status=self.server.strategy.status, mode=self.server.strategy.mode,
@@ -2122,6 +2359,7 @@ if __name__ == '__main__':
         sys.exit(0)
     server = ThreadingHTTPServer(('127.0.0.1',8765),Handler)
     server.strategy = DemoStrategy()
+    server.shadow = LiveMarketSimulation(journal_path().with_name('live-market-simulation.json'))
     if os.getenv('BINANCE_DEMO_API_KEY') and os.getenv('BINANCE_DEMO_API_SECRET'):
         threading.Thread(target=protection_watch, daemon=True).start()
     print('http://127.0.0.1:8765', flush=True)
