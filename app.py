@@ -3,6 +3,7 @@ import json
 import math
 import os
 import time
+from datetime import datetime
 import threading
 import sys
 import sqlite3
@@ -788,9 +789,15 @@ def fast_structure_stop(entry, direction, extreme, volatility, base_stop, contra
 
 
 def scan_entry_signal(symbol, mode, *, venue=DEMO_VENUE):
-    base, confirm, backdrop = SIGNAL_TIMEFRAMES[mode]
     now = demo_now_ms() if venue == DEMO_VENUE else time.time_ns() // 1_000_000
-    bars, raw = closed_demo_bars(symbol, base, now, 49, venue=venue)
+    def read(interval, cutoff, required):
+        return closed_demo_bars(symbol, interval, cutoff, required, venue=venue)
+    return evaluate_entry_signal(symbol, mode, now, read)
+
+
+def evaluate_entry_signal(symbol, mode, now, read):
+    base, confirm, backdrop = SIGNAL_TIMEFRAMES[mode]
+    bars, raw = read(base, now, 49)
     candle, score, volatility, reason = entry_signal(symbol, mode, bars)
     stressed = False
     retest = None
@@ -808,10 +815,10 @@ def scan_entry_signal(symbol, mode, *, venue=DEMO_VENUE):
 
     signal_at = candle + STRATEGY_INTERVALS[mode]
     direction = 1 if score > 0 else -1
-    confirmation, _ = closed_demo_bars(symbol, confirm, signal_at, 48, venue=venue)
+    confirmation, _ = read(confirm, signal_at, 48)
     if not trend_metrics(confirmation, direction)[0]:
         return candle, None, volatility, f'{reason} · {confirm} 趋势未确认', {}
-    background, _ = closed_demo_bars(symbol, backdrop, signal_at, 48, venue=venue)
+    background, _ = read(backdrop, signal_at, 48)
     if trend_metrics(background, -direction)[0]:
         return candle, None, volatility, f'{reason} · {backdrop} 趋势反向', {}
     aligned = trend_metrics(background, direction)[0]
@@ -845,6 +852,176 @@ def scan_entry_signal(symbol, mode, *, venue=DEMO_VENUE):
         detail=f'{confirm} 同向 · {backdrop}{" 同向" if aligned else " 中性"} · '
                f'相对成交量 {relative_volume:.2f}× · 同向主动成交 {side_flow:.0%}')
 
+
+
+BACKTEST_LOCK = threading.Lock()
+
+
+def historical_bars(venue, symbol, interval, start, end, *, mark=False):
+    step = (1 if interval == '1m' else TIMEFRAME_MINUTES[interval]) * 60000
+    first = start // step * step
+    path = '/fapi/v1/markPriceKlines' if mark else '/fapi/v1/klines'
+    rows = []
+    cursor = first
+    while cursor + step <= end:
+        batch_end = min(end, cursor + 1000 * step)
+        batch = request(venue, path, symbol=symbol, interval=interval,
+                        startTime=cursor, endTime=batch_end-1, limit=1000)
+        for raw in batch:
+            stamp = int(raw[0])
+            if stamp + step > end:
+                break
+            if stamp != first + len(rows)*step or int(raw[6]) != stamp + step - 1:
+                raise ValueError(f'{symbol} {interval} K 线存在缺口或预热数据不足')
+            bar = (stamp, *map(float, raw[1:5]))
+            if not all(math.isfinite(p) and p > 0 for p in bar[1:]):
+                raise ValueError(f'{symbol} {interval} K 线价格无效')
+            rows.append((bar, raw))
+        cursor = batch_end
+    if len(rows) != (end-first)//step:
+        raise ValueError(f'{symbol} {interval} K 线覆盖不足，请缩短区间或选较晚日期')
+    return rows
+
+
+def replay_strategy(asset, mode, data, marks, funding, start, end, fee, slippage, event_at=None):
+    starts = {interval: series[0][0][0] for interval, series in data.items()}
+
+    def read(interval, cutoff, required):
+        duration = TIMEFRAME_MINUTES[interval] * 60000
+        end_index = (cutoff - starts[interval]) // duration
+        if end_index < required:
+            raise ValueError('回测预热数据不足')
+        return tuple(zip(*data[interval][end_index-required:end_index]))
+
+    initial = Decimal(10000)
+    balance = high_water = initial
+    drawdown = Decimal(0)
+    position = None
+    trades = []
+    event_skips = 0
+    curve = [dict(time=start, equity=float(initial))]
+    funding_by_minute = {stamp: (rate, price) for stamp, rate, price in funding}
+    interval = STRATEGY_INTERVALS[mode]
+    max_hours = {'intraday': 4, 'swing': 48, 'us_open': 1.5}.get(mode)
+
+    for (mark, _), (trade, _) in zip(marks, data['1m']):
+        stamp, mark_open, mark_high, mark_low, mark_close = mark
+        if stamp < start:
+            continue
+        _, trade_open, _, _, trade_close = trade
+        if position is None and stamp % interval == 0 and balance > 0:
+            _, score, volatility, reason, context = evaluate_entry_signal(
+                asset+'USDT', mode, stamp, read)
+            if score is not None and event_at is not None and abs(stamp-event_at) <= 15*60000:
+                event_skips += 1
+                score = None
+            if score is not None:
+                direction = 1 if score > 0 else -1
+                opening = Decimal(str(trade_open))
+                entry = opening * (1 + direction*slippage)
+                if (direction*(opening/context['close']-1) <= volatility/2
+                        and direction*(opening/context['boundary']-1) >=
+                        (0 if context['stressed'] else -volatility/4)):
+                    stop = entry_stop_fraction(asset, mode, volatility)
+                    try:
+                        if mode == 'fast':
+                            stop = fast_structure_stop(entry, direction, context['extreme'], volatility, stop,
+                                                       'PERPETUAL' if asset in {'BTC', 'ETH', 'SOL'} else 'TRADIFI_PERPETUAL')
+                    except ValueError:
+                        stop = None
+                    cost = 2*(fee+slippage)
+                    if stop and cost <= stop*Decimal('.75'):
+                        amount = min(balance, balance*ENTRY_EQUITY_RISK[mode]/(stop+cost))/entry
+                        position = dict(opened=stamp, entry=entry, direction=direction, amount=amount,
+                                        risk=stop, trail=entry*(1-direction*stop),
+                                        peak=Decimal(0), funding=Decimal(0), signal=reason)
+        if position:
+            entry, direction, amount, stop = (position[k] for k in ('entry','direction','amount','risk'))
+            if stamp in funding_by_minute and stamp > position['opened']:
+                rate, price = funding_by_minute[stamp]
+                position['funding'] -= direction*amount*rate*price
+            adverse = Decimal(str(mark_low if direction > 0 else mark_high))
+            favorable = Decimal(str(mark_high if direction > 0 else mark_low))
+            take = entry*(1+direction*2*stop)
+            trail = position['trail']
+            reason = None
+            price = None
+            if direction*(adverse-trail) <= 0:
+                reason = '移动止损' if trail != entry*(1-direction*stop) else '止损'
+                price = (min if direction > 0 else max)(trail, Decimal(str(trade_open)))
+            elif direction*(favorable-take) >= 0:
+                reason, price = '止盈', take
+            elif max_hours is not None and stamp-position['opened'] >= max_hours*HOUR:
+                reason, price = '持仓到期', Decimal(str(trade_open))
+            elif stamp+60000 >= end:
+                reason, price = '回测结束结算', Decimal(str(trade_close))
+
+            if reason:
+                price *= 1-direction*slippage
+                fees = fee*amount*(entry+price)
+                net = direction*amount*(price-entry)-fees+position['funding']
+                balance += net
+                trades.append(dict(opened=position['opened'], closed=stamp, entry=float(entry), exit=float(price),
+                                   direction=direction, net=float(net), reason=reason, signal=position['signal']))
+                position = None
+            else:
+                close = Decimal(str(mark_close))
+                peak = max(position['peak'], direction*(close/entry-1))
+                position['peak'] = peak
+                if peak >= stop:
+                    breakeven = (entry*(1+direction*fee)-direction*position['funding']/amount)/(1-direction*fee)
+                    candidate = (max if direction > 0 else min)(entry*(1+direction*(peak-stop)), breakeven)
+                    if direction*(close-candidate) > 0 and direction*(candidate-trail) > 0:
+                        position['trail'] = candidate
+        equity = balance
+        if position:
+            close = Decimal(str(trade_close))
+            equity += (position['direction']*position['amount']*(close-position['entry'])
+                       - fee*position['amount']*(close+position['entry']) + position['funding'])
+        high_water = max(high_water, equity)
+        drawdown = max(drawdown, (high_water-equity)/high_water)
+        if stamp % HOUR == 0 or stamp+60000 >= end:
+            curve.append(dict(time=stamp+60000, equity=float(equity)))
+    return dict(mode=mode, name=STRATEGY_NAMES[mode], initial=float(initial), net=float(balance-initial),
+                roi=float(balance/initial-1), drawdown=float(drawdown), count=len(trades),
+                win_rate=sum(t['net'] > 0 for t in trades)/len(trades) if trades else None,
+                curve=curve, trades=list(reversed(trades)), event_skips=event_skips)
+
+
+def run_backtest(params):
+    asset = params.get('asset', ['BTC'])[0]
+    mode = params.get('strategy', ['all'])[0]
+    venue = DEMO_VENUE if params.get('source', ['demo'])[0] == 'demo' else 'Binance'
+    if asset not in ASSETS or mode not in {*STRATEGY_NAMES, 'all'}:
+        raise ValueError('标的或策略无效')
+    if mode == 'us_open' and asset not in US_EQUITY_ASSETS:
+        raise ValueError('美股双向策略仅用于美股类标的')
+    start, end = (int(datetime.fromisoformat(params[key][0]+'T00:00:00+08:00').timestamp()*1000)
+                  for key in ('start','end'))
+    end = min(end+24*HOUR, (time.time_ns()//1_000_000)//60000*60000)
+    if not 0 < end-start <= 7*24*HOUR:
+        raise ValueError('请选择已开始且不超过 7 天的区间')
+    event_value = params.get('event_at', [''])[0]
+    event_at = int(datetime.fromisoformat(event_value+'+08:00').timestamp()*1000) if event_value else None
+    if event_at is not None and not start <= event_at < end:
+        raise ValueError('事件时间须在回测区间内')
+    modes = ([key for key in STRATEGY_NAMES if key != 'us_open' or asset in US_EQUITY_ASSETS]
+             if mode == 'all' else [mode])
+    intervals = {frame for key in modes for frame in SIGNAL_TIMEFRAMES[key]}
+    symbol = asset+'USDT'
+    data = {frame:historical_bars(venue, symbol, frame, start-50*TIMEFRAME_MINUTES[frame]*60000, end)
+            for frame in sorted(intervals)}
+    data['1m'] = historical_bars(venue, symbol, '1m', start, end)
+    marks = historical_bars(venue, symbol, '1m', start, end, mark=True)
+    rows = request(venue, '/fapi/v1/fundingRate', symbol=symbol, startTime=start, endTime=end-1, limit=1000)
+    if len(rows) >= 1000:
+        raise ValueError('资金费数据超出回测范围')
+    funding = [(int(row['fundingTime'])//60000*60000, Decimal(row['fundingRate']), Decimal(row['markPrice']))
+               for row in rows]
+    fee, slippage = Decimal('.0005'), Decimal('.0003')
+    return dict(asset=asset, venue=venue, start=start, end=end, funding_samples=len(funding),
+                results=[replay_strategy(asset, key, data, marks, funding, start, end, fee, slippage, event_at)
+                         for key in modes])
 
 
 def restore_strategy_positions(positions, assets, mode):
@@ -1786,8 +1963,19 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlsplit(self.path)
         try:
-            if parsed.path == '/':
-                self.send(200, 'text/html', Path(__file__).with_name('index.html').read_bytes())
+            if parsed.path in {'/', '/backtest'}:
+                main, _, backtest = Path(__file__).with_name('index.html').read_bytes().partition(b'<!-- backtest-page -->')
+                self.send(200, 'text/html', backtest if parsed.path == '/backtest' else main)
+                return
+            if parsed.path == '/backtest/results':
+                if not BACKTEST_LOCK.acquire(blocking=False):
+                    self.send(429, 'application/json', json.dumps({'error':'已有回测正在运行'}).encode())
+                    return
+                try:
+                    result = run_backtest(parse_qs(parsed.query))
+                finally:
+                    BACKTEST_LOCK.release()
+                self.send(200, 'application/json', json.dumps(result, allow_nan=False).encode())
                 return
             if parsed.path == '/account/binance-demo':
                 self.send(200, 'application/json', json.dumps(demo_account()).encode())
