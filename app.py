@@ -7,6 +7,7 @@ import threading
 import sys
 import sqlite3
 from contextlib import closing
+from datetime import datetime
 import uuid
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 import statistics
@@ -18,8 +19,17 @@ from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 ASSETS = 'ETH BTC SNDK SOXL KORU MU NVDA SOL SKHYNIX QQQ GOOGL SPCX META TSLA AMZN'.split()
+US_EQUITY_ASSETS = set('SNDK SOXL KORU MU NVDA QQQ GOOGL SPCX META TSLA AMZN'.split())
+NEW_YORK = ZoneInfo('America/New_York')
+US_MARKET_HOLIDAYS = {
+    2026: {101, 119, 216, 403, 525, 619, 703, 907, 1126, 1225},
+    2027: {101, 118, 215, 326, 531, 618, 705, 906, 1125, 1224},
+    2028: {117, 221, 414, 529, 619, 704, 904, 1123, 1225},
+}
+US_MARKET_EARLY_CLOSE = {2026: {1127, 1224}, 2027: {1126}, 2028: {703, 1124}}
 HOSTS = {'OKX': 'https://openapi.okx.com', 'Binance': 'https://fapi.binance.com'}
 DEMO_VENUE = 'Binance 模拟盘'
 HOSTS[DEMO_VENUE] = 'https://demo-fapi.binance.com'
@@ -30,8 +40,8 @@ DEMO_ORDER_TERMINAL = {'FILLED', 'CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJ
 DEMO_CLOCK_TTL_NS = 60 * 1_000_000_000
 TRADIFI_QUOTE_MAX_AGE_MS = 30_000
 TRADIFI_QUOTE_MAX_DEVIATION = Decimal('.03')
-FAST_MAKER_WAIT_MS = 60_000
-FAST_QUOTE_MAX_AGE_MS = 5_000
+ENTRY_WAIT_SECONDS = {'fast': 60, 'intraday': 90, 'swing': 120, 'us_open': 60}
+ENTRY_QUOTE_MAX_AGE_MS = 5_000
 demo_clock_lock = threading.Lock()
 demo_clock_sample = None
 
@@ -125,21 +135,20 @@ def demo_entry_book(symbol, contract_type):
     return book, bid, ask
 
 
-def select_demo_entry(mode, direction, book, bid, ask, budget, step, stop_loss, cost):
-    if mode == 'fast':
-        price = ask if direction > 0 else bid
-        amount = (budget / price // step) * step
-        try:
-            depth = Decimal(book.get('askQty' if direction > 0 else 'bidQty') or '0')
-        except (ValueError, TypeError, InvalidOperation):
-            depth = Decimal(0)
-        if depth.is_finite() and 0 < amount <= depth and cost <= stop_loss / 2:
-            return price, amount, 'IOC'
+def select_demo_entry(direction, book, bid, ask, budget, step, stop_loss, cost):
+    price = ask if direction > 0 else bid
+    amount = (budget / price // step) * step
+    try:
+        depth = Decimal(book.get('askQty' if direction > 0 else 'bidQty') or '0')
+    except (ValueError, TypeError, InvalidOperation):
+        depth = Decimal(0)
+    if depth.is_finite() and 0 < amount <= depth and cost <= stop_loss / 2:
+        return price, amount, 'IOC'
     price = bid if direction > 0 else ask
     return price, (budget / price // step) * step, 'GTX'
 
 
-def fast_entry_cost(symbol, direction):
+def demo_entry_cost(symbol, direction, funding_window):
     fee = demo_taker_fee_rate(symbol)
     if fee is None:
         raise ValueError('手续费率未确认')
@@ -153,8 +162,7 @@ def fast_entry_cost(symbol, direction):
     funding_rate = Decimal(reference['lastFundingRate'])
     if not funding_rate.is_finite() or funding_at < now - 1000:
         raise ValueError('资金费率或结算时间异常')
-    # Only charge adverse funding in the short-term entry cost estimate.
-    return fee, max(Decimal(0), direction * funding_rate) if funding_at <= now + HOUR else Decimal(0)
+    return fee, max(Decimal(0), direction * funding_rate) if funding_at <= now + funding_window else Decimal(0)
 
 
 def set_demo_leverage(symbol, target):
@@ -639,15 +647,58 @@ def trend_metrics(bars, direction=1):
 
 
 STRATEGY_NAMES = {
-    'swing': '中长线 · 1 小时趋势突破',
-    'intraday': '短线 · 15 分钟趋势突破',
+    'swing': '中长线 · 1 小时双向突破与回踩',
+    'intraday': '短线 · 15 分钟双向突破与回踩',
     'fast': '短线 · 5 分钟双向突破与回踩',
+    'us_open': '美股开盘测试',
 }
-STRATEGY_INTERVALS = {'swing': HOUR, 'intraday': HOUR//4, 'fast': HOUR//12}
+SIGNAL_TIMEFRAMES = {
+    'fast': ('5m', '15m', '1h'),
+    'intraday': ('15m', '1h', '4h'),
+    'swing': ('1h', '4h', '1d'),
+    'us_open': ('15m', '1h', '4h'),
+}
+TIMEFRAME_MINUTES = {'5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440}
+STRATEGY_INTERVALS = {mode: TIMEFRAME_MINUTES[frames[0]] * 60000 for mode, frames in SIGNAL_TIMEFRAMES.items()}
+STRATEGY_LOOKBACK = {'fast': 12, 'intraday': 20, 'swing': 24, 'us_open': 20}
+STRATEGY_MAX_ATR = {'fast': Decimal('.008'), 'intraday': Decimal('.012'), 'swing': Decimal('.02'),
+                    'us_open': Decimal('.015')}
+ENTRY_EQUITY_RISK = {'fast': Decimal('.005'), 'intraday': Decimal('.0065'), 'swing': Decimal('.0075'),
+                     'us_open': Decimal('.004')}
+
+
+def entry_session_block(asset, mode, now, order_window=0):
+    if mode == 'us_open' and asset not in US_EQUITY_ASSETS:
+        return '此策略仅测试美股和美股 ETF'
+    if asset not in US_EQUITY_ASSETS or mode not in {'fast', 'us_open'}:
+        return None
+    eastern = datetime.fromtimestamp(now / 1000, NEW_YORK)
+    day = eastern.month * 100 + eastern.day
+    if eastern.year not in US_MARKET_HOLIDAYS:
+        return '美股休市日历待更新'
+    if eastern.weekday() >= 5 or day in US_MARKET_HOLIDAYS[eastern.year]:
+        return '美股休市，暂停新开仓'
+    start = eastern.replace(hour=10, minute=0, second=0, microsecond=0)
+    close_hour = 13 if day in US_MARKET_EARLY_CLOSE[eastern.year] else 16
+    end = eastern.replace(hour=11 if mode == 'us_open' else close_hour-1,
+                          minute=0 if mode == 'us_open' else 50, second=0, microsecond=0)
+    if not start <= eastern or now + order_window >= end.timestamp() * 1000:
+        return ('等待美东时间 10:00–11:00 开仓窗口' if mode == 'us_open'
+                else '美股盘前、开盘前 30 分钟或临近收盘，暂停新开仓')
+    return None
+
+
+def entry_stop_fraction(asset, mode, volatility):
+    if mode == 'us_open':
+        return min(Decimal('.025'), max(Decimal('.008'), Decimal('2.5') * volatility))
+    if mode == 'fast' and asset in US_EQUITY_ASSETS:
+        return min(Decimal('.02'), max(Decimal('.0065'), Decimal('2.5') * volatility))
+    low, high = (Decimal('.005'), Decimal('.02')) if mode == 'swing' else (Decimal('.0035'), Decimal('.01'))
+    return min(high, max(low, 2 * volatility))
 
 
 def closed_demo_bars(symbol, interval, cutoff, required):
-    minutes = {'5m': 5, '15m': 15, '1h': 60}[interval]
+    minutes = TIMEFRAME_MINUTES[interval]
     duration = minutes * 60000
     raw = request(DEMO_VENUE, '/fapi/v1/klines', symbol=symbol, interval=interval, limit=65)
     closed = [row for row in raw if int(row[6]) < cutoff][-required:]
@@ -662,22 +713,13 @@ def closed_demo_bars(symbol, interval, cutoff, required):
 
 
 def entry_signal(symbol, strategy, bars=None):
-    if strategy == 'swing':
-        bars, funding = history(DEMO_VENUE, symbol)
-        signal = replay(bars, funding)
-        uptrend, volatility = trend_metrics(bars)
-        reason = ('均线趋势未确认' if not uptrend else 'ATR 超过 2%' if volatility > Decimal('.02')
-                  else signal['status'])
-        return bars[-1][0], signal['score'] if reason == '入场候选' else None, volatility, reason
-
-    minutes = 5 if strategy == 'fast' else 15
-    lookback = 12 if strategy == 'fast' else 20
+    lookback = STRATEGY_LOOKBACK[strategy]
     if bars is None:
-        bars, _ = closed_demo_bars(symbol, f'{minutes}m', demo_now_ms(), 49 if strategy == 'fast' else 48)
+        bars, _ = closed_demo_bars(symbol, SIGNAL_TIMEFRAMES[strategy][0], demo_now_ms(), 49)
     close = bars[-1][4]
     direction = 1
     trend, volatility = trend_metrics(bars)
-    if not trend and strategy == 'fast':
+    if not trend:
         trend, _ = trend_metrics(bars, -1)
         if trend:
             direction = -1
@@ -687,12 +729,12 @@ def entry_signal(symbol, strategy, bars=None):
     score = None
     if not trend:
         reason = '均线趋势未确认'
-    elif volatility > Decimal('.008'):
-        reason = 'ATR 超过 0.8%'
+    elif volatility > STRATEGY_MAX_ATR[strategy]:
+        reason = f'ATR 超过 {STRATEGY_MAX_ATR[strategy]:.1%}'
     elif breakout > 0:
         reason = '突破做多' if direction > 0 else '跌破做空'
         score = direction*breakout
-    elif strategy == 'fast':
+    else:
         fast_average = statistics.mean(bar[4] for bar in bars[-12:])
         previous_average = statistics.mean(bar[4] for bar in bars[-13:-1])
         previous = bars[-2]
@@ -703,37 +745,34 @@ def entry_signal(symbol, strategy, bars=None):
         else:
             reason = '等待向上突破或回踩' if direction > 0 else '等待向下跌破或反抽'
             reason += f' · 距前 {lookback} 根极值 {-breakout:.2%}'
-    else:
-        reason = f'尚未突破前 {lookback} 根最高价 · 距门槛 {-breakout:.2%}'
     return bars[-1][0], score, volatility, reason
 
 
 def scan_entry_signal(symbol, mode, handled_candle=None):
-    if mode != 'fast':
-        return (*entry_signal(symbol, mode), {})
-    bars, raw = closed_demo_bars(symbol, '5m', demo_now_ms(), 49)
+    base, confirm, backdrop = SIGNAL_TIMEFRAMES[mode]
+    bars, raw = closed_demo_bars(symbol, base, demo_now_ms(), 49)
     candle, score, volatility, reason = entry_signal(symbol, mode, bars)
     if score is None:
         return candle, None, volatility, reason, {}
     if candle == handled_candle:
         return candle, score, volatility, reason, {}
 
-    signal_at = candle + STRATEGY_INTERVALS['fast']
+    signal_at = candle + STRATEGY_INTERVALS[mode]
     direction = 1 if score > 0 else -1
-    trend_15m, _ = closed_demo_bars(symbol, '15m', signal_at, 48)
-    if not trend_metrics(trend_15m, direction)[0]:
-        return candle, None, volatility, f'{reason} · 15 分钟趋势未确认', {}
-    trend_1h, _ = closed_demo_bars(symbol, '1h', signal_at, 48)
-    if trend_metrics(trend_1h, -direction)[0]:
-        return candle, None, volatility, f'{reason} · 1 小时趋势反向', {}
-    aligned_1h = trend_metrics(trend_1h, direction)[0]
+    confirmation, _ = closed_demo_bars(symbol, confirm, signal_at, 48)
+    if not trend_metrics(confirmation, direction)[0]:
+        return candle, None, volatility, f'{reason} · {confirm} 趋势未确认', {}
+    background, _ = closed_demo_bars(symbol, backdrop, signal_at, 48)
+    if trend_metrics(background, -direction)[0]:
+        return candle, None, volatility, f'{reason} · {backdrop} 趋势反向', {}
+    aligned = trend_metrics(background, direction)[0]
 
     quote_volume = float(raw[-1][7])
     taker_buy = float(raw[-1][10])
     previous_volumes = [float(row[7]) for row in raw[-21:-1]]
     if (not all(math.isfinite(volume) and volume >= 0 for volume in previous_volumes)
             or not math.isfinite(quote_volume) or not 0 <= taker_buy <= quote_volume < math.inf):
-        raise ValueError('5 分钟成交量或主动成交数据无效')
+        raise ValueError(f'{base} 成交量或主动成交数据无效')
     baseline = statistics.median(previous_volumes)
     if baseline <= 0 or quote_volume <= 0 or volatility <= 0:
         return candle, None, volatility, f'{reason} · 成交或波动样本不足', {}
@@ -748,10 +787,10 @@ def scan_entry_signal(symbol, mode, handled_candle=None):
 
     close = bars[-1][4]
     return candle, score, volatility, reason, dict(
-        priority=int(aligned_1h) + min(relative_volume, 2.0) / 2 + side_flow
+        priority=int(aligned) + min(relative_volume, 2.0) / 2 + side_flow
                  + min(abs(score) / float(volatility), 0.75),
         close=Decimal(str(close)), boundary=Decimal(str(close / (1 + score))),
-        detail=f'15 分钟同向 · 1 小时{"同向" if aligned_1h else "中性"} · '
+        detail=f'{confirm} 同向 · {backdrop}{" 同向" if aligned else " 中性"} · '
                f'相对成交量 {relative_volume:.2f}× · 同向主动成交 {side_flow:.0%}')
 
 
@@ -764,7 +803,7 @@ def restore_strategy_positions(positions, assets, mode):
     catalog = None
     for symbol, position in positions.items():
         amount = Decimal(position['positionAmt'])
-        if (symbol[:-4] not in assets or not amount or (amount < 0 and mode != 'fast')
+        if (symbol[:-4] not in assets or not amount
                 or position.get('positionSide', 'BOTH') != 'BOTH'):
             continue
         opened_at, order_id = position_opened_at(position)
@@ -904,7 +943,7 @@ class DemoStrategy:
     def run(self, assets, mode):
         short_term = mode != 'swing'
         max_positions = self.FAST_MAX_POSITIONS if mode == 'fast' else self.MAX_POSITIONS
-        max_hold_hours = {'intraday': 4, 'swing': 48}.get(mode)
+        max_hold_hours = {'intraday': 4, 'swing': 48, 'us_open': 1.5}.get(mode)
         holdings = {}
         seen = {}
         peaks = {}
@@ -988,35 +1027,30 @@ class DemoStrategy:
                     stop = trailing_stops.get(symbol, minimum_stop)
                     if peak >= stop_loss and not (timed_out or fixed_exit):
                         candidate = protection_price(entry_price, peak-stop_loss, tick, direction=direction, kind='stop')
-                        if mode == 'fast':
-                            try:
-                                costs = position_breakeven_costs(symbol, opening_id, amount, breakeven_costs)
-                                breakeven = net_breakeven_price(entry_price, amount, tick, *costs)
-                            except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
-                                breakeven = None
-                            if (breakeven is not None and direction*(candidate-breakeven) >= 0
-                                    and direction*(mark-candidate) > 0 and direction*(candidate-stop) > 0):
-                                stop = candidate
-                        else:
+                        try:
+                            costs = position_breakeven_costs(symbol, opening_id, amount, breakeven_costs)
+                            breakeven = net_breakeven_price(entry_price, amount, tick, *costs)
+                        except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
+                            breakeven = None
+                        if (breakeven is not None and direction*(candidate-breakeven) >= 0
+                                and direction*(mark-candidate) > 0 and direction*(candidate-stop) > 0):
                             stop = candidate
-                    trailing = stop != minimum_stop and (
-                        direction*(mark-stop) <= 0 if mode == 'fast' else price_return <= peak-stop_loss
-                    )
+                    trailing = stop != minimum_stop and direction*(mark-stop) <= 0
                     missing_stop = False
                     if not (timed_out or fixed_exit or trailing):
                         take = None
-                        if mode == 'fast' and stop != minimum_stop and price_return >= stop_loss:
-                            window = demo_now_ms() // STRATEGY_INTERVALS['fast']
+                        if stop != minimum_stop and price_return >= stop_loss:
+                            window = demo_now_ms() // STRATEGY_INTERVALS[mode]
                             if take_reviewed.get(symbol) != window:
                                 try:
                                     candle, signal, _, assessment = entry_signal(symbol, mode)
-                                    take_reviewed[symbol] = min(window, (candle + STRATEGY_INTERVALS['fast']) // STRATEGY_INTERVALS['fast'])
+                                    take_reviewed[symbol] = min(window, (candle + STRATEGY_INTERVALS[mode]) // STRATEGY_INTERVALS[mode])
                                 except (OSError, ValueError, KeyError, IndexError, ArithmeticError):
                                     pass
                                 else:
                                     weakened = assessment == '均线趋势未确认' or (signal is not None and signal*direction < 0)
                                     target = price_return + stop_loss/4
-                                    if weakened and candle + STRATEGY_INTERVALS['fast'] > opened*1000 and target < 2*stop_loss:
+                                    if weakened and candle + STRATEGY_INTERVALS[mode] > opened*1000 and target < 2*stop_loss:
                                         closer = protection_price(entry_price, target, tick, direction=direction, kind='take')
                                         if direction*(closer-mark) > 0:
                                             take = closer
@@ -1024,7 +1058,7 @@ class DemoStrategy:
                             align_strategy_protection(symbol, entry_price, mark, stop_loss, stop, tick,
                                                       dict(opening_id=opening_id, opened=int(opened*1000),
                                                            leverage=leverage, strategy=mode), direction=direction, take=take)
-                            if mode == 'fast' and stop != minimum_stop:
+                            if stop != minimum_stop:
                                 trailing_stops[symbol] = stop
                             protection_errors.pop(symbol, None)
                             self.checks = {**self.checks, symbol[:-4]: '持仓监控中'}
@@ -1105,6 +1139,7 @@ class DemoStrategy:
                             prepare_at_start = False
                             self.status = '正在检查行情与入场信号'
                         jobs = {}
+                        scan_time = demo_now_ms()
                         for asset in sorted(assets):
                             symbol = asset + 'USDT'
                             item = listed.get(symbol)
@@ -1118,6 +1153,8 @@ class DemoStrategy:
                             elif (item['status'] != 'TRADING' or item['contractType'] not in
                                   {'PERPETUAL', 'TRADIFI_PERPETUAL'}):
                                 checks[asset] = '模拟盘合约当前不可交易'
+                            elif (session_block := entry_session_block(asset, mode, scan_time)):
+                                checks[asset] = session_block
                             else:
                                 checks[asset] = '正在读取行情'
                                 jobs[pool.submit(scan_entry_signal, symbol, mode, seen.get(symbol))] = (asset, item)
@@ -1157,29 +1194,26 @@ class DemoStrategy:
                         filters = {f['filterType']: f for f in item['filters']}
                         lot = filters['LOT_SIZE']
                         direction = 1 if score > 0 else -1
-                        cost = None
                         try:
-                            if mode == 'fast':
-                                fee, funding_cost = fast_entry_cost(symbol, direction)
+                            funding_window = (max_hold_hours or 1) * HOUR
+                            fee, funding_cost = demo_entry_cost(symbol, direction, funding_window)
                             book, bid, ask = demo_entry_book(symbol, item['contractType'])
-                            if mode == 'fast':
-                                book_time = int(book['time'])
-                                midpoint = (bid + ask) / 2
-                                spread = (ask - bid) / midpoint
-                                cost = spread + 2 * fee + funding_cost
-                                if direction * (midpoint / signal_context['close'] - 1) > volatility / 2:
-                                    raise ValueError('盘口已远离信号收盘价，避免追价')
-                                if direction * (midpoint / signal_context['boundary'] - 1) < -volatility / 4:
-                                    raise ValueError('价格已反向穿过触发位')
+                            book_time = int(book['time'])
+                            midpoint = (bid + ask) / 2
+                            spread = (ask - bid) / midpoint
+                            cost = spread + 2 * fee + funding_cost
+                            if direction * (midpoint / signal_context['close'] - 1) > volatility / 2:
+                                raise ValueError('盘口已远离信号收盘价，避免追价')
+                            if direction * (midpoint / signal_context['boundary'] - 1) < -volatility / 4:
+                                raise ValueError('价格已反向穿过触发位')
                         except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
                             checks[symbol[:-4]] = f'跳过 · 价格核验未通过：{error}'
                             self.checks = checks.copy()
                             continue
                         step = Decimal(lot['stepSize'])
                         equity = Decimal(account['totalMarginBalance'])
-                        low, high = (Decimal('.0035'), Decimal('.01')) if short_term else (Decimal('.005'), Decimal('.02'))
-                        stop_loss = min(high, max(low, 2 * volatility))
-                        if mode == 'fast' and cost > stop_loss * Decimal('.75'):
+                        stop_loss = entry_stop_fraction(symbol[:-4], mode, volatility)
+                        if cost > stop_loss * Decimal('.75'):
                             checks[symbol[:-4]] = (f'跳过 · 点差与交易成本过高：预估 {cost:.3%}'
                                                    f' · 上限 {stop_loss * Decimal(".75"):.3%}')
                             self.checks = checks.copy()
@@ -1189,8 +1223,9 @@ class DemoStrategy:
                                            else min(leverage_cap, max(1, int(Decimal('.05') / stop_loss))))
                         margin_budget = free_margin * Decimal('.95') / (max_positions - len(occupied))
                         budget = max(Decimal(0), min((equity if short_term else 3 * equity), leverage_target * margin_budget))
+                        risk_budget = equity * ENTRY_EQUITY_RISK[mode] / (stop_loss + cost)
                         price, amount, time_in_force = select_demo_entry(
-                            mode, direction, book, bid, ask, budget, step, stop_loss, cost)
+                            direction, book, bid, ask, min(budget, risk_budget), step, stop_loss, cost)
                         notional = amount * price
                         minimum = Decimal(filters.get('MIN_NOTIONAL', {}).get('notional', '0'))
                         if not Decimal(lot['minQty']) <= amount <= Decimal(lot['maxQty']) or notional < minimum or not amount:
@@ -1220,17 +1255,21 @@ class DemoStrategy:
                         if self.stop.is_set():
                             break
                         signal_at = candle + STRATEGY_INTERVALS[mode]
-                        if mode == 'fast':
-                            now = demo_now_ms()
-                            quote_age = now - book_time
-                            if not -1000 <= quote_age <= FAST_QUOTE_MAX_AGE_MS:
-                                checks[symbol[:-4]] = '跳过 · 下单前盘口已过期或时间异常'
-                                self.checks = checks.copy()
-                                continue
-                            if not 0 <= now - signal_at <= STRATEGY_INTERVALS[mode] - FAST_MAKER_WAIT_MS:
-                                checks[symbol[:-4]] = '跳过 · 信号接近下一根 5 分钟 K 线收盘'
-                                self.checks = checks.copy()
-                                continue
+                        now = demo_now_ms()
+                        quote_age = now - book_time
+                        if not -1000 <= quote_age <= ENTRY_QUOTE_MAX_AGE_MS:
+                            checks[symbol[:-4]] = '跳过 · 下单前盘口已过期或时间异常'
+                            self.checks = checks.copy()
+                            continue
+                        order_window = ENTRY_WAIT_SECONDS[mode] * 1000 if time_in_force == 'GTX' else 0
+                        if (session_block := entry_session_block(symbol[:-4], mode, now, order_window)):
+                            checks[symbol[:-4]] = f'跳过 · {session_block}'
+                            self.checks = checks.copy()
+                            continue
+                        if not 0 <= now - signal_at < STRATEGY_INTERVALS[mode] - order_window:
+                            checks[symbol[:-4]] = '跳过 · 信号即将过期，等待下一根已收盘 K 线'
+                            self.checks = checks.copy()
+                            continue
                         execution = '限价吃单' if time_in_force == 'IOC' else '只挂不吃'
                         checks[symbol[:-4]] = f'正在提交 · {execution}'
                         self.checks = checks.copy()
@@ -1238,13 +1277,12 @@ class DemoStrategy:
                         if tick <= 0:
                             raise ValueError('合约价格步长无效')
                         detail = f'{execution} · 信号幅度 {abs(score):.3%} · ATR {volatility:.3%} · 计划止损 {stop_loss:.3%}'
-                        if mode == 'fast':
-                            detail += (f' · {signal_context["detail"]} · 点差 {spread:.3%} · '
-                                       f'预估双边手续费 {2 * fee:.3%} · 不利资金费 {funding_cost:.3%}')
-                            if time_in_force == 'GTX':
-                                maker_reason = '吃单成本偏高' if cost > stop_loss / 2 else '对手盘一档数量不足'
-                                detail += f' · {maker_reason}，改为限价挂单'
-                        decision = dict(reason='1 小时趋势突破' if mode == 'swing' else reason,
+                        detail += (f' · {signal_context["detail"]} · 点差 {spread:.3%} · '
+                                   f'预估双边手续费 {2 * fee:.3%} · 下一次不利资金费 {funding_cost:.3%}')
+                        if time_in_force == 'GTX':
+                            maker_reason = '吃单成本偏高' if cost > stop_loss / 2 else '对手盘一档数量不足'
+                            detail += f' · {maker_reason}，改为限价挂单'
+                        decision = dict(reason=reason,
                                         detail=detail, signal_at=signal_at)
                         order = submit_demo_limit_entry(symbol, amount, price, leverage_target, mode,
                                                         stop_loss, tick, self.stop, decision,
@@ -1253,7 +1291,7 @@ class DemoStrategy:
                             pending_symbols[symbol] = order['status']
                             occupied.add(symbol)
                             free_margin = max(Decimal(0), free_margin - notional / leverage_target)
-                            checks[symbol[:-4]] = ('限价挂单等待成交' if order['status'] == 'NEW' and mode == 'fast'
+                            checks[symbol[:-4]] = ('限价挂单等待成交' if order['status'] == 'NEW' and time_in_force == 'GTX'
                                                    else f'开仓委托待核对 · {order["status"]}')
                             self.checks = checks.copy()
                             if order['status'] == 'PARTIALLY_FILLED':
@@ -1315,7 +1353,7 @@ class DemoStrategy:
                     self.status += f' · {len(protection_errors)} 个持仓的保护单待核对'
                 if pending_partial_entry:
                     continue
-                self.stop.wait((3 if pending_symbols else 10) if mode == 'fast' else 30)
+                self.stop.wait(3 if pending_symbols else 10 if mode == 'fast' else 30)
             self.status = '已停止' + (' · 仍有持仓，请手动管理' if holdings else '')
         except HTTPError as error:
             endpoint = urlsplit(error.url or '').path
@@ -1358,6 +1396,8 @@ class Handler(BaseHTTPRequestHandler):
             if mode not in STRATEGY_NAMES:
                 self.send(400, 'application/json', '{"error":"未知策略"}'.encode())
                 return
+            if mode == 'us_open':
+                assets &= US_EQUITY_ASSETS
             with strategy.control:
                 if not assets or strategy.draining or strategy.switch_blocked or not strategy.lock.acquire(blocking=False):
                     self.send(409, 'application/json', '{"error":"请选择标的，并等当前策略停止且币安确认空仓、无挂单"}'.encode())
@@ -1675,7 +1715,7 @@ def reconcile_demo_orders():
             if Decimal(response['executedQty']) > 0:
                 reason = '委托已部分成交，程序撤销剩余数量并管理已成交仓位'
             elif expires_at and demo_now_ms() >= expires_at:
-                reason = '限价挂单等待 60 秒仍未成交，程序撤单'
+                reason = f'限价挂单等待 {order.get("entry_wait_seconds", 60)} 秒仍未成交，程序撤单'
             elif not expires_at:
                 reason = '程序在对账时撤销仍未完成的短时限价单'
             if reason:
@@ -1883,8 +1923,10 @@ def submit_demo_limit_entry(symbol, amount, price, leverage, strategy, stop_loss
                   notional=str(amount*price), leverage=leverage, strategy=strategy,
                   maker_only=time_in_force == 'GTX', time_in_force=time_in_force,
                   limit_price=str(price), stop_loss=str(stop_loss), price_tick=str(tick), decision=decision)
-    if strategy == 'fast' and time_in_force == 'GTX':
-        intent['entry_expires_at'] = demo_now_ms() + FAST_MAKER_WAIT_MS
+    if time_in_force == 'GTX':
+        wait_seconds = ENTRY_WAIT_SECONDS[strategy]
+        intent['entry_wait_seconds'] = wait_seconds
+        intent['entry_expires_at'] = demo_now_ms() + wait_seconds * 1000
     journal('demo_order_intent', intent)
     lookup = dict(symbol=symbol, origClientOrderId=client_id)
     try:

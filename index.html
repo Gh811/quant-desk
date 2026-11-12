@@ -27,10 +27,11 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
 .decision-list{margin-top:12px}.decision-item{padding:12px 14px;margin-bottom:8px;border-left:3px solid #7098c8;border-radius:6px;background:#eaf0f7}.decision-item strong{font-size:14px}.decision-item p{margin:6px 0 0}.decision-item small{display:block;color:#506279}.decision-item time{font-variant-numeric:tabular-nums}
 #strategy-start[data-running=true]{background:#dcefe6;border-color:#a3cfb9;color:#075a3b;opacity:1;cursor:default;font-weight:700}
 .pagination{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:12px}.pagination[hidden]{display:none}.pagination button{width:auto;min-width:32px;padding:4px 8px;margin:0;background:#f8fafc;color:#253248}.pagination button[aria-current=page]{background:#1756a9;border-color:#1756a9;color:white;font-weight:700}
+#strategy-mode{min-width:0;max-width:100%;font-size:14px;padding-inline:10px 26px}
 </style><main><aside><h1>Quant Desk</h1><small>币安合约模拟盘</small>
 <p id="strategy-status" role="status">正在读取后台策略状态…</p>
 <label for="strategy-mode">策略</label>
-<select id="strategy-mode" disabled><option value="swing">中长线 · 1 小时趋势突破</option><option value="intraday">短线 · 15 分钟趋势突破</option><option value="fast">短线 · 5 分钟双向突破与回踩</option></select>
+<select id="strategy-mode" disabled><option value="swing">1 小时双向</option><option value="intraday">15 分钟双向</option><option value="fast">5 分钟双向</option><option value="us_open">美股开盘测试</option></select>
 <button id="strategy-start" type="button" disabled>正在同步状态…</button>
 <button id="strategy-stop" type="button" disabled>停止并平仓</button><form id="config"><h3>允许交易的标的</h3><div id="assets"></div></form></aside>
 <section><h1>量化交易仪表盘</h1>
@@ -43,8 +44,8 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
   <p id="account-status" class="market-pulse" role="status">模拟盘未连接 · 最近同步 —</p>
   <div class="account-metrics">
     <div class="card">账户权益<strong data-account="equity">—</strong></div>
-    <div class="card">账户余额<strong data-account="balance">—</strong></div>
     <div class="card">可用余额<strong data-account="available">—</strong></div>
+    <div class="card" title="起算以来已核对的净盈亏，含手续费和资金费">累计已实现盈亏<strong id="realized-pnl">—</strong></div>
     <div class="card">持仓浮盈亏<strong data-account="pnl">—</strong></div>
     <div class="card" title="起算以来已核对的平仓净收益 ÷ 固定起始本金">累计已实现收益率<strong id="realized-return">—</strong><small id="realized-base"></small></div>
     <div class="card">持仓数<strong data-account="count">—</strong></div>
@@ -110,6 +111,9 @@ function colorPnL(cell, value) {
 }
 function showRealizedReturn() {
   const data = accountMode.value === 'demo' ? realizedReturnSnapshot : null;
+  const net = el('realized-pnl');
+  net.textContent = data?.net == null ? '—' : (Number(data.net) > 0 ? '+' : '') + oneDecimal.format(data.net) + ' USDT';
+  colorPnL(net, data?.net);
   const field = el('realized-return');
   field.textContent = data?.rate == null ? '—' : (data.rate*100).toFixed(2) + '%';
   colorPnL(field, data?.rate);
