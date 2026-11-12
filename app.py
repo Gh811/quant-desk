@@ -908,6 +908,8 @@ class DemoStrategy:
         self.draining = False
         self.switch_blocked = False
         self.stop = threading.Event()
+        self.entries_paused = threading.Event()
+        self.wake = threading.Event()
         self.status = '未启动'
         self.mode = 'swing'
         self.assets = []
@@ -922,6 +924,7 @@ class DemoStrategy:
             self.draining = True
             self.switch_blocked = True
             self.stop.set()
+            self.wake.set()
             record_runtime('收到停止并平仓请求', mode=self.mode)
             threading.Thread(target=self.finish_stop, daemon=True).start()
 
@@ -961,9 +964,10 @@ class DemoStrategy:
         try:
             record_runtime('收到启动请求', mode=mode, detail='、'.join(sorted(assets)))
             while not self.stop.is_set():
+                self.wake.clear()
                 if recovering:
                     self.status = '正在读取模拟账户持仓'
-                pending = reconcile_demo_orders()
+                pending = reconcile_demo_orders(cancel_entries=self.entries_paused.is_set())
                 resting_entries = {order['symbol'] for order in pending if order.get('entry_expires_at')
                                    and order['status'] == 'NEW' and not order.get('cancel_requested')}
                 pending_symbols = {order['symbol']: order['status'] for order in pending}
@@ -1113,6 +1117,7 @@ class DemoStrategy:
                         self.checks = {**self.checks, symbol[:-4]: f'已平仓 · {reason}'}
                         closed = True
                 if (not closed and not closed_symbols and not self.stop.is_set()
+                        and not self.entries_paused.is_set()
                         and (prepare_at_start or len(holdings) < max_positions)
                         and (not holdings or time.monotonic() >= next_entry_scan)):
                     next_entry_scan = time.monotonic() + (3 if pending_symbols else 10 if mode == 'fast' else 30)
@@ -1199,7 +1204,7 @@ class DemoStrategy:
                     free_margin = Decimal(account['availableBalance'])
                     for _, symbol, candle, volatility, reason, item, score, signal_context in sorted(
                             candidates, key=lambda candidate: candidate[0], reverse=True):
-                        if self.stop.is_set() or len(occupied) >= max_positions:
+                        if self.wake.is_set() or self.stop.is_set() or self.entries_paused.is_set() or len(occupied) >= max_positions:
                             break
                         filters = {f['filterType']: f for f in item['filters']}
                         lot = filters['LOT_SIZE']
@@ -1269,7 +1274,7 @@ class DemoStrategy:
                                 continue
                             if mode == 'fast':
                                 prepared_leverage.add(symbol)
-                        if self.stop.is_set():
+                        if self.wake.is_set() or self.stop.is_set() or self.entries_paused.is_set():
                             break
                         signal_at = candle + STRATEGY_INTERVALS[mode]
                         now = demo_now_ms()
@@ -1299,7 +1304,7 @@ class DemoStrategy:
                                         detail=detail, signal_at=signal_at)
                         entry_attempts[symbol] = (candle, direction, now, price, time_in_force, cost)
                         order = submit_demo_limit_entry(symbol, amount, price, leverage_target, mode,
-                                                        stop_loss, tick, self.stop, decision,
+                                                        stop_loss, tick, self.wake, decision,
                                                         side=entry_side(direction), time_in_force=time_in_force)
                         if order['status'] in DEMO_ORDER_PENDING:
                             pending_symbols[symbol] = order['status']
@@ -1365,12 +1370,18 @@ class DemoStrategy:
                     self.status += f' · {len(pending_symbols)} 个标的有待处理委托'
                 if protection_errors:
                     self.status += f' · {len(protection_errors)} 个持仓的保护单待核对'
+                if self.entries_paused.is_set():
+                    self.status = f'已停止开新仓 · 持仓 {len(holdings)}'
+                    if pending_entries or any(symbol not in pending_closes for symbol in pending_symbols):
+                        self.status += ' · 开仓挂单撤销待核对'
+                    elif not holdings and not pending_symbols:
+                        self.status += ' · 已空仓'
                 if pending_partial_entry:
                     continue
                 if holdings or protection_errors:
-                    self.stop.wait(2)
+                    self.wake.wait(2)
                 else:
-                    self.stop.wait(3 if pending_symbols else 10 if mode == 'fast' else 30)
+                    self.wake.wait(3 if pending_symbols else 10 if mode == 'fast' else 30)
             self.status = '已停止' + (' · 仍有持仓，请手动管理' if holdings else '')
         except HTTPError as error:
             endpoint = urlsplit(error.url or '').path
@@ -1406,6 +1417,19 @@ class Handler(BaseHTTPRequestHandler):
                 return
         elif parsed.path == '/strategy/stop':
             strategy.stop_and_flatten()
+        elif parsed.path in {'/strategy/pause-entries', '/strategy/resume-entries'}:
+            with strategy.control:
+                if not strategy.lock.locked() or strategy.stop.is_set() or strategy.draining:
+                    self.send(409, 'application/json', json.dumps({'error': '当前没有可调整的运行中策略'}).encode())
+                    return
+                paused = parsed.path == '/strategy/pause-entries'
+                if paused != strategy.entries_paused.is_set():
+                    if paused:
+                        strategy.entries_paused.set()
+                    else:
+                        strategy.entries_paused.clear()
+                    strategy.wake.set()
+                    record_runtime('停止开新仓' if paused else '恢复开新仓', mode=strategy.mode)
         elif parsed.path == '/strategy/start':
             params = parse_qs(parsed.query)
             assets = set(params.get('asset', ())) & set(ASSETS)
@@ -1420,6 +1444,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.send(409, 'application/json', '{"error":"请选择标的，并等当前策略停止且币安确认空仓、无挂单"}'.encode())
                     return
                 strategy.stop.clear()
+                strategy.entries_paused.clear()
+                strategy.wake.clear()
                 strategy.mode = mode
                 strategy.assets = sorted(assets)
                 strategy.checks = {}
@@ -1457,6 +1483,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(200, 'application/json', json.dumps(dict(status=self.server.strategy.status, mode=self.server.strategy.mode,
                                                                     running=self.server.strategy.lock.locked() or self.server.strategy.draining,
                                                                     draining=self.server.strategy.draining, assets=self.server.strategy.assets,
+                                                                    entries_paused=self.server.strategy.entries_paused.is_set(),
                                                                     switch_blocked=self.server.strategy.switch_blocked,
                                                                     checks=self.server.strategy.checks,
                                                                     checked_at=self.server.strategy.checked_at,
@@ -1711,7 +1738,7 @@ def cancel_entry_order(intent, response, reason):
     return result, reason if result['status'] == 'CANCELED' else None
 
 
-def reconcile_demo_orders():
+def reconcile_demo_orders(*, cancel_entries=False):
     pending = []
     for order in recent_orders(limit=None):
         if order['status'] not in DEMO_ORDER_PENDING:
@@ -1752,11 +1779,15 @@ def reconcile_demo_orders():
             continue
         outcome = None
         cancel_requested = order.get('cancel_requested')
-        if response['status'] in DEMO_ORDER_ACTIVE and strategy_limit_entry(order):
+        if response['status'] in DEMO_ORDER_ACTIVE and not order.get('reduce_only') and strategy_limit_entry(order):
             expires_at = order.get('entry_expires_at')
             reason = None
             if Decimal(response['executedQty']) > 0:
                 reason = '委托已部分成交，程序撤销剩余数量并管理已成交仓位'
+            elif cancel_entries:
+                reason = '已停止开新仓，程序撤销未成交开仓委托'
+            elif cancel_requested:
+                reason = cancel_requested
             elif expires_at and demo_now_ms() >= expires_at:
                 reason = f'限价挂单等待 {order.get("entry_wait_seconds", 60)} 秒仍未成交，程序撤单'
             elif not expires_at:
@@ -1961,6 +1992,8 @@ def settle_demo_trade(symbol, opening_id, order, opened=None):
 
 
 def submit_demo_limit_entry(symbol, amount, price, leverage, strategy, stop_loss, tick, stop_event, decision=None, *, side='BUY', time_in_force='GTX'):
+    if stop_event.is_set():
+        return dict(status='CANCELED', executedQty='0', outcome='已停止开新仓，委托未发送')
     client_id = 'quant-demo-' + uuid.uuid4().hex[:20]
     intent = dict(clientOrderId=client_id, symbol=symbol, side=side, quantity=str(amount),
                   notional=str(amount*price), leverage=leverage, strategy=strategy,
@@ -2017,7 +2050,7 @@ def submit_demo_limit_entry(symbol, amount, price, leverage, strategy, stop_loss
         order = latest
     if order.get('status') not in DEMO_ORDER_TERMINAL:
         if stop_event.is_set():
-            cancel_reason = '用户停止策略并清仓，程序撤销剩余委托'
+            cancel_reason = '策略控制状态变更，程序撤销剩余开仓委托'
         elif Decimal(order.get('executedQty') or '0') > 0:
             cancel_reason = '委托已部分成交，程序撤销剩余数量并管理已成交仓位'
         order, outcome = cancel_entry_order(intent, order, cancel_reason)
