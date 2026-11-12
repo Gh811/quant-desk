@@ -575,8 +575,38 @@ async function loadHistory(page) {
     if (historyRequest === request) historyRequest = null;
   }
 }
+let protectionDecisions = [];
+let protectionDecisionsPending = false;
+async function loadProtectionDecisions() {
+  if (protectionDecisionsPending) return;
+  protectionDecisionsPending = true;
+  try {
+    const response = await fetch('./strategy/protection-decisions', {cache:'no-store', signal:AbortSignal.timeout(6000)});
+    if (!response.ok) throw Error('HTTP ' + response.status);
+    const events = await response.json();
+    if (JSON.stringify(events) !== JSON.stringify(protectionDecisions)) {
+      protectionDecisions = events;
+      renderDecisions();
+    }
+  } catch (error) {
+    console.error('读取保护单决策失败：', error);
+  } finally {
+    protectionDecisionsPending = false;
+  }
+}
 function renderDecisions() {
-  const items = pageItems(latestOrders, 'decisions-pages', renderDecisions).map(order => {
+  const records = [
+    ...latestOrders.map(order => ({order, at:Number(order.time || order.closed || order.opened || 0)})),
+    ...protectionDecisions.map(event => ({event, at:Number(event.at)}))
+  ].sort((a, b) => b.at - a.at);
+  const items = pageItems(records, 'decisions-pages', renderDecisions).map(({order, event}) => {
+    if (event) {
+      const item = orderElement('article', 'decision-item');
+      item.append(orderElement('strong', '', event.symbol + ' · ' + event.message),
+        orderElement('p', '', event.detail),
+        orderElement('small', '', [strategyNames[event.mode], date(event.at)].filter(Boolean).join(' · ')));
+      return item;
+    }
     const item = orderElement('article', 'decision-item');
     const action = order.reduce_only
       ? (order.side === 'BUY' ? '平空' : '平多')
@@ -864,13 +894,17 @@ for (const tab of positionTabs) {
       item.setAttribute('aria-pressed', String(item === tab));
       el(item.getAttribute('aria-controls')).hidden = item !== tab;
     }
-    if (tab.getAttribute('aria-controls') === 'decisions-panel') renderDecisions();
+    if (tab.getAttribute('aria-controls') === 'decisions-panel') {
+      renderDecisions();
+      loadProtectionDecisions();
+    }
     if (tab.getAttribute('aria-controls') === 'runtime-panel') loadRuntimeLogs();
     if (tab.getAttribute('aria-controls') === 'history-panel') loadHistory();
   };
 }
 setInterval(() => {
   if (!el('runtime-panel').hidden) loadRuntimeLogs();
+  if (!el('decisions-panel').hidden) loadProtectionDecisions();
 }, 2500);
 setInterval(() => {
   if (!el('history-panel').hidden) loadHistory();
