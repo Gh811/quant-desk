@@ -672,6 +672,7 @@ function assetBusy(asset) {
 function assetEditingLocked() {
   return !strategyState || strategyState.draining || strategyState.switch_blocked || strategyAction !== null;
 }
+let assetUpdateRevision = 0;
 async function changeRunningAsset(asset, enabled) {
   if (assetEditingLocked()) return false;
   strategyAction = 'asset';
@@ -682,12 +683,13 @@ async function changeRunningAsset(asset, enabled) {
     const response = await fetch('./strategy/asset?' + params, {
       method:'POST', headers:{'X-Quant-Demo':'strategy'}, signal:AbortSignal.timeout(30000)
     });
-    if (!response.ok) throw Error((await response.json()).error);
+    const data = await response.json();
+    if (!response.ok) throw Error(data.error || 'HTTP ' + response.status);
+    assetUpdateRevision++;
+    if (strategyState.running) strategyState.assets = data.assets;
   } catch (failure) {
     error = failure.message;
   } finally {
-    if (statusRequest) await statusRequest;
-    await strategyStatus();
     strategyAction = null;
     renderStrategyControls();
     if (error) el('strategy-status').textContent = error;
@@ -801,10 +803,12 @@ async function showDeployedVersion() {
 }
 showDeployedVersion();
 async function refreshStrategyStatus() {
+  const revision = assetUpdateRevision;
   try {
     const response = await fetch('./strategy', {cache:'no-store', signal:AbortSignal.timeout(6000)});
     if (!response.ok) throw Error('HTTP ' + response.status);
     const state = await response.json();
+    if (revision !== assetUpdateRevision) return;
     strategyChecks = state.checks || {};
     const wasRunning = strategyState?.running;
     const busyChanged = JSON.stringify(strategyState?.busy_assets) !== JSON.stringify(state.busy_assets);
@@ -935,7 +939,7 @@ config.addEventListener('change', async event => {
   if (input.name === 'asset' && strategyState?.running) {
     const enabled = input.checked;
     input.checked = strategyState.assets.includes(input.value);
-    await changeRunningAsset(input.value, enabled);
+    if (await changeRunningAsset(input.value, enabled)) input.checked = enabled;
     savePreferences();
   }
   renderMarketRows();
