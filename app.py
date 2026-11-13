@@ -210,6 +210,20 @@ def has_order_fill(order):
     )
 
 
+def protection_http_error(error, operation, symbol, client_id):
+    with error:
+        body = error.read()
+    code = None
+    message = error.msg
+    try:
+        payload = json.loads(body)
+        code, message = payload['code'], payload['msg']
+    except (ValueError, TypeError, KeyError):
+        pass
+    detail = f'{operation} · {symbol} · 条件单 {client_id} · 币安 {code if code is not None else error.code}：{message}'
+    return code, detail, HTTPError(error.url, error.code, detail, error.headers, BytesIO(body))
+
+
 def place_protection(symbol, kind, price, context=None, *, direction=1):
     client_id = 'quant-guard-' + uuid.uuid4().hex[:20]
     intent = dict(symbol=symbol, kind=kind, price=str(price), clientAlgoId=client_id, context=context, side=exit_side(direction))
@@ -221,13 +235,19 @@ def place_protection(symbol, kind, price, context=None, *, direction=1):
                                workingType='MARK_PRICE', triggerPrice=format(price, 'f'),
                                clientAlgoId=client_id)
     except HTTPError as error:
+        code, detail, failure = protection_http_error(error, '提交新保护单', symbol, client_id)
         if 400 <= error.code < 500 and error.code not in {408, 429}:
-            journal('demo_protection_resolved', dict(clientAlgoId=client_id, rejected=error.code))
-        raise
+            journal('demo_protection_resolved', dict(clientAlgoId=client_id, rejected=error.code,
+                                                     exchange_code=code, detail=detail))
+        raise failure from None
     journal('demo_protection_response', dict(intent=intent, response=response))
-    if not any(order['clientAlgoId'] == client_id and order['algoStatus'] == 'NEW'
-               for order in open_protection(symbol)):
-        raise ValueError('币安未确认保护单仍在挂单列表，请先核对')
+    try:
+        orders = open_protection(symbol)
+    except HTTPError as error:
+        _, _, failure = protection_http_error(error, '查询新保护单', symbol, client_id)
+        raise failure from None
+    if not any(order['clientAlgoId'] == client_id and order['algoStatus'] == 'NEW' for order in orders):
+        raise ValueError(f'提交已返回 · {symbol} · 条件单 {client_id} · 挂单列表未确认 NEW')
     try:
         journal('demo_protection_confirmed', dict(intent=intent), timeout=0.15)
     except (OSError, sqlite3.Error) as error:
@@ -238,10 +258,20 @@ def place_protection(symbol, kind, price, context=None, *, direction=1):
 def cancel_protection(order):
     client_id = order['clientAlgoId']
     journal('demo_protection_cancel_intent', dict(symbol=order['symbol'], clientAlgoId=client_id))
-    result = demo_signed('/fapi/v1/algoOrder', method='DELETE', clientAlgoId=client_id)
+    symbol = order['symbol']
+    try:
+        result = demo_signed('/fapi/v1/algoOrder', method='DELETE', clientAlgoId=client_id)
+    except HTTPError as error:
+        _, _, failure = protection_http_error(error, '撤销保护单', symbol, client_id)
+        raise failure from None
     journal('demo_protection_cancel_response', dict(clientAlgoId=client_id, response=result))
-    if any(item['clientAlgoId'] == client_id for item in open_protection(order['symbol'])):
-        raise ValueError('币安仍显示旧保护单，请核对挂单列表')
+    try:
+        orders = open_protection(symbol)
+    except HTTPError as error:
+        _, _, failure = protection_http_error(error, '核对保护单撤销结果', symbol, client_id)
+        raise failure from None
+    if any(item['clientAlgoId'] == client_id for item in orders):
+        raise ValueError(f'撤销已返回 · {symbol} · 条件单 {client_id} · 仍在挂单列表')
 
 
 def confirmed_strategy_stop(symbol, target, *, direction=1):
