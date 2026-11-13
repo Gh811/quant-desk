@@ -18,6 +18,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
+from itertools import islice
 from functools import lru_cache
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -1436,20 +1437,22 @@ def historical_bars(venue, symbol, interval, start, end, *, mark=False):
 
     rows = []
     with ThreadPoolExecutor(max_workers=4) as pool:
-        for batch in pool.map(fetch_chunk, range(first // width * width, end-step+1, width)):
-            for raw in batch:
-                stamp = int(raw[0])
-                if stamp < first:
-                    continue
+        cursors = iter(range(first // width * width, end-step+1, width))
+        while (window := list(islice(cursors, 8))):
+            for batch in pool.map(fetch_chunk, window):
+                for raw in batch:
+                    stamp = int(raw[0])
+                    if stamp < first:
+                        continue
 
-                if stamp + step > end:
-                    break
-                if stamp != first + len(rows)*step or int(raw[6]) != stamp + step - 1:
-                    raise ValueError(f'{symbol} {interval} K 线存在缺口或预热数据不足')
-                bar = (stamp, *map(float, raw[1:5]))
-                if not all(math.isfinite(p) and p > 0 for p in bar[1:]):
-                    raise ValueError(f'{symbol} {interval} K 线价格无效')
-                rows.append((bar, raw))
+                    if stamp + step > end:
+                        break
+                    if stamp != first + len(rows)*step or int(raw[6]) != stamp + step - 1:
+                        raise ValueError(f'{symbol} {interval} K 线存在缺口或预热数据不足')
+                    bar = (stamp, *map(float, raw[1:5]))
+                    if not all(math.isfinite(p) and p > 0 for p in bar[1:]):
+                        raise ValueError(f'{symbol} {interval} K 线价格无效')
+                    rows.append((bar, raw))
     if len(rows) != (end-first)//step:
         raise ValueError(f'{symbol} {interval} K 线覆盖不足，请缩短区间或选较晚日期')
     return rows
@@ -1801,6 +1804,20 @@ def submit_backtests(params):
         for job, asset in jobs:
             BACKTEST_WORKERS.submit(run_backtest_job, job, asset, source, start, end)
     return {'jobs': [existing[asset, source, start, end] for asset in assets]}
+
+
+def resume_backtests():
+    with backtest_database() as database:
+        database.execute("""
+            UPDATE backtest_jobs SET state='queued', detail='服务重启，等待恢复'
+            WHERE state='running'
+        """)
+        jobs = database.execute("""
+            SELECT id, asset, source, start, end FROM backtest_jobs
+            WHERE state='queued' ORDER BY created, rowid
+        """).fetchall()
+    for job in jobs:
+        BACKTEST_WORKERS.submit(run_backtest_job, *job)
 
 
 def run_backtest_job(job, asset, source, start, end):
@@ -3942,10 +3959,8 @@ if __name__ == '__main__':
         except ValueError as error:
             sys.exit(str(error))
         sys.exit(0)
-    with backtest_database() as database:
-        database.execute("""UPDATE backtest_jobs SET state='failed', detail='服务重启，请重新提交'
-                            WHERE state IN ('queued', 'running')""")
     server = ThreadingHTTPServer(('127.0.0.1',8765),Handler)
+    resume_backtests()
     server.strategy = DemoStrategy()
     server.shadow = LiveMarketSimulation(journal_path().with_name('live-market-mirror.json'))
     threading.Thread(target=watch_opportunities, daemon=True).start()
