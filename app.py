@@ -9,7 +9,7 @@ from collections import Counter, deque
 import threading
 import sys
 import sqlite3
-from contextlib import closing
+from contextlib import closing, contextmanager
 import uuid
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 import statistics
@@ -1158,6 +1158,7 @@ def scan_opportunities():
                 if row:
                     rows.append(row)
                     rows.sort(key=lambda item: (-item['rank'], item['symbol']))
+                    remember_opportunity(cutoff, row)
                     publish_opportunities(cutoff, rows, 'scanning')
         opportunity_cache = dict(scanned_at=now, candle_at=cutoff, scanned=len(markets),
                                  unavailable=unavailable, rows=rows)
@@ -1171,13 +1172,62 @@ def publish_opportunities(candle_at, rows, status):
         opportunity_report.update(candle_at=candle_at, rows=rows.copy(), status=status)
 
 
+OPPORTUNITY_HISTORY_MS = 24 * 60 * 60 * 1000
+
+
+@contextmanager
+def opportunity_history_database():
+    path = journal_path().with_name('opportunity-history.sqlite3')
+    with closing(sqlite3.connect(path)) as database, database:
+        database.execute("""
+            CREATE TABLE IF NOT EXISTS opportunity_signals (
+                symbol TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                candle_at INTEGER NOT NULL,
+                reference TEXT NOT NULL,
+                PRIMARY KEY (candle_at, symbol, direction)
+            )
+        """)
+        yield database
+
+
+def remember_opportunity(candle_at, row):
+    try:
+        with opportunity_history_database() as database:
+            database.execute("""
+                INSERT INTO opportunity_signals (symbol, direction, candle_at, reference)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (candle_at, symbol, direction) DO UPDATE SET reference = excluded.reference
+            """, (row['symbol'], row['direction'], candle_at, row['reference']))
+            database.execute('DELETE FROM opportunity_signals WHERE candle_at <= ?',
+                             (time.time_ns() // 1_000_000 - OPPORTUNITY_HISTORY_MS,))
+    except (OSError, sqlite3.Error) as error:
+        print(f'机会历史写入失败：{error}', flush=True)
+
+
+def recent_opportunities(now):
+    with opportunity_history_database() as database:
+        return [dict(symbol=symbol, direction=direction, candle_at=candle_at, reference=reference)
+                for symbol, direction, candle_at, reference in database.execute("""
+                    SELECT symbol, direction, candle_at, reference FROM opportunity_signals
+                    WHERE candle_at > ? ORDER BY candle_at DESC, symbol, direction
+                """, (now - OPPORTUNITY_HISTORY_MS,))]
+
+
 def current_opportunities():
     interval = STRATEGY_INTERVALS['fast']
-    cutoff = time.time_ns() // 1_000_000 // interval * interval
+    now = time.time_ns() // 1_000_000
+    cutoff = now // interval * interval
     with opportunity_report_lock:
-        if opportunity_report['candle_at'] != cutoff:
-            return dict(candle_at=cutoff, rows=[], status='waiting')
-        return opportunity_report.copy()
+        if opportunity_report['candle_at'] == cutoff:
+            report = opportunity_report.copy()
+        else:
+            report = dict(candle_at=cutoff, rows=[], status='waiting')
+    try:
+        report['history'] = recent_opportunities(now)
+    except (OSError, sqlite3.Error):
+        report['history'] = None
+    return report
 
 
 def watch_opportunities():
@@ -1828,9 +1878,39 @@ class DemoStrategy:
         self.mode = 'swing'
         self.fixed_notional = None
         self.assets = []
+        self.busy_assets = []
         self.checks = {}
         self.checked_at = None
         self.scan_ms = None
+
+    def change_asset(self, asset, enabled):
+        if not asset or len(asset) > 24 or not asset.isascii() or not asset.isalnum() or asset != asset.upper():
+            raise ValueError('标的代码无效')
+        with self.control:
+            if not self.lock.locked() or self.stop.is_set() or self.draining:
+                raise ValueError('当前没有可调整的运行中策略')
+            if enabled == (asset in self.assets):
+                return
+            symbol = asset + 'USDT'
+            if enabled:
+                demo = futures_catalog(DEMO_VENUE).get(symbol)
+                if not tradable_future(demo) or (self.mode == 'us_open' and equity_kind(symbol, demo) != 'us'):
+                    raise ValueError('模拟盘或当前策略不支持：' + asset)
+                if asset not in ASSETS and not any(row['asset'] == asset and row['pool']
+                                                   for row in market_universe()['markets']):
+                    raise ValueError('标的不在实盘候选池中，请刷新合约目录')
+                self.assets = sorted([*self.assets, asset])
+            else:
+                pending = any(order['symbol'] == symbol and order['status'] in DEMO_ORDER_PENDING
+                              for order in recent_orders(limit=None))
+                if pending or demo_signed('/fapi/v1/openOrders', symbol=symbol) or open_protection(symbol):
+                    raise ValueError(asset + ' 仍有挂单或待核对委托')
+                if any(position['symbol'] == symbol and Decimal(position['positionAmt'])
+                       for position in demo_signed('/fapi/v3/account')['positions']):
+                    raise ValueError(asset + ' 仍有持仓')
+                self.assets = [item for item in self.assets if item != asset]
+                self.checks = {key: value for key, value in self.checks.items() if key != asset}
+            self.wake.set()
 
     def stop_and_flatten(self):
         with self.control:
@@ -1908,11 +1988,17 @@ class DemoStrategy:
             return fast_position_market(now, lambda frame, cutoff, required:
                                         closed_demo_bars(symbol, frame, cutoff, required))
 
+        active_selection = self.assets
         try:
             record_runtime('收到启动请求', mode=mode,
                            detail=f'{STRATEGY_NAMES[mode]} · {"、".join(sorted(assets))}')
             while not self.stop.is_set():
-                self.wake.clear()
+                with self.control:
+                    self.wake.clear()
+                    if active_selection is not self.assets:
+                        active_selection = self.assets
+                        next_entry_scan = 0
+                    assets = set(active_selection)
                 if recovering:
                     self.status = '正在读取模拟账户持仓'
                 pending = reconcile_demo_orders(cancel_entries=self.entries_paused.is_set())
@@ -1926,6 +2012,7 @@ class DemoStrategy:
                 account = demo_signed('/fapi/v3/account')
                 active = [p for p in account['positions'] if Decimal(p['positionAmt'])]
                 positions = {p['symbol']: p for p in active}
+                self.busy_assets = sorted(symbol[:-4] for symbol in positions.keys() | pending_symbols.keys())
                 if recovering:
                     demo_return_baseline(account.get('totalWalletBalance'))
                 to_restore = {symbol: position for symbol, position in positions.items()
@@ -2412,9 +2499,13 @@ class DemoStrategy:
                             if time_in_force == 'IOC' and (budget / price // step) * step > amount:
                                 decision['detail'] += ' · 按一档可成交深度缩量'
                         entry_attempts[symbol] = (candle, direction, now, price, time_in_force, cost)
-                        order = submit_demo_limit_entry(symbol, amount, price, leverage_target, mode,
-                                                        stop_loss, tick, self.wake, decision,
-                                                        side=entry_side(direction), time_in_force=time_in_force)
+                        with self.control:
+                            if (symbol[:-4] not in self.assets or self.stop.is_set()
+                                    or self.entries_paused.is_set() or self.wake.is_set()):
+                                break
+                            order = submit_demo_limit_entry(symbol, amount, price, leverage_target, mode,
+                                                            stop_loss, tick, self.wake, decision,
+                                                            side=entry_side(direction), time_in_force=time_in_force)
                         if fast_trend:
                             entry_outcomes[f'{time_in_force} {order["status"]}'] += 1
                         if order['status'] in DEMO_ORDER_PENDING:
@@ -2797,6 +2888,16 @@ class Handler(BaseHTTPRequestHandler):
                         strategy.entries_paused.clear()
                     strategy.wake.set()
                     record_runtime('停止开新仓' if paused else '恢复开新仓', mode=strategy.mode)
+        elif parsed.path == '/strategy/asset':
+            params = parse_qs(parsed.query)
+            try:
+                enabled = params['enabled'][0]
+                if enabled not in {'0', '1'}:
+                    raise ValueError('标的操作无效')
+                strategy.change_asset(params['asset'][0], enabled == '1')
+            except (OSError, ValueError, KeyError, ArithmeticError, sqlite3.Error) as error:
+                self.send(409, 'application/json', json.dumps({'error': str(error)}).encode())
+                return
         elif parsed.path == '/strategy/start':
             params = parse_qs(parsed.query)
             assets = set(params.get('asset', ()))
@@ -2843,6 +2944,7 @@ class Handler(BaseHTTPRequestHandler):
                 strategy.mode = mode
                 strategy.fixed_notional = fixed_notional
                 strategy.assets = sorted(assets)
+                strategy.busy_assets = []
                 strategy.checks = {}
                 strategy.checked_at = None
                 strategy.scan_ms = None
@@ -2905,6 +3007,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(200, 'application/json', json.dumps(dict(status=self.server.strategy.status, mode=self.server.strategy.mode,
                                                                     running=self.server.strategy.lock.locked() or self.server.strategy.draining,
                                                                     draining=self.server.strategy.draining, assets=self.server.strategy.assets,
+                                                                    busy_assets=self.server.strategy.busy_assets,
                                                                     entries_paused=self.server.strategy.entries_paused.is_set(),
                                                                     fixed_notional=(str(self.server.strategy.fixed_notional)
                                                                                     if self.server.strategy.fixed_notional is not None else None),
