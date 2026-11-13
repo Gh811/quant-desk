@@ -23,8 +23,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-ASSETS = 'ETH BTC XAU SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN'.split()
-US_EQUITY_ASSETS = set('SNDK SOXL KORU MU NVDA QQQ GOOGL SPCX META TSLA AMZN'.split())
+ASSETS = 'ETH BTC XAU SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN BNB ZEC INTC'.split()
+US_EQUITY_ASSETS = set('SNDK SOXL KORU MU NVDA QQQ GOOGL SPCX META TSLA AMZN INTC'.split())
 HOSTS = {'OKX': 'https://openapi.okx.com', 'Binance': 'https://fapi.binance.com'}
 DEMO_VENUE = 'Binance 模拟盘'
 HOSTS[DEMO_VENUE] = 'https://demo-fapi.binance.com'
@@ -40,6 +40,10 @@ ENTRY_QUOTE_MAX_AGE_MS = 5_000
 ENTRY_RETRY_COOLDOWN_SECONDS = {'fast': 20, 'intraday': 30, 'swing': 60, 'us_open': 30}
 demo_clock_lock = threading.Lock()
 demo_clock_sample = None
+catalog_locks = {venue: threading.Lock() for venue in ('Binance', DEMO_VENUE)}
+catalog_cache = {}
+opportunity_lock = threading.Lock()
+opportunity_cache = None
 
 
 @lru_cache(maxsize=1)
@@ -94,6 +98,63 @@ def request(venue, path, **params):
             raise ValueError(payload['msg'])
         return payload['data']
     return payload
+
+
+def futures_catalog(venue):
+    with catalog_locks[venue]:
+        cached = catalog_cache.get(venue)
+        if cached and time.monotonic() - cached[0] < 60:
+            return cached[1]
+        rows = request(venue, '/fapi/v1/exchangeInfo')['symbols']
+        catalog = {item['symbol']: item for item in rows
+                   if item['symbol'].endswith('USDT') and item.get('quoteAsset', 'USDT') == 'USDT'}
+        catalog_cache[venue] = (time.monotonic(), catalog)
+        return catalog
+
+
+def tradable_future(item):
+    return bool(item and item['status'] == 'TRADING'
+                and item['contractType'] in {'PERPETUAL', 'TRADIFI_PERPETUAL'})
+
+
+def equity_kind(symbol, item):
+    if symbol[:-4] in US_EQUITY_ASSETS:
+        return 'us'
+    if not item:
+        return None
+    tags = {str(tag).upper() for tag in [item.get('underlyingType'), *(item.get('underlyingSubType') or [])]}
+    if tags & {'COMMODITY', 'METAL', 'FOREX', 'FX', 'PRECIOUS_METAL', 'ENERGY'} or symbol[:-4] in {
+            'XAU', 'XAG', 'XPT', 'XPD', 'CL', 'BZ', 'WTI', 'BRENT', 'NG'}:
+        return None
+    if tags & {'HK', 'KOREA', 'JAPAN', 'KR', 'JP', 'NON_US_EQUITY'} or symbol[:-4] in {'SKHYNIX', 'SAMSUNG'}:
+        return 'other'
+    if tags & {'STOCK', 'STOCKS', 'EQUITY', 'EQUITIES', 'ETF', 'US_STOCK', 'US_EQUITY', 'US_STOCKS', 'US_EQUITIES'}:
+        return 'us'
+    return 'unclassified' if item['contractType'] == 'TRADIFI_PERPETUAL' else None
+
+
+def market_universe():
+    catalogs, errors = {}, {}
+    for venue in ('Binance', DEMO_VENUE):
+        try:
+            catalogs[venue] = futures_catalog(venue)
+        except (OSError, ValueError, KeyError) as error:
+            catalogs[venue] = {}
+            errors[venue] = str(error)
+    live, demo = catalogs['Binance'], catalogs[DEMO_VENUE]
+    default_symbols = [asset + 'USDT' for asset in ASSETS]
+    pool = {symbol for symbol, item in live.items() if tradable_future(item)
+            and equity_kind(symbol, item) in {'us', 'unclassified'}}
+    rows = []
+    for symbol in dict.fromkeys([*default_symbols, *sorted(pool)]):
+        formal, simulated = live.get(symbol), demo.get(symbol)
+        rows.append(dict(asset=symbol[:-4], symbol=symbol, default=symbol in default_symbols,
+                         pool=symbol in pool, equity=equity_kind(symbol, formal or simulated),
+                         live_tradeable=tradable_future(formal), demo_tradeable=tradable_future(simulated),
+                         live_contract_type=formal['contractType'] if formal else None,
+                         status=simulated['status'] if simulated else None,
+                         contract_type=(simulated or formal or {}).get('contractType')))
+    return dict(markets=rows, live_error=errors.get('Binance'), demo_error=errors.get(DEMO_VENUE))
 
 def sync_demo_clock(rejected_sample=None):
     global demo_clock_sample
@@ -415,7 +476,7 @@ def align_strategy_protection(symbol, entry, mark, stop_loss, stop, tick, contex
 
 
 def replace_protection(symbol, kind, raw_price):
-    if symbol not in {asset + 'USDT' for asset in ASSETS} or kind not in PROTECTION_TYPES:
+    if not symbol.isascii() or not symbol.isalnum() or not symbol.endswith('USDT') or kind not in PROTECTION_TYPES:
         raise ValueError('合约或保护单类型无效')
     price = Decimal(raw_price)
     if not price.is_finite() or price <= 0:
@@ -791,10 +852,10 @@ FAST_LEARNING_WINDOW = 60 * 24 * HOUR
 FAST_LEARNING_HALF_LIFE = 14 * 24 * HOUR
 
 
-def entry_stop_fraction(asset, mode, volatility):
+def entry_stop_fraction(asset, mode, volatility, *, us_equity=False):
     if mode == 'us_open':
         return min(Decimal('.025'), max(Decimal('.008'), Decimal('2.5') * volatility))
-    if mode == 'fast' and asset in US_EQUITY_ASSETS:
+    if mode == 'fast' and (us_equity or asset in US_EQUITY_ASSETS):
         return min(Decimal('.02'), max(Decimal('.0065'), Decimal('2.5') * volatility))
     low, high = (Decimal('.005'), Decimal('.02')) if mode == 'swing' else (Decimal('.0035'), Decimal('.01'))
     return min(high, max(low, 2 * volatility))
@@ -809,10 +870,10 @@ def entry_notional_budget(mode, equity, free_margin, leverage, slots, stop, cost
     return max(Decimal(0), min(capital_cap, margin_cap, risk_cap))
 
 
-def closed_demo_bars(symbol, interval, cutoff, required, *, venue=DEMO_VENUE):
+def closed_demo_bars(symbol, interval, cutoff, required, *, venue=DEMO_VENUE, fetch=None):
     minutes = TIMEFRAME_MINUTES[interval]
     duration = minutes * 60000
-    raw = request(venue, '/fapi/v1/klines', symbol=symbol, interval=interval, limit=65)
+    raw = (fetch or request)(venue, '/fapi/v1/klines', symbol=symbol, interval=interval, limit=65)
     closed = [row for row in raw if int(row[6]) < cutoff][-required:]
     bars = [(int(row[0]), *map(float, row[1:5])) for row in closed]
     if (len(bars) < required or cutoff - int(closed[-1][6]) > duration + 15000
@@ -1045,6 +1106,59 @@ def fast_take_target(entry, direction, risk, volatility, cost, obstacles):
     return target, source
 
 
+def scan_opportunities():
+    global opportunity_cache
+    with opportunity_lock:
+        now = time.time_ns() // 1_000_000
+        cutoff = now // STRATEGY_INTERVALS['fast'] * STRATEGY_INTERVALS['fast']
+        if (opportunity_cache and opportunity_cache['candle_at'] == cutoff
+                and now - opportunity_cache['scanned_at'] < 60_000):
+            return opportunity_cache
+        universe = market_universe()
+        if universe['live_error']:
+            raise ValueError('币安实盘合约目录不可用：' + universe['live_error'])
+        markets = [item for item in universe['markets'] if item['live_tradeable']]
+
+        def evaluate(item):
+            symbol = item['symbol']
+            try:
+                def read(interval, before, required):
+                    return closed_demo_bars(symbol, interval, before, required, venue='Binance', fetch=backtest_request)
+
+                candle, score, volatility, reason, context = evaluate_entry_signal(symbol, 'fast', cutoff, read)
+                if candle + STRATEGY_INTERVALS['fast'] != cutoff:
+                    raise ValueError('最新 5 分钟 K 线尚未齐备')
+                direction = '多' if '做多' in reason else '空' if '做空' in reason else None
+                if score is None:
+                    if direction:
+                        return dict(**item, direction=direction, level='观察', reason=reason, rank=0), False
+                    if '等待突破后回踩' in reason:
+                        return dict(**item, direction='—', level='观察', reason=reason, rank=0), False
+                    return None, False
+                side = 1 if score > 0 else -1
+                entry = context['close']
+                stop = entry_stop_fraction(item['asset'], 'fast', volatility, us_equity=item['equity'] == 'us')
+                try:
+                    stop = fast_structure_stop(entry, side, context['extreme'], volatility, stop,
+                                               item['live_contract_type'])
+                    target, source = fast_take_target(entry, side, stop, volatility, Decimal(0),
+                                                     context['obstacles'])
+                except ValueError as error:
+                    return dict(**item, direction=direction, level='观察', reason=str(error), rank=0), False
+                return dict(**item, direction='多' if side > 0 else '空', level='信号成立',
+                            reason=f'{reason} · {context["detail"]} · {source}', rank=context['priority'],
+                            reference=str(entry), stop=f'{stop:.2%}', target=f'{target:.2%}'), False
+            except (OSError, ValueError, KeyError, TypeError, IndexError, ArithmeticError):
+                return None, True
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            outcomes = list(pool.map(evaluate, markets))
+        rows = sorted((row for row, _ in outcomes if row), key=lambda row: (-row['rank'], row['symbol']))
+        opportunity_cache = dict(scanned_at=now, candle_at=cutoff, scanned=len(markets),
+                                 unavailable=sum(failed for _, failed in outcomes), rows=rows)
+        return opportunity_cache
+
+
 def fast_signal_family(reason):
     if reason in {'突破做多', '跌破做空'}:
         return 'breakout'
@@ -1221,6 +1335,7 @@ def historical_bars(venue, symbol, interval, start, end, *, mark=False):
 
 BACKTEST_MAX_POSITIONS = 5
 FAST_CORRELATED_ASSETS = {'BTC', 'ETH', 'SOL'}
+FAST_CRYPTO_ASSETS = FAST_CORRELATED_ASSETS | {'BNB', 'ZEC'}
 
 
 BACKTEST_RULES = {'current': '当前策略', 'confirmation': '严格确认', 'retest': '严格确认＋回踩'}
@@ -1321,7 +1436,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 if mode == 'fast':
                     try:
                         stop = fast_structure_stop(entry, direction, context['extreme'], volatility, stop,
-                                                   'PERPETUAL' if asset in FAST_CORRELATED_ASSETS else 'TRADIFI_PERPETUAL')
+                                                   'PERPETUAL' if asset in FAST_CRYPTO_ASSETS else 'TRADIFI_PERPETUAL')
                     except ValueError:
                         continue
                 cost = 2*(fee+slippage)
@@ -1724,6 +1839,7 @@ class DemoStrategy:
         fast_takes = {}
         fast_exit_decisions = {}
         review_pool = ThreadPoolExecutor(max_workers=self.FAST_MAX_POSITIONS) if fast_trend else None
+        quote_pool = ThreadPoolExecutor(max_workers=6) if fast_trend else None
         prepared_leverage = set()
         prepare_at_start = mode == 'fast'
         recovering = True
@@ -1984,7 +2100,7 @@ class DemoStrategy:
                                                                      if not order.get('reduceOnly')}
                     for order in open_orders:
                         pending_symbols.setdefault(order['symbol'], order.get('status') or '交易所有挂单')
-                    catalog = request(DEMO_VENUE, '/fapi/v1/exchangeInfo')['symbols']
+                    listed = futures_catalog(DEMO_VENUE)
                     started = time.monotonic()
                     if fast_trend and started >= next_learning_refresh:
                         next_learning_refresh = started + 30
@@ -1998,9 +2114,8 @@ class DemoStrategy:
                                                 for side in (1, -1)}
                     self.status = '正在检查行情与入场信号'
                     candidates = []
-                    listed = {item['symbol']: item for item in catalog}
                     checks = {}
-                    with ThreadPoolExecutor(max_workers=max(1, len(assets))) as pool:
+                    with ThreadPoolExecutor(max_workers=max(1, min(8, len(assets)))) as pool:
                         if prepare_at_start:
                             self.status = f'正在初始化所选标的的 {self.FAST_LEVERAGE}× 杠杆'
                             eligible = [asset + 'USDT' for asset in sorted(assets)
@@ -2081,8 +2196,17 @@ class DemoStrategy:
                                        detail=f'读取 {len(jobs)} 个标的 · 行情不可用 {unavailable} 个 · 耗时 {self.scan_ms} ms')
                         last_scan_log = self.checked_at
                     free_margin = Decimal(account['availableBalance'])
-                    for _, symbol, candle, volatility, reason, item, score, signal_context, evidence in sorted(
-                            candidates, key=lambda candidate: (-candidate[0], candidate[1])):
+                    ranked = sorted(candidates, key=lambda candidate: (-candidate[0], candidate[1]))
+                    quotes = {}
+                    funding_window = (max_hold_hours or 1) * HOUR
+                    if quote_pool and not self.wake.is_set() and len(occupied) < max_positions:
+                        for _, symbol, _, _, _, item, score, *_ in ranked[:3]:
+                            direction = 1 if score > 0 else -1
+                            quotes[symbol] = (
+                                quote_pool.submit(demo_entry_cost, symbol, direction, funding_window),
+                                quote_pool.submit(demo_entry_book, symbol, item['contractType']),
+                            )
+                    for _, symbol, candle, volatility, reason, item, score, signal_context, evidence in ranked:
                         if self.wake.is_set() or self.stop.is_set() or self.entries_paused.is_set() or len(occupied) >= max_positions:
                             break
                         filters = {f['filterType']: f for f in item['filters']}
@@ -2101,9 +2225,16 @@ class DemoStrategy:
                                 self.checks = checks.copy()
                                 continue
                         try:
-                            funding_window = (max_hold_hours or 1) * HOUR
-                            fee, funding_cost = demo_entry_cost(symbol, direction, funding_window)
-                            book, bid, ask = demo_entry_book(symbol, item['contractType'])
+                            quote_started = time.monotonic()
+                            if symbol in quotes:
+                                cost_job, book_job = quotes.pop(symbol)
+                                fee, funding_cost = cost_job.result()
+                                book, bid, ask = book_job.result()
+                                if demo_now_ms() - int(book['time']) > ENTRY_QUOTE_MAX_AGE_MS:
+                                    book, bid, ask = demo_entry_book(symbol, item['contractType'])
+                            else:
+                                fee, funding_cost = demo_entry_cost(symbol, direction, funding_window)
+                                book, bid, ask = demo_entry_book(symbol, item['contractType'])
                             book_time = int(book['time'])
                             midpoint = (bid + ask) / 2
                             spread = (ask - bid) / midpoint
@@ -2113,13 +2244,15 @@ class DemoStrategy:
                             tolerance = 0 if signal_context['stressed'] else -volatility / 4
                             if direction * (midpoint / signal_context['boundary'] - 1) < tolerance:
                                 raise ValueError('价格已反向穿过触发位')
+                            quote_ms = round((time.monotonic() - quote_started) * 1000)
                         except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
                             checks[symbol[:-4]] = f'跳过 · 价格核验未通过：{error}'
                             self.checks = checks.copy()
                             continue
                         step = Decimal(lot['stepSize'])
                         equity = Decimal(account['totalMarginBalance'])
-                        stop_loss = entry_stop_fraction(symbol[:-4], mode, volatility)
+                        stop_loss = entry_stop_fraction(symbol[:-4], mode, volatility,
+                                                        us_equity=equity_kind(symbol, item) == 'us')
                         if mode == 'fast':
                             try:
                                 stop_loss = fast_structure_stop(
@@ -2227,6 +2360,7 @@ class DemoStrategy:
                             planned_take = protection_price(price, target_return, tick, direction=direction, kind='take')
                             decision['detail'] += f' · 计划止盈 {planned_take:f}（{target_source} · {target_return:.3%}）'
                             decision['detail'] += ' · ' + fast_evidence_label(evidence)
+                            decision['detail'] += f' · 行情扫描 {self.scan_ms} ms · 下单前报价等待 {quote_ms} ms'
                             decision['detail'] += (f' · 名义仓位 {notional:.2f} USDT'
                                                    f' · 计划风险 {notional * (stop_loss + cost):.2f} USDT'
                                                    f'（上限 {equity * ENTRY_EQUITY_RISK[mode] * risk_scale:.2f} USDT）')
@@ -2300,6 +2434,9 @@ class DemoStrategy:
                                 checks[other_asset] = '信号成立 · 等待下一轮仓位检查'
                         self.checks = checks.copy()
                         break
+                    for jobs in quotes.values():
+                        for job in jobs:
+                            job.cancel()
                     if fast_trend:
                         entry_signal_count += scan_signals
                         entry_blockers.update(checks[symbol[:-4]].split('：', 1)[0]
@@ -2345,6 +2482,8 @@ class DemoStrategy:
             self.status = f'已暂停 · {error}'
             record_runtime('策略已暂停', mode=mode, detail=str(error))
         finally:
+            if quote_pool is not None:
+                quote_pool.shutdown(wait=False, cancel_futures=True)
             if review_pool is not None:
                 review_pool.shutdown(wait=False, cancel_futures=True)
             self.lock.release()
@@ -2615,7 +2754,7 @@ class Handler(BaseHTTPRequestHandler):
                     record_runtime('停止开新仓' if paused else '恢复开新仓', mode=strategy.mode)
         elif parsed.path == '/strategy/start':
             params = parse_qs(parsed.query)
-            assets = set(params.get('asset', ())) & set(ASSETS)
+            assets = set(params.get('asset', ()))
             mode = params.get('strategy', ['swing'])[0]
             if mode not in STRATEGY_NAMES:
                 self.send(400, 'application/json', '{"error":"未知策略"}'.encode())
@@ -2634,8 +2773,21 @@ class Handler(BaseHTTPRequestHandler):
             except (ValueError, InvalidOperation):
                 self.send(400, 'application/json', json.dumps({'error': '请选择仓位模式并输入有效的固定名义金额'}).encode())
                 return
-            if mode == 'us_open':
-                assets &= US_EQUITY_ASSETS
+            if assets:
+                try:
+                    demo = futures_catalog(DEMO_VENUE)
+                    extra = assets - set(ASSETS)
+                    if extra:
+                        pool = {row['asset'] for row in market_universe()['markets'] if row['pool']}
+                        if not extra <= pool:
+                            raise ValueError('有标的不在实盘候选池中，请刷新合约目录')
+                    unavailable = sorted(asset for asset in assets if not tradable_future(demo.get(asset + 'USDT'))
+                                         or (mode == 'us_open' and equity_kind(asset + 'USDT', demo.get(asset + 'USDT')) != 'us'))
+                    if unavailable:
+                        raise ValueError('模拟盘或当前策略不支持：' + '、'.join(unavailable))
+                except (OSError, ValueError, KeyError) as error:
+                    self.send(400, 'application/json', json.dumps({'error': str(error)}).encode())
+                    return
             with strategy.control:
                 if not assets or strategy.draining or strategy.switch_blocked or not strategy.lock.acquire(blocking=False):
                     self.send(409, 'application/json', '{"error":"请选择标的，并等当前策略停止且币安确认空仓、无挂单"}'.encode())
@@ -2694,6 +2846,12 @@ class Handler(BaseHTTPRequestHandler):
                                      status=item['status'] if item else None,
                                      contract_type=item['contractType'] if item else None))
                 self.send(200, 'application/json', json.dumps(rows).encode())
+                return
+            if parsed.path == '/market-universe':
+                self.send(200, 'application/json', json.dumps(market_universe()).encode())
+                return
+            if parsed.path == '/opportunities':
+                self.send(200, 'application/json', json.dumps(scan_opportunities(), allow_nan=False).encode())
                 return
             if parsed.path == '/shadow':
                 self.send(200, 'application/json', json.dumps(self.server.shadow.snapshot()).encode())
