@@ -79,6 +79,9 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 .asset-code{font-family:ui-monospace,SFMono-Regular,monospace;font-weight:600}
 #pool-search{padding:7px 9px;border:1px solid #bdcadd;border-radius:5px;max-width:100%}
 #assets label[data-unavailable=true]{color:#52647a}
+.asset-choice{display:flex;align-items:center;justify-content:space-between;gap:6px}
+.asset-choice label{margin:4px 0}
+.asset-choice button{width:auto;padding:2px 5px;font-size:11px;color:#52647a;background:transparent;border:0}
 </style><main><aside><div class="desk-brand"><strong>Quant Desk</strong><small>币安合约模拟盘</small>
 <small id="desk-version" class="desk-version" hidden>GitHub <a target="_blank" rel="noopener"></a></small></div>
 <p id="strategy-status" role="status">正在读取后台策略状态…</p>
@@ -208,8 +211,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <nav id="pool-pages" class="pagination" aria-label="候选池分页" hidden></nav>
 </div>
 <div class="market-research" aria-labelledby="opportunity-title">
-  <div class="research-header"><div><h2 id="opportunity-title">AI 选股 · 多空机会</h2><small>覆盖全部候选。参考价基于收盘行情，未计盘口与费用。</small><p id="opportunity-status" role="status">等待扫描</p></div>
-  <button id="opportunity-scan" class="compact-button" type="button">扫描全部机会</button></div>
+  <div class="research-header"><div><h2 id="opportunity-title">AI 选股 · 多空机会</h2><small>后台每根 5 分钟 K 线收盘后扫描全部候选。参考价未计盘口与费用。</small><p id="opportunity-status" role="status">正在连接机会扫描…</p></div></div>
   <div class="research-scroll" id="opportunity-results" hidden><table><thead><tr><th>合约</th><th>方向</th><th>状态</th><th>依据</th><th>参考入场价</th><th>参考止损 / 止盈</th><th>模拟盘</th></tr></thead><tbody id="opportunity-rows"></tbody></table></div>
   <nav id="opportunity-pages" class="pagination" aria-label="机会分页" hidden></nav>
 </div></section></main>
@@ -358,12 +360,18 @@ demoSync.onclick = async () => {
 const name = asset => ({XAU:'黄金', SKHYNIX:'SK 海力士', SAMSUNG:'三星电子', GOOGL:'Google（GOOGL）', INTC:'英特尔（INTC）'})[asset] || asset;
 const defaultAssets = 'ETH BTC XAU SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN BNB ZEC INTC'.split(' ');
 function addAssetCheckbox(asset, checked) {
+  const choice = document.createElement('div');
+  choice.className = 'asset-choice';
   const label = document.createElement('label');
   const checkbox = Object.assign(document.createElement('input'), {type:'checkbox', name:'asset', value:asset, checked, disabled:true});
   label.append(checkbox, ' '+name(asset));
-  el('assets').append(label);
+  const remove = document.createElement('button');
+  Object.assign(remove, {type:'button', textContent:'移出', disabled:true});
+  remove.setAttribute('aria-label', '移出 ' + name(asset));
+  remove.addEventListener('click', () => setAssetWatch(asset, false));
+  choice.append(label, remove);
+  el('assets').append(choice);
 }
-for (const asset of defaultAssets) addAssetCheckbox(asset, !['SAMSUNG','XAU','BNB','ZEC','INTC'].includes(asset));
 function row(table, values) {
   const item = el(table).insertRow();
   values.forEach(value => { item.insertCell().textContent = value; });
@@ -382,6 +390,10 @@ const config = el('config');
 const preferences = readSaved('config');
 const poolWatch = new Set(Array.isArray(preferences?.poolWatch)
   ? preferences.poolWatch.filter(asset => typeof asset === 'string' && /^[A-Z0-9]{1,24}$/.test(asset)) : []);
+const removedAssets = new Set(Array.isArray(preferences?.removedAssets) ? preferences.removedAssets : []);
+for (const asset of defaultAssets) {
+  if (!removedAssets.has(asset)) addAssetCheckbox(asset, !['SAMSUNG','XAU','BNB','ZEC','INTC'].includes(asset));
+}
 const strategyMode = el('strategy-mode');
 const strategySizing = el('strategy-sizing');
 const strategyNotional = el('strategy-notional');
@@ -396,7 +408,7 @@ if (Array.isArray(preferences?.assets)) {
 }
 function savePreferences() {
   writeSaved('config', {assets:[...config.querySelectorAll('[name=asset]:checked')].map(input=>input.value),
-    poolWatch:[...poolWatch], strategy:strategyMode.value,
+    poolWatch:[...poolWatch], removedAssets:[...removedAssets], strategy:strategyMode.value,
     sizing:strategySizing.value, notional:strategyNotional.value});
 }
 const usStrategyAssets = new Set('SNDK SOXL KORU MU NVDA QQQ GOOGL SPCX META TSLA AMZN INTC'.split(' '));
@@ -900,6 +912,8 @@ function renderStrategyControls() {
     checkbox.disabled = locked || !market?.demo_tradeable || (strategyMode.value === 'us_open' && market.equity !== 'us');
     checkbox.parentElement.dataset.unavailable = String(!market?.demo_tradeable);
     checkbox.parentElement.title = market?.demo_tradeable ? '' : '模拟盘未确认可交易';
+    checkbox.closest('.asset-choice').querySelector('button').disabled = !strategyState ||
+      (running && strategyState.assets.includes(checkbox.value));
   }
 }
 function setMarketPill(cell, label, tone) {
@@ -1005,6 +1019,13 @@ async function refreshStrategyStatus() {
     }
     if (state.running && Array.isArray(state.assets)) {
       let selectionChanged = false;
+      const existing = new Set([...config.querySelectorAll('[name=asset]')].map(input=>input.value));
+      for (const asset of state.assets) {
+        if (!existing.has(asset)) {
+          addAssetCheckbox(asset, true);
+          selectionChanged = true;
+        }
+      }
       for (const checkbox of config.querySelectorAll('[name=asset]')) {
         const selected = state.assets.includes(checkbox.value);
         if (checkbox.checked !== selected) {
@@ -1013,6 +1034,11 @@ async function refreshStrategyStatus() {
         }
       }
       if (selectionChanged) renderMarketRows();
+    } else if (wasRunning) {
+      for (const input of config.querySelectorAll('[name=asset]')) {
+        if (removedAssets.has(input.value)) input.closest('.asset-choice').remove();
+      }
+      renderMarketRows();
     }
     el('strategy-status').textContent = state.running
       ? strategyNames[state.mode] + ' · ' + state.status : state.status;
@@ -1063,7 +1089,7 @@ function renderMarketRows() {
   if (!marketCatalog) return;
   const selected = new Set([...config.querySelectorAll('[name=asset]:checked')].map(checkbox => checkbox.value));
   for (const asset of poolWatch) selected.add(asset);
-  for (const asset of ['BNB','ZEC','INTC']) selected.add(asset);
+  for (const asset of ['BNB','ZEC','INTC']) if (!removedAssets.has(asset)) selected.add(asset);
   const heldSymbols = new Set((accountSnapshot?.holdings || [])
     .filter(position => Number(position.quantity) !== 0)
     .map(position => position.symbol));
@@ -1089,7 +1115,8 @@ async function loadMarketStatus() {
     marketByAsset = new Map(marketCatalog.map(market => [market.asset, market]));
     const existing = new Set([...config.querySelectorAll('[name=asset]')].map(input=>input.value));
     for (const market of marketCatalog) {
-      if ((poolWatch.has(market.asset) || strategyState?.assets?.includes(market.asset)) && !existing.has(market.asset))
+      if ((poolWatch.has(market.asset) || (strategyState?.running && strategyState.assets.includes(market.asset))) &&
+          !existing.has(market.asset))
         addAssetCheckbox(market.asset, strategyState?.running ? strategyState.assets.includes(market.asset) :
           (preferences?.assets?.includes(market.asset) || false));
     }
@@ -1111,37 +1138,41 @@ async function loadMarketStatus() {
 }
 function renderPool() {
   const query = el('pool-search').value.trim().toUpperCase();
-  const rows = (marketCatalog || []).filter(market=>market.pool &&
+  const rows = (marketCatalog || []).filter(market=>(market.pool || removedAssets.has(market.asset)) &&
     (market.symbol.includes(query) || name(market.asset).toUpperCase().includes(query)));
   el('pool-rows').replaceChildren();
   for (const market of pageItems(rows, 'pool-pages', renderPool)) {
     const item = row('pool-rows', [market.symbol, market.equity === 'us' ? '美股 / ETF' : '传统资产 · 分类待确认',
-      '可交易', market.demo_tradeable ? '可交易' : '不可选', '']);
+      market.live_tradeable ? '可交易' : '未确认', market.demo_tradeable ? '可交易' : '不可选', '']);
     item.cells[0].className = 'asset-code';
-    setMarketPill(item.cells[2], '可交易', 'live');
+    setMarketPill(item.cells[2], market.live_tradeable ? '可交易' : '未确认', market.live_tradeable ? 'live' : 'warn');
     setMarketPill(item.cells[3], market.demo_tradeable ? '可交易' : '不可选', market.demo_tradeable ? 'live' : 'warn');
     const builtIn = defaultAssets.includes(market.asset);
-    const watched = poolWatch.has(market.asset);
-    const button = orderElement('button', 'compact-button', builtIn ? '已在列表' : watched ? '移出观察' : '加入观察');
+    const watched = !removedAssets.has(market.asset) && (builtIn || poolWatch.has(market.asset));
+    const button = orderElement('button', 'compact-button', watched ? '移出列表' : '加入列表');
     button.type = 'button';
-    button.disabled = builtIn || (watched && strategyState?.running && strategyState.assets.includes(market.asset));
-    button.addEventListener('click', () => {
-      const input = [...config.querySelectorAll('[name=asset]')].find(input=>input.value === market.asset);
-      if (watched) {
-        poolWatch.delete(market.asset);
-        input?.parentElement.remove();
-      } else {
-        poolWatch.add(market.asset);
-        if (!input) addAssetCheckbox(market.asset, false);
-      }
-      savePreferences();
-      renderStrategyControls();
-      renderMarketRows();
-      renderPool();
-    });
+    button.disabled = watched && (!strategyState || (strategyState.running && strategyState.assets.includes(market.asset)));
+    button.addEventListener('click', () => setAssetWatch(market.asset, !watched));
     item.cells[4].append(button);
   }
   if (!rows.length) row('pool-rows', ['暂无匹配合约', '—', '—', '—', '—']);
+}
+function setAssetWatch(asset, watched) {
+  const input = [...config.querySelectorAll('[name=asset]')].find(input=>input.value === asset);
+  if (!watched) {
+    if (!strategyState || (strategyState.running && strategyState.assets.includes(asset))) return;
+    poolWatch.delete(asset);
+    if (defaultAssets.includes(asset)) removedAssets.add(asset);
+    input?.closest('.asset-choice').remove();
+  } else {
+    removedAssets.delete(asset);
+    poolWatch.add(asset);
+    if (!input) addAssetCheckbox(asset, false);
+  }
+  savePreferences();
+  renderStrategyControls();
+  renderMarketRows();
+  renderPool();
 }
 el('pool-refresh').addEventListener('click', async () => {
   const button = el('pool-refresh');
@@ -1164,27 +1195,47 @@ function renderOpportunities() {
   }
   el('opportunity-results').hidden = !opportunityRows.length;
 }
-el('opportunity-scan').addEventListener('click', async () => {
-  const button = el('opportunity-scan');
-  button.disabled = true;
-  el('opportunity-status').textContent = '正在按 5 分钟、15 分钟、1 小时行情筛选全部候选…';
+let opportunityRequest = false;
+let opportunitySnapshot = '';
+let opportunityCandle = null;
+async function refreshOpportunities() {
+  if (opportunityRequest) return;
+  opportunityRequest = true;
   try {
-    const response = await fetch('./opportunities', {cache:'no-store', signal:AbortSignal.timeout(120000)});
+    const response = await fetch('./opportunities', {cache:'no-store', signal:AbortSignal.timeout(6000)});
     const report = await response.json();
     if (!response.ok) throw Error(report.error || 'HTTP ' + response.status);
-    opportunityRows = report.rows;
-    el('opportunity-pages').dataset.page = 1;
-    renderOpportunities();
-    const signals = report.rows.filter(market=>market.level === '信号成立').length;
-    el('opportunity-status').textContent = date(report.scanned_at) + ' · 扫描 ' + report.scanned +
-      ' 个 · 信号 ' + signals + ' 个 · 观察 ' + (report.rows.length-signals) +
-      ' 个 · 行情不可用 ' + report.unavailable + ' 个';
-  } catch (error) {
-    el('opportunity-status').textContent = '本次扫描失败 · ' + error.message + (opportunityRows.length ? ' · 下方为上次结果' : '');
+    if (report.candle_at !== opportunityCandle) {
+      opportunityCandle = report.candle_at;
+      el('opportunity-pages').dataset.page = 1;
+    }
+    const snapshot = JSON.stringify([report.candle_at, report.rows]);
+    if (snapshot !== opportunitySnapshot) {
+      opportunitySnapshot = snapshot;
+      opportunityRows = report.rows;
+      renderOpportunities();
+    }
+    const status = {
+      waiting:'等待本轮行情就绪', scanning:'后台正在扫描',
+      ready:opportunityRows.length ? '信号时点 · ' + date(report.candle_at) : '当前暂无符合条件的机会',
+      partial:opportunityRows.length ? '部分行情暂不可用 · ' + date(report.candle_at) : '部分行情暂不可用 · 暂无已确认机会',
+      unavailable:'行情暂不可用 · 后台将重试'
+    }[report.status];
+    const label = el('opportunity-status');
+    if (label.textContent !== status) label.textContent = status;
+  } catch {
+    opportunitySnapshot = '';
+    if (opportunityRows.length) {
+      opportunityRows = [];
+      renderOpportunities();
+    }
+    el('opportunity-status').textContent = '机会扫描连接中断 · 正在重连';
   } finally {
-    button.disabled = false;
+    opportunityRequest = false;
   }
-});
+}
+refreshOpportunities();
+setInterval(refreshOpportunities, 3000);
 renderStrategyControls();
 loadMarketStatus();
 strategyStatus();

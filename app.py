@@ -44,6 +44,8 @@ catalog_locks = {venue: threading.Lock() for venue in ('Binance', DEMO_VENUE)}
 catalog_cache = {}
 opportunity_lock = threading.Lock()
 opportunity_cache = None
+opportunity_report_lock = threading.Lock()
+opportunity_report = {'candle_at': None, 'rows': [], 'status': 'waiting'}
 
 
 @lru_cache(maxsize=1)
@@ -1111,9 +1113,9 @@ def scan_opportunities():
     with opportunity_lock:
         now = time.time_ns() // 1_000_000
         cutoff = now // STRATEGY_INTERVALS['fast'] * STRATEGY_INTERVALS['fast']
-        if (opportunity_cache and opportunity_cache['candle_at'] == cutoff
-                and now - opportunity_cache['scanned_at'] < 60_000):
+        if opportunity_cache and opportunity_cache['candle_at'] == cutoff:
             return opportunity_cache
+        publish_opportunities(cutoff, [], 'scanning')
         universe = market_universe()
         if universe['live_error']:
             raise ValueError('币安实盘合约目录不可用：' + universe['live_error'])
@@ -1128,12 +1130,7 @@ def scan_opportunities():
                 candle, score, volatility, reason, context = evaluate_entry_signal(symbol, 'fast', cutoff, read)
                 if candle + STRATEGY_INTERVALS['fast'] != cutoff:
                     raise ValueError('最新 5 分钟 K 线尚未齐备')
-                direction = '多' if '做多' in reason else '空' if '做空' in reason else None
                 if score is None:
-                    if direction:
-                        return dict(**item, direction=direction, level='观察', reason=reason, rank=0), False
-                    if '等待突破后回踩' in reason:
-                        return dict(**item, direction='—', level='观察', reason=reason, rank=0), False
                     return None, False
                 side = 1 if score > 0 else -1
                 entry = context['close']
@@ -1143,20 +1140,68 @@ def scan_opportunities():
                                                item['live_contract_type'])
                     target, source = fast_take_target(entry, side, stop, volatility, Decimal(0),
                                                      context['obstacles'])
-                except ValueError as error:
-                    return dict(**item, direction=direction, level='观察', reason=str(error), rank=0), False
+                except ValueError:
+                    return None, False
                 return dict(**item, direction='多' if side > 0 else '空', level='信号成立',
                             reason=f'{reason} · {context["detail"]} · {source}', rank=context['priority'],
                             reference=str(entry), stop=f'{stop:.2%}', target=f'{target:.2%}'), False
             except (OSError, ValueError, KeyError, TypeError, IndexError, ArithmeticError):
                 return None, True
 
+        rows = []
+        unavailable = 0
         with ThreadPoolExecutor(max_workers=4) as pool:
-            outcomes = list(pool.map(evaluate, markets))
-        rows = sorted((row for row, _ in outcomes if row), key=lambda row: (-row['rank'], row['symbol']))
+            jobs = [pool.submit(evaluate, item) for item in markets]
+            for job in as_completed(jobs):
+                row, failed = job.result()
+                unavailable += failed
+                if row:
+                    rows.append(row)
+                    rows.sort(key=lambda item: (-item['rank'], item['symbol']))
+                    publish_opportunities(cutoff, rows, 'scanning')
         opportunity_cache = dict(scanned_at=now, candle_at=cutoff, scanned=len(markets),
-                                 unavailable=sum(failed for _, failed in outcomes), rows=rows)
+                                 unavailable=unavailable, rows=rows)
+        status = 'unavailable' if not markets or unavailable == len(markets) else 'partial' if unavailable else 'ready'
+        publish_opportunities(cutoff, rows, status)
         return opportunity_cache
+
+
+def publish_opportunities(candle_at, rows, status):
+    with opportunity_report_lock:
+        opportunity_report.update(candle_at=candle_at, rows=rows.copy(), status=status)
+
+
+def current_opportunities():
+    interval = STRATEGY_INTERVALS['fast']
+    cutoff = time.time_ns() // 1_000_000 // interval * interval
+    with opportunity_report_lock:
+        if opportunity_report['candle_at'] != cutoff:
+            return dict(candle_at=cutoff, rows=[], status='waiting')
+        return opportunity_report.copy()
+
+
+def watch_opportunities():
+    global opportunity_cache
+    interval = STRATEGY_INTERVALS['fast']
+    while True:
+        now = time.time_ns() // 1_000_000
+        cutoff = now // interval * interval
+        if now - cutoff < 3000:
+            time.sleep((cutoff + 3000 - now) / 1000)
+        try:
+            report = scan_opportunities()
+        except (OSError, ValueError, KeyError, TypeError, ArithmeticError) as error:
+            publish_opportunities(cutoff, [], 'unavailable')
+            print(f'机会扫描暂不可用：{error}', flush=True)
+            time.sleep(20)
+        else:
+            if report['unavailable'] == report['scanned']:
+                with opportunity_lock:
+                    opportunity_cache = None
+                time.sleep(20)
+                continue
+            next_scan = report['candle_at'] + interval + 3000
+            time.sleep(max(0, (next_scan - time.time_ns() // 1_000_000) / 1000))
 
 
 def fast_signal_family(reason):
@@ -2851,7 +2896,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(200, 'application/json', json.dumps(market_universe()).encode())
                 return
             if parsed.path == '/opportunities':
-                self.send(200, 'application/json', json.dumps(scan_opportunities(), allow_nan=False).encode())
+                self.send(200, 'application/json', json.dumps(current_opportunities(), allow_nan=False).encode())
                 return
             if parsed.path == '/shadow':
                 self.send(200, 'application/json', json.dumps(self.server.shadow.snapshot()).encode())
@@ -3674,6 +3719,7 @@ if __name__ == '__main__':
     server = ThreadingHTTPServer(('127.0.0.1',8765),Handler)
     server.strategy = DemoStrategy()
     server.shadow = LiveMarketSimulation(journal_path().with_name('live-market-mirror.json'))
+    threading.Thread(target=watch_opportunities, daemon=True).start()
     if os.getenv('BINANCE_DEMO_API_KEY') and os.getenv('BINANCE_DEMO_API_SECRET'):
         threading.Thread(target=protection_watch, daemon=True).start()
         threading.Thread(target=external_demo_close_watch, daemon=True).start()
