@@ -1825,9 +1825,10 @@ def run_backtest(params, progress):
     asset, = coverage['assets']
     venue, start, end = (coverage[key] for key in ('venue', 'start', 'end'))
     symbol = asset + 'USDT'
-    contract = futures_catalog(venue).get(symbol)
-    if not tradable_future(contract):
-        raise ValueError(f'{coverage["source_label"]}未确认支持 {symbol}')
+    try:
+        contract = futures_catalog(venue).get(symbol)
+    except (OSError, ValueError, KeyError):
+        contract = None
     progress('读取历史 K 线与资金费')
 
     def load_funding():
