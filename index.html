@@ -325,10 +325,10 @@ demoSync.onclick = async () => {
     updateAccountStatus();
   }
 };
-const name = asset => ({SKHYNIX:'SK 海力士', SAMSUNG:'三星电子', GOOGL:'Google（GOOGL）'})[asset] || asset;
-for (const asset of 'ETH BTC SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN'.split(' ')) {
+const name = asset => ({XAU:'黄金', SKHYNIX:'SK 海力士', SAMSUNG:'三星电子', GOOGL:'Google（GOOGL）'})[asset] || asset;
+for (const asset of 'ETH BTC XAU SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN'.split(' ')) {
   const label = document.createElement('label');
-  const checkbox = Object.assign(document.createElement('input'), {type:'checkbox', name:'asset', value:asset, checked:asset !== 'SAMSUNG'});
+  const checkbox = Object.assign(document.createElement('input'), {type:'checkbox', name:'asset', value:asset, checked:asset !== 'SAMSUNG' && asset !== 'XAU'});
   label.append(checkbox, ' '+name(asset));
   el('assets').append(label);
 }
@@ -1282,8 +1282,8 @@ const today = new Date(Date.now()+8*3600000).toISOString().slice(0,10);
 const previous = days => new Date(Date.parse(today)-days*86400000).toISOString().slice(0,10);
 form.elements.start.value=previous(3);form.elements.end.value=previous(1);
 form.elements.start.max=today;form.elements.end.max=today;
-for (const symbol of 'ETH BTC SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN'.split(' ')) {
-  const option=element('option',symbol==='SAMSUNG'?'三星电子':symbol);option.value=symbol;
+for (const symbol of 'ETH BTC XAU SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN'.split(' ')) {
+  const option=element('option',({SAMSUNG:'三星电子',XAU:'黄金（XAU）'})[symbol] || symbol);option.value=symbol;
   form.elements.asset.append(option);
 }
 form.elements.asset.value='BTC';
