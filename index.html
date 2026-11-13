@@ -1512,38 +1512,35 @@ th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #e2e9f0}th{backgr
 .gain{color:#08754a}.loss{color:#bb3246}small{color:#52647a}
 canvas{display:block;width:100%;height:240px}.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px}
 summary{cursor:pointer;font-weight:600}details .scroll{margin-top:10px}
+#asset{max-height:190px;overflow:auto}#asset [hidden]{display:none}#history{margin:12px 0}#history-asset{max-width:240px}#custom-range:not([hidden]){display:flex;gap:8px}
 </style>
 <main>
 <a href="./">← 返回交易仪表盘</a>
 <h1>历史回测</h1>
 <form id="backtest">
-  <fieldset class="backtest-assets"><legend>标的</legend><button type="button" id="select-assets">全选</button><div id="asset"></div></fieldset>
-  <label>策略<select name="strategy"><option value="all">比较适用策略</option><option value="fast">5 分钟双向</option><option value="intraday">15 分钟双向</option><option value="swing">1 小时双向</option><option value="us_open">美股双向</option></select></label>
   <label>行情来源<select name="source"><option value="live">币安实盘</option><option value="demo">币安模拟盘</option></select></label>
-  <label>策略规则<select name="rules"><option value="current">当前策略</option><option value="confirmation">严格确认</option><option value="retest">严格确认＋回踩</option><option value="compare">对照全部规则</option></select></label>
-  <label>回测跨度<select name="days"><option value="1">最近 1 天</option><option value="7" selected>最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option><option value="60">最近 60 天</option></select></label>
-  <label>事件时间（可选，北京时间）<input type="datetime-local" name="event_at"></label>
-  <button type="submit">检查区间</button>
+  <label>区间<select name="days"><option value="1">最近 1 天</option><option value="7" selected>最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option><option value="60">最近 60 天</option><option value="custom">自定义日期</option></select></label>
+  <div id="custom-range" hidden><label>开始日期<input type="date" name="start"></label><label>结束日期<input type="date" name="end"></label></div>
+  <fieldset class="backtest-assets"><legend>回测标的</legend>
+    <input id="search-assets" type="search" aria-label="搜索标的" placeholder="搜索标的">
+    <button type="button" id="select-assets">选中搜索结果</button>
+    <button type="button" id="clear-assets">清空</button><div id="asset"></div>
+  </fieldset>
+  <button type="submit">开始回测</button>
 </form>
-<p id="status" role="status">终点自动取最新已收盘的 1 分钟 K 线，时间按北京时间显示。每个策略以 10,000 USDT 虚拟本金独立运行，所选标的共享资金，最多同时 5 仓。</p>
-<dialog id="confirm-range">
-  <p id="range-summary"></p>
-  <form method="dialog">
-    <button value="cancel" autofocus>返回修改</button>
-    <button value="run">开始回测</button>
-  </form>
-</dialog>
+<p id="status" role="status">当前 5 分钟双向策略 · 各标的以 10,000 USDT 独立回放 · 北京时间</p>
+<div class="panel">
+  <h2>回测记录</h2>
+  <label>筛选标的<input id="history-asset" type="search" placeholder="例如 BTC 或 BTCUSDT"></label>
+  <div id="history"></div>
+  <button type="button" id="history-prev">上一页</button>
+  <span id="history-page"></span>
+  <button type="button" id="history-next">下一页</button>
+</div>
 <div id="results"></div>
 <details><summary>数据与成交假设</summary>
-  <p>5 分钟策略用 5 分钟找信号、15 分钟确认、1 小时过滤逆势。15 分钟和美股双向用 15 分钟、1 小时、4 小时。1 小时策略用 1 小时、4 小时、日线。信号还用成交量、主动成交占比和波动。</p>
-  <p>可用起点取成交 K 线和标记价共同覆盖，并为所选策略预留指标预热时间。区间内出现数据缺口会报错。</p>
-  <p>严格确认要求最大周期同向，确认周期趋势效率至少 0.30，且主动成交至少 52% 同向。加回踩的版本在 5 分钟、15 分钟和美股双向中跳过直接突破；1 小时仍保留突破。</p>
-  <p>5 分钟持仓按已收盘的 5 分钟、15 分钟和 1 小时 K 线复评。入场结构失效时退出，行情走弱时收紧止盈止损。</p>
-  <p>5 分钟初始止盈考虑近期波动和 15 分钟、1 小时的支撑阻力。目标会放在前方最近的结构位之前，空间不足以覆盖风险与成本时跳过。</p>
-  <p>5 分钟策略用此前已结算的同向交易估计净盈利概率和净期望，影响候选排序与风险预算。回测从区间起点开始积累样本。</p>
-  <p>5 分钟单笔名义仓位上限为账户权益，计划风险上限为权益的 0.5%。止损和成本越高，计算出的仓位越小。</p>
-  <p>信号只看已收盘 K 线。下一分钟开盘价加估算滑点入场，止盈止损用 1 分钟标记价判断，同一根同时碰到两条线时按止损计算。按单边手续费 0.05%、单边滑点 0.03% 和可取得的历史资金费计账。</p>
-  <p>5 分钟策略在每分钟开盘复评保护价，其他策略按 1 分钟收盘近似更新移动止损。填写已知事件时间后，前后 15 分钟跳过新的入场信号，已有仓位继续管理。回测简化盘口排队与成交过程，未接入自动新闻数据。结果用于比较规则在相同假设下的表现。</p>
+  <p>只运行当前 5 分钟双向策略。信号使用已收盘的 5 分钟、15 分钟和 1 小时 K 线，持仓复评及止盈止损使用分钟级行情。历史覆盖不足会缩短区间，结果页显示实际区间。区间内有数据缺口会单独标记该标的失败。</p>
+  <p>按下一分钟开盘价和滑点估算入场，止盈止损用 1 分钟标记价判断，同一根同时碰到两条线时按止损计算。单边手续费 0.05%，单边滑点 0.03%，另计历史资金费。盘口排队、部分成交与多标的共用保证金未纳入。</p>
 </details>
 </main>
 <script>
@@ -1605,7 +1602,7 @@ function render(data) {
   results.replaceChildren();
   const panel=element('div');panel.className='panel';
   const metric = value => value == null ? '—' : amount.format(value);
-  panel.append(element('h2','策略对比'),table(['策略','净盈亏 USDT','毛盈亏','手续费','滑点','资金费净额','收益率','最大回撤','胜率','平均盈亏比','盈利因子','每笔净收益 USDT','交易笔数','峰值仓位','满仓信号','事件过滤信号'],
+  panel.append(element('h2',data.assets[0]+' · '+data.source_label),element('p','实际回测区间 '+formatTime(data.start)+' 至 '+formatTime(data.end)),table(['策略','净盈亏 USDT','毛盈亏','手续费','滑点','资金费净额','收益率','最大回撤','胜率','平均盈亏比','盈利因子','每笔净收益 USDT','交易笔数','峰值仓位','满仓信号','事件过滤信号'],
     data.results.map(r=>[r.name,r.net,amount.format(r.gross),amount.format(r.fees),amount.format(r.slippage),amount.format(r.funding),percent(r.roi),percent(r.drawdown),percent(r.win_rate),metric(r.payoff_ratio),metric(r.profit_factor),metric(r.expectancy),r.count,r.peak_positions,r.capacity_skips,r.event_skips]),1));
   panel.append(element('h2','估算权益曲线'));
   const canvas=element('canvas');canvas.setAttribute('aria-label','回测权益随时间变化');
@@ -1633,61 +1630,138 @@ function render(data) {
     results.append(details);
   }
 }
-const assets = 'ETH BTC XAU SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN BNB ZEC INTC'.split(' ');
-const usEquities = 'SNDK SOXL KORU MU NVDA QQQ GOOGL SPCX META TSLA AMZN INTC'.split(' ');
 const assetGroup = document.getElementById('asset');
+const search = document.getElementById('search-assets');
+const historyAsset = document.getElementById('history-asset');
+const defaults = 'ETH BTC XAU SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN BNB ZEC INTC'.split(' ');
+let markets = [];
+const selected = {live:new Set(['BTC']), demo:new Set(['BTC'])};
+const submit = form.querySelector('button[type=submit]');
+function source() { return form.elements.source.value; }
 function updateBacktestAssets() {
-  const list = form.elements.strategy.value === 'us_open' ? usEquities : assets;
-  assetGroup.replaceChildren(...list.map(symbol => {
+  const feed = source();
+  const list = markets.length ? markets : defaults.map(asset => ({asset, symbol:asset+'USDT'}));
+  const query = search.value.trim().toUpperCase();
+  assetGroup.replaceChildren(...list.filter(market => market.symbol.includes(query)).map(market => {
     const label = element('label');
     const input = element('input');
-    Object.assign(input, {type:'checkbox', name:'asset', value:symbol, checked:!['BNB','ZEC','INTC'].includes(symbol)});
-    label.append(input, ({SAMSUNG:'三星电子',XAU:'黄金（XAU）'})[symbol] || symbol);
+    const enabled = market[feed+'_tradeable'];
+    Object.assign(input, {type:'checkbox', value:market.asset,
+      disabled:enabled === false, checked:enabled !== false && selected[feed].has(market.asset)});
+    input.onchange = () => input.checked ? selected[feed].add(market.asset) : selected[feed].delete(market.asset);
+    label.append(input, market.asset);
     return label;
   }));
 }
+async function fetchData(url, options = {}) {
+  const response = await fetch(url, {cache:'no-store', signal:AbortSignal.timeout(15000), ...options});
+  const data = await response.json();
+  if (!response.ok) throw Error(data.error || 'HTTP '+response.status);
+  return data;
+}
+fetchData('./market-universe').then(data => {
+  markets = data.markets;
+  updateBacktestAssets();
+}).catch(() => {});
+search.oninput = updateBacktestAssets;
 document.getElementById('select-assets').onclick = () => {
-  for (const input of assetGroup.querySelectorAll('input')) input.checked = true;
+  for (const input of assetGroup.querySelectorAll('input:not(:disabled)')) selected[source()].add(input.value);
+  updateBacktestAssets();
 };
-form.elements.strategy.addEventListener('change', updateBacktestAssets);
-updateBacktestAssets();
-window.addEventListener('resize',()=>chart?.());
-form.onsubmit=async event=>{
-  event.preventDefault();
-  const button=form.querySelector('button[type=submit]');button.disabled=true;
-  status.textContent='正在检查历史覆盖和指标预热数据…';
+document.getElementById('clear-assets').onclick = () => {
+  selected[source()].clear();
+  updateBacktestAssets();
+};
+form.elements.days.onchange = () => {
+  const custom = form.elements.days.value === 'custom';
+  document.getElementById('custom-range').hidden = !custom;
+  for (const field of ['start','end']) form.elements[field].required = custom;
+};
+const history = document.getElementById('history');
+const previous = document.getElementById('history-prev');
+const next = document.getElementById('history-next');
+let page = 1, requestId = 0, historySnapshot = '', resultRequest = 0;
+async function refreshHistory() {
+  const id = ++requestId;
+  const params = new URLSearchParams({source:source(), page});
+  const asset = historyAsset.value.trim().toUpperCase().replace(/USDT$/, '');
+  if (asset) params.set('asset', asset);
   try {
-    const params = new URLSearchParams(new FormData(form));
-    if (!params.has('asset')) throw Error('请选择至少一个标的');
-    const checked = await fetch('./backtest/coverage?'+params,{signal:AbortSignal.timeout(120000)});
-    const range = await checked.json();
-    if (!checked.ok) throw Error(range.error || 'HTTP '+checked.status);
-    const dialog = document.getElementById('confirm-range');
-    const limited = range.start > range.requested_start;
-    document.getElementById('range-summary').textContent =
-      range.source_label+' · '+range.assets.join('、')+' · '+range.strategies.join(' / ')+'。'+
-      (limited ? '历史或预热数据不足，请求起点 '+formatTime(range.requested_start)+'，实际可回测区间缩短为 ' : '回测区间为 ')+
-      formatTime(range.start)+' 至 '+formatTime(range.end)+'（北京时间）。';
-    dialog.returnValue = 'cancel';
-    dialog.showModal();
-    await new Promise(resolve => dialog.addEventListener('close',resolve,{once:true}));
-    if (dialog.returnValue !== 'run') {
-      status.textContent='已取消，可以调整标的或跨度。';
-      return;
+    const report = await fetchData('./backtest/jobs?'+params);
+    if (id !== requestId) return;
+    const snapshot = JSON.stringify([source(), asset, report]);
+    if (snapshot === historySnapshot) return;
+    historySnapshot = snapshot;
+    page = report.page;
+    const labels = {queued:'排队中', running:'运行中', done:'已完成', failed:'失败'};
+    const grid = table(['标的','请求区间','状态','进度或错误','结果'], report.jobs.map(job =>
+      [job.asset, formatTime(job.start)+' 至 '+formatTime(job.end), labels[job.state], job.detail || '—', '—']));
+    for (const [index, job] of report.jobs.entries()) {
+      if (job.state !== 'done') continue;
+      const button = element('button','查看');
+      button.onclick = async () => {
+        const request = ++resultRequest;
+        try {
+          const data = await fetchData('./backtest/jobs?id='+job.id);
+          if (request === resultRequest) render(data);
+        } catch (error) {
+          if (request === resultRequest) status.textContent = error.message;
+        }
+      };
+      grid.querySelector('tbody').rows[index].cells[4].replaceChildren(button);
     }
-    params.set('start_at', range.start);
-    params.set('end_at', range.end);
-    status.textContent='正在读取历史数据并回测，30 至 60 天可能需要几分钟…';
-    const response=await fetch('./backtest/results?'+params,{signal:AbortSignal.timeout(900000)});
-    const data=await response.json();
-    if (!response.ok) throw Error(data.error || 'HTTP '+response.status);
-    render(data);
-    status.textContent=data.assets.join('、')+' · '+data.source_label+' · '+formatTime(data.start)+' 至 '+formatTime(data.end)+
-      '（北京时间） · 资金费记录 '+data.funding_samples+' 条';
-  } catch(error) {
-    status.textContent='回测失败：'+error.message;
+    history.replaceChildren(report.jobs.length ? grid : element('p','暂无回测记录'));
+    const pages = Math.max(1, Math.ceil(report.total/25));
+    previous.disabled = page <= 1;
+    next.disabled = page >= pages;
+    document.getElementById('history-page').textContent = page+' / '+pages;
+  } catch (error) {
+    if (id === requestId) {
+      historySnapshot = '';
+      history.replaceChildren(element('p','记录读取失败 · '+error.message));
+    }
+  }
+}
+function resetHistory() { page = 1; refreshHistory(); }
+form.elements.source.onchange = () => {
+  resultRequest++;
+  results.replaceChildren();
+  chart = null;
+  updateBacktestAssets();
+  resetHistory();
+};
+historyAsset.oninput = resetHistory;
+previous.onclick = () => { page--; refreshHistory(); };
+next.onclick = () => { page++; refreshHistory(); };
+updateBacktestAssets();
+refreshHistory();
+setInterval(refreshHistory, 4000);
+window.addEventListener('resize',()=>chart?.());
+form.onsubmit = async event => {
+  event.preventDefault();
+  const feed = source();
+  submit.disabled = true;
+  try {
+    const assets = [...selected[feed]].filter(asset =>
+      markets.find(market => market.asset === asset)?.[feed+'_tradeable'] !== false);
+    if (!assets.length) throw Error('请选择至少一个标的');
+    const params = new URLSearchParams({source:feed, days:form.elements.days.value});
+    if (form.elements.days.value === 'custom') {
+      for (const field of ['start','end']) params.set(field, form.elements[field].value);
+    }
+    for (const asset of assets) params.append('asset', asset);
+    const data = await fetchData('./backtest/jobs?'+params, {
+      method:'POST', headers:{'X-Quant-Demo':'strategy'}
+    });
+    status.textContent = '已提交 '+data.jobs.length+' 个标的 · 可继续提交其他区间';
+    if (source() === feed) {
+      historyAsset.value = '';
+      resetHistory();
+    }
+  } catch (error) {
+    status.textContent = '提交失败 · '+error.message;
   } finally {
-    button.disabled=false;
+    submit.disabled = false;
   }
 };
 </script></html>
