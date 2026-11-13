@@ -1767,7 +1767,7 @@ async function cancelBacktests(id, button) {
     const result = await fetchData('./backtest/cancel' + query, {
       method:'POST', headers:{'X-Quant-Demo':'strategy'}
     });
-    status.textContent = '已取消 ' + result.cancelled + ' 个回测任务';
+    status.textContent = result.cancelled ? '已取消 ' + result.cancelled + ' 个回测任务' : '没有仍在排队或运行的匹配任务';
     await refreshHistory();
   } catch (error) {
     status.textContent = '取消失败 · ' + error.message;
