@@ -8,6 +8,7 @@ from datetime import datetime
 from collections import Counter
 import threading
 import sys
+import subprocess
 import sqlite3
 from contextlib import closing, contextmanager
 import uuid
@@ -1641,8 +1642,10 @@ def settled_fast_samples(orders, now):
 
 
 
-BACKTEST_WORKERS = ThreadPoolExecutor(max_workers=2)
+BACKTEST_WORKERS = ThreadPoolExecutor(max_workers=1)
 BACKTEST_SUBMIT_LOCK = threading.Lock()
+backtest_processes = {}
+BACKTEST_CANCEL_BEFORE = 1794572184000
 BACKTEST_JOB_LIMIT = 500
 BACKTEST_FEEDS = {'live': ('Binance', '币安实盘行情'), 'demo': (DEMO_VENUE, '币安模拟盘行情')}
 backtest_request_lock = threading.Lock()
@@ -1881,10 +1884,58 @@ def resume_backtests():
         BACKTEST_WORKERS.submit(run_backtest_job, *job)
 
 
+def cancel_backtests(job=None, *, before=None):
+    condition = "state IN ('queued', 'running')"
+    params = []
+    if job is not None:
+        condition += ' AND id=?'
+        params.append(job)
+    if before is not None:
+        condition += ' AND created<=?'
+        params.append(before)
+    with BACKTEST_SUBMIT_LOCK:
+        with backtest_database() as database:
+            ids = [row[0] for row in database.execute(
+                "UPDATE backtest_jobs SET state='cancelled', detail='已取消' WHERE " + condition + ' RETURNING id', params)]
+        for job_id in ids:
+            process = backtest_processes.get(job_id)
+            if process is not None and process.poll() is None:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+    return {'cancelled': len(ids)}
+
+
 def run_backtest_job(job, asset, source, start, end):
+    try:
+        with BACKTEST_SUBMIT_LOCK:
+            with backtest_database() as database:
+                row = database.execute('SELECT state FROM backtest_jobs WHERE id=?', (job,)).fetchone()
+            if row != ('queued',):
+                return
+            process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--backtest-worker',
+                                        job, asset, source, str(start), str(end)])
+            backtest_processes[job] = process
+        try:
+            code = process.wait()
+            if code:
+                raise subprocess.CalledProcessError(code, process.args)
+        finally:
+            with BACKTEST_SUBMIT_LOCK:
+                backtest_processes.pop(job, None)
+    except (OSError, subprocess.CalledProcessError) as error:
+        with backtest_database() as database:
+            database.execute("""
+                UPDATE backtest_jobs SET state='failed', detail=?
+                WHERE id=? AND state IN ('queued', 'running')
+            """, (f'回测进程异常退出：{error.returncode if isinstance(error, subprocess.CalledProcessError) else error}', job))
+
+
+def execute_backtest_job(job, asset, source, start, end):
     def update(state, detail=None, result=None):
         with backtest_database() as database:
-            database.execute("UPDATE backtest_jobs SET state=?, detail=?, result=? WHERE id=?",
+            database.execute("UPDATE backtest_jobs SET state=?, detail=?, result=? WHERE id=? AND state IN ('queued', 'running')",
                              (state, detail, result, job))
 
     try:
@@ -1896,7 +1947,7 @@ def run_backtest_job(job, asset, source, start, end):
         result = run_backtest(params, lambda detail: update('running', detail), settings=settings)
         update('done', result=zlib.compress(json.dumps(result, allow_nan=False).encode()))
     except Exception as error:
-        update('failed', str(error))
+        update('failed', str(error) or type(error).__name__)
 
 
 def backtest_jobs(params):
@@ -3092,6 +3143,15 @@ class Handler(BaseHTTPRequestHandler):
             return
         parsed = urlsplit(self.path)
         strategy = self.server.strategy
+        if parsed.path == '/backtest/cancel':
+            try:
+                job = parse_qs(parsed.query).get('id', [None])[0]
+                result = cancel_backtests(job)
+            except (OSError, sqlite3.Error) as error:
+                self.send(500, 'application/json', json.dumps({'error': str(error)}).encode())
+                return
+            self.send(200, 'application/json', json.dumps(result).encode())
+            return
         if parsed.path == '/backtest/jobs':
             try:
                 submitted = submit_backtests(parse_qs(parsed.query))
@@ -4044,6 +4104,17 @@ def submit_demo_order(symbol, side, quantity, *, notional=None, leverage=None, r
 
 
 if __name__ == '__main__':
+    if len(sys.argv) == 7 and sys.argv[1] == '--backtest-worker':
+        if sys.platform.startswith('linux'):
+            import resource
+            soft, hard = resource.getrlimit(resource.RLIMIT_AS)
+            limit = 384 * 1024 * 1024
+            if soft != resource.RLIM_INFINITY:
+                limit = min(limit, soft)
+            resource.setrlimit(resource.RLIMIT_AS, (limit, hard))
+        job, asset, source, start, end = sys.argv[2:]
+        execute_backtest_job(job, asset, source, int(start), int(end))
+        sys.exit(0)
     if len(sys.argv) > 1:
         if len(sys.argv) != 5 or sys.argv[1] != '--demo-order':
             sys.exit('用法：启动.command --demo-order 合约代码 BUY或SELL 数量')
@@ -4053,7 +4124,11 @@ if __name__ == '__main__':
             sys.exit(str(error))
         sys.exit(0)
     server = ThreadingHTTPServer(('127.0.0.1',8765),Handler)
-    resume_backtests()
+    try:
+        cancel_backtests(before=BACKTEST_CANCEL_BEFORE)
+        resume_backtests()
+    except (OSError, sqlite3.Error) as error:
+        print(f'回测任务恢复失败：{error}', file=sys.stderr, flush=True)
     server.strategy = DemoStrategy()
     server.shadow = LiveMarketSimulation(journal_path().with_name('live-market-mirror.json'))
     threading.Thread(target=watch_opportunities, daemon=True).start()

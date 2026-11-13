@@ -1543,6 +1543,7 @@ summary{cursor:pointer;font-weight:600}details .scroll{margin-top:10px}
 <p id="status" role="status">当前 5 分钟双向策略 · 各标的以 10,000 USDT 独立回放 · 北京时间</p>
 <div class="panel">
   <h2>回测记录</h2>
+  <button type="button" id="cancel-backtests">取消全部回测</button>
   <label>记录来源<select id="history-source"><option value="live">币安实盘</option><option value="demo">币安模拟盘</option></select></label>
   <label>筛选标的<input id="history-asset" type="search" placeholder="例如 BTC 或 BTCUSDT"></label>
   <div id="history"></div>
@@ -1732,10 +1733,15 @@ async function refreshHistory() {
     if (snapshot === historySnapshot) return;
     historySnapshot = snapshot;
     page = report.page;
-    const labels = {queued:'排队中', running:'运行中', done:'已完成', failed:'失败'};
+    const labels = {queued:'排队中', running:'运行中', done:'已完成', failed:'失败', cancelled:'已取消'};
     const grid = table(['标的','行情来源','请求区间','状态','进度或错误','结果'], report.jobs.map(job =>
       [job.asset, job.source === 'demo' ? '币安模拟盘' : '币安实盘', formatTime(job.start)+' 至 '+formatTime(job.end), labels[job.state], job.detail || '—', '—']));
     for (const [index, job] of report.jobs.entries()) {
+      if (['queued','running'].includes(job.state)) {
+        const button = element('button','取消');
+        button.onclick = () => cancelBacktests(job.id, button);
+        grid.querySelector('tbody').rows[index].cells[5].replaceChildren(button);
+      }
       if (job.state !== 'done') continue;
       const link = element('a','查看');
       const query = new URLSearchParams({id:job.id, source:historySource.value, page, asset:historyAsset.value.trim()});
@@ -1754,6 +1760,23 @@ async function refreshHistory() {
     }
   }
 }
+async function cancelBacktests(id, button) {
+  button.disabled = true;
+  try {
+    const query = id ? '?' + new URLSearchParams({id}) : '';
+    const result = await fetchData('./backtest/cancel' + query, {
+      method:'POST', headers:{'X-Quant-Demo':'strategy'}
+    });
+    status.textContent = '已取消 ' + result.cancelled + ' 个回测任务';
+    await refreshHistory();
+  } catch (error) {
+    status.textContent = '取消失败 · ' + error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+const cancelAll = document.getElementById('cancel-backtests');
+cancelAll.onclick = () => cancelBacktests(null, cancelAll);
 function resetHistory() { page = 1; refreshHistory(); }
 form.elements.source.onchange = () => {
   updateBacktestAssets();
