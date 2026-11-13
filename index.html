@@ -1530,7 +1530,7 @@ th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #e2e9f0}th{backgr
 .gain{color:#08754a}.loss{color:#bb3246}small{color:#52647a}
 canvas{display:block;width:100%;height:clamp(310px,52vh,540px)}.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px}
 summary{cursor:pointer;font-weight:600}details .scroll{margin-top:10px}
-#asset{max-height:190px;overflow:auto}#asset [hidden]{display:none}#history{margin:12px 0}#history-asset{max-width:240px}#custom-range:not([hidden]){display:flex;gap:8px}
+#asset{max-height:190px;overflow:auto}#asset [hidden]{display:none}#history{margin:12px 0}#history-asset{max-width:240px}#custom-days[hidden]{display:none}#custom-range:not([hidden]){display:flex;gap:8px}
 </style>
 <main>
 <a id="backtest-return" href="./">← 返回交易仪表盘</a>
@@ -1538,7 +1538,8 @@ summary{cursor:pointer;font-weight:600}details .scroll{margin-top:10px}
 <div id="backtest-list">
 <form id="backtest">
   <label>行情来源<select name="source"><option value="live">币安实盘</option><option value="demo">币安模拟盘</option></select></label>
-  <label>区间<select name="days"><option value="1">最近 1 天</option><option value="7" selected>最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option><option value="60">最近 60 天</option><option value="custom">自定义日期</option></select></label>
+  <label>区间<select name="days"><option value="1">最近 1 天</option><option value="7" selected>最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option><option value="60">最近 60 天</option><option value="90">最近 90 天</option><option value="180">最近 180 天</option><option value="365">最近 365 天</option><option value="days">自定义天数</option><option value="custom">自定义日期</option></select></label>
+  <label id="custom-days" hidden>最近天数<input type="number" name="day_count" min="1" step="1" value="90" disabled></label>
   <div id="custom-range" hidden><label>开始日期<input type="date" name="start"></label><label>结束日期<input type="date" name="end"></label></div>
   <fieldset class="backtest-assets"><legend>回测标的</legend>
     <input id="search-assets" type="search" aria-label="搜索标的" placeholder="搜索标的">
@@ -1550,6 +1551,7 @@ summary{cursor:pointer;font-weight:600}details .scroll{margin-top:10px}
 <p id="status" role="status">当前 5 分钟双向策略 · 各标的以 10,000 USDT 独立回放 · 北京时间</p>
 <div class="panel">
   <h2>回测记录</h2>
+  <label>记录来源<select id="history-source"><option value="live">币安实盘</option><option value="demo">币安模拟盘</option></select></label>
   <label>筛选标的<input id="history-asset" type="search" placeholder="例如 BTC 或 BTCUSDT"></label>
   <div id="history"></div>
   <button type="button" id="history-prev">上一页</button>
@@ -1667,6 +1669,7 @@ function render(data) {
 const assetGroup = document.getElementById('asset');
 const search = document.getElementById('search-assets');
 const historyAsset = document.getElementById('history-asset');
+const historySource = document.getElementById('history-source');
 const defaults = 'ETH BTC XAU SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN BNB ZEC INTC'.split(' ');
 let markets = [];
 const selected = {live:new Set(['BTC']), demo:new Set(['BTC'])};
@@ -1706,6 +1709,10 @@ document.getElementById('clear-assets').onclick = () => {
   updateBacktestAssets();
 };
 form.elements.days.onchange = () => {
+  const customDays = form.elements.days.value === 'days';
+  document.getElementById('custom-days').hidden = !customDays;
+  form.elements.day_count.disabled = !customDays;
+  form.elements.day_count.required = customDays;
   const custom = form.elements.days.value === 'custom';
   document.getElementById('custom-range').hidden = !custom;
   for (const field of ['start','end']) form.elements[field].required = custom;
@@ -1718,25 +1725,25 @@ const detailId = route.get('id');
 let page = Number(route.get('page')) || 1, requestId = 0, historySnapshot = '';
 async function refreshHistory() {
   const id = ++requestId;
-  const params = new URLSearchParams({source:source(), page});
+  const params = new URLSearchParams({source:historySource.value, page});
   const asset = historyAsset.value.trim().toUpperCase().replace(/USDT$/, '');
   if (asset) params.set('asset', asset);
   try {
     const report = await fetchData('./backtest/jobs?'+params);
     if (id !== requestId) return;
-    const snapshot = JSON.stringify([source(), asset, report]);
+    const snapshot = JSON.stringify([historySource.value, asset, report]);
     if (snapshot === historySnapshot) return;
     historySnapshot = snapshot;
     page = report.page;
     const labels = {queued:'排队中', running:'运行中', done:'已完成', failed:'失败'};
-    const grid = table(['标的','请求区间','状态','进度或错误','结果'], report.jobs.map(job =>
-      [job.asset, formatTime(job.start)+' 至 '+formatTime(job.end), labels[job.state], job.detail || '—', '—']));
+    const grid = table(['标的','行情来源','请求区间','状态','进度或错误','结果'], report.jobs.map(job =>
+      [job.asset, job.source === 'demo' ? '币安模拟盘' : '币安实盘', formatTime(job.start)+' 至 '+formatTime(job.end), labels[job.state], job.detail || '—', '—']));
     for (const [index, job] of report.jobs.entries()) {
       if (job.state !== 'done') continue;
       const link = element('a','查看');
-      const query = new URLSearchParams({id:job.id, source:source(), page, asset:historyAsset.value.trim()});
+      const query = new URLSearchParams({id:job.id, source:historySource.value, page, asset:historyAsset.value.trim()});
       link.href = './backtest?' + query;
-      grid.querySelector('tbody').rows[index].cells[4].replaceChildren(link);
+      grid.querySelector('tbody').rows[index].cells[5].replaceChildren(link);
     }
     history.replaceChildren(report.jobs.length ? grid : element('p','暂无回测记录'));
     const pages = Math.max(1, Math.ceil(report.total/25));
@@ -1753,12 +1760,16 @@ async function refreshHistory() {
 function resetHistory() { page = 1; refreshHistory(); }
 form.elements.source.onchange = () => {
   updateBacktestAssets();
-  resetHistory();
 };
+historySource.onchange = resetHistory;
 historyAsset.oninput = resetHistory;
 previous.onclick = () => { page--; refreshHistory(); };
 next.onclick = () => { page++; refreshHistory(); };
-if (['live','demo'].includes(route.get('source'))) form.elements.source.value = route.get('source');
+if (['live','demo'].includes(route.get('source'))) {
+  form.elements.source.value = route.get('source');
+  historySource.value = route.get('source');
+}
+form.elements.days.onchange();
 historyAsset.value = route.get('asset') || '';
 if (detailId) {
   document.getElementById('backtest-list').hidden = true;
@@ -1789,7 +1800,8 @@ form.onsubmit = async event => {
   try {
     const assets = [...selected[feed]];
     if (!assets.length) throw Error('请选择至少一个标的');
-    const params = new URLSearchParams({source:feed, days:form.elements.days.value});
+    const span = form.elements.days.value;
+    const params = new URLSearchParams({source:feed, days:span === 'days' ? form.elements.day_count.value : span});
     if (form.elements.days.value === 'custom') {
       for (const field of ['start','end']) params.set(field, form.elements[field].value);
     }
@@ -1799,6 +1811,7 @@ form.onsubmit = async event => {
     });
     status.textContent = '已提交 '+data.jobs.length+' 个标的 · 可继续提交其他区间';
     if (source() === feed) {
+      historySource.value = feed;
       historyAsset.value = '';
       resetHistory();
     }
