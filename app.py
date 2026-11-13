@@ -931,7 +931,33 @@ BACKTEST_MAX_POSITIONS = 5
 FAST_CORRELATED_ASSETS = {'BTC', 'ETH', 'SOL'}
 
 
-def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None):
+BACKTEST_RULES = {'baseline': '当前规则', 'confirmation': '严格确认', 'retest': '严格确认＋回踩'}
+
+
+def backtest_entry_signal(symbol, mode, now, read, rules):
+    candle, score, volatility, reason, context = evaluate_entry_signal(symbol, mode, now, read)
+    if rules == 'baseline' or score is None:
+        return candle, score, volatility, reason, context
+    if rules == 'retest' and mode != 'swing' and reason in {'突破做多', '跌破做空'}:
+        return candle, None, volatility, '等待回踩或反抽', {}
+
+    direction = 1 if score > 0 else -1
+    base, confirm, backdrop = SIGNAL_TIMEFRAMES[mode]
+    cutoff = candle + STRATEGY_INTERVALS[mode]
+    background, _ = read(backdrop, cutoff, 48)
+    confirmation, _ = read(confirm, cutoff, 48)
+    _, raw = read(base, cutoff, 49)
+    closes = [bar[4] for bar in confirmation[-12:]]
+    path = sum(abs(b-a) for a, b in zip(closes, closes[1:]))
+    efficiency = direction*(closes[-1]-closes[0])/path if path else 0
+    buy_flow = float(raw[-1][10])/float(raw[-1][7])
+    side_flow = buy_flow if direction > 0 else 1-buy_flow
+    if not trend_metrics(background, direction)[0] or efficiency < .30 or side_flow < .52:
+        return candle, None, volatility, '大周期方向、趋势效率或主动成交未达标', {}
+    return candle, score, volatility, reason, context
+
+
+def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *, rules='baseline'):
     starts = {asset: {frame: series[0][0][0] for frame, series in data.items()}
               for asset, (data, _, _) in markets.items()}
     funding = {asset: {stamp: (rate, price) for stamp, rate, price in rows}
@@ -950,7 +976,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None):
 
     initial = Decimal(10000)
     balance = high_water = equity = initial
-    drawdown = Decimal(0)
+    drawdown = fees_paid = estimated_slippage = funding_net = Decimal(0)
     positions = {}
     trades = []
     event_skips = capacity_skips = peak_positions = 0
@@ -965,8 +991,8 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None):
             for asset in assets:
                 if asset in positions:
                     continue
-                _, score, volatility, reason, context = evaluate_entry_signal(
-                    asset+'USDT', mode, stamp, lambda frame, cutoff, required: read(asset, frame, cutoff, required))
+                _, score, volatility, reason, context = backtest_entry_signal(
+                    asset+'USDT', mode, stamp, lambda frame, cutoff, required: read(asset, frame, cutoff, required), rules)
                 if score is not None:
                     if event_at is not None and abs(stamp-event_at) <= 15*60000:
                         event_skips += 1
@@ -1007,6 +1033,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None):
                 free_margin -= margin
                 positions[asset] = dict(opened=stamp, entry=entry, direction=direction, amount=notional/entry,
                                         risk=stop, trail=entry*(1-direction*stop), margin=margin,
+                                        entry_slippage=abs(entry-opening)*notional/entry,
                                         peak=Decimal(0), funding=Decimal(0), signal=reason)
                 peak_positions = max(peak_positions, len(positions))
 
@@ -1034,8 +1061,12 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None):
             elif stamp+60000 >= end:
                 reason, price = '回测结束结算', Decimal(str(trade_close))
             if reason:
+                price_before_slippage = price
                 price *= 1-direction*slippage
                 fees = fee*amount*(entry+price)
+                fees_paid += fees
+                estimated_slippage += position['entry_slippage'] + amount*abs(price-price_before_slippage)
+                funding_net += position['funding']
                 net = direction*amount*(price-entry)-fees+position['funding']
                 balance += net
                 trades.append(dict(symbol=asset+'USDT', opened=position['opened'], closed=stamp, entry=float(entry), exit=float(price),
@@ -1056,7 +1087,11 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None):
         drawdown = max(drawdown, (high_water-equity)/high_water)
         if stamp % HOUR == 0 or stamp+60000 >= end:
             curve.append(dict(time=stamp+60000, equity=float(equity)))
-    return dict(mode=mode, name=STRATEGY_NAMES[mode], initial=float(initial), net=float(balance-initial),
+    name = STRATEGY_NAMES[mode] if rules == 'baseline' else f'{STRATEGY_NAMES[mode]} · {BACKTEST_RULES[rules]}'
+    net = balance-initial
+    return dict(mode=mode, name=name, initial=float(initial), net=float(net),
+                gross=float(net+fees_paid+estimated_slippage-funding_net), fees=float(fees_paid),
+                slippage=float(estimated_slippage), funding=float(funding_net),
                 roi=float(balance/initial-1), drawdown=float(drawdown), count=len(trades),
                 win_rate=sum(t['net'] > 0 for t in trades)/len(trades) if trades else None,
                 curve=curve, trades=list(reversed(trades)), event_skips=event_skips,
@@ -1116,6 +1151,10 @@ def backtest_coverage(params):
 
 def run_backtest(params):
     assets, modes, intervals, start, end = backtest_range(params)
+    variant = params.get('rules', ['baseline'])[0]
+    if variant not in {*BACKTEST_RULES, 'compare'}:
+        raise ValueError('回测规则无效')
+    variants = list(BACKTEST_RULES) if variant == 'compare' else [variant]
     venue = 'Binance'
     event_value = params.get('event_at', [''])[0]
     event_at = int(datetime.fromisoformat(event_value+'+08:00').timestamp()*1000) if event_value else None
@@ -1146,8 +1185,9 @@ def run_backtest(params):
     fee, slippage = Decimal('.0005'), Decimal('.0003')
     return dict(assets=assets, venue=venue, start=start, end=end,
                 funding_samples=sum(len(funding) for _, _, funding in markets.values()),
-                results=[replay_portfolio(key, markets, start, end, fee, slippage, event_at)
-                         for key in modes])
+                results=[replay_portfolio(key, markets, start, end, fee, slippage, event_at, rules=rules)
+                         for key in modes for rules in variants if not (key == 'swing' and rules == 'retest'
+                                                                      and variant == 'compare')])
 
 
 def restore_strategy_positions(positions, assets, mode):
