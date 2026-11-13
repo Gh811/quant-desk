@@ -1531,7 +1531,8 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 _, score, volatility, reason, context = backtest_entry_signal(
                     asset+'USDT', mode, stamp, lambda frame, cutoff, required: read(asset, frame, cutoff, required), rules)
                 if score is None:
-                    label = reason.split(' · ')[-1].split('（')[0]
+                    label = reason.split(' · ')[0] if ' · 距前 ' in reason else reason.split(' · ')[-1]
+                    label = label.split('（')[0]
                     entry_checks[label or '无入场信号'] += 1
                 else:
                     entry_checks['通过信号过滤'] += 1
