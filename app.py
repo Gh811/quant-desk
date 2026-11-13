@@ -1507,11 +1507,17 @@ class DemoStrategy:
             else:
                 pending = any(order['symbol'] == symbol and order['status'] in DEMO_ORDER_PENDING
                               for order in recent_orders(limit=None))
-                if pending or demo_signed('/fapi/v1/openOrders', symbol=symbol) or open_protection(symbol):
-                    raise ValueError(asset + ' 仍有挂单或待核对委托')
-                if any(position['symbol'] == symbol and Decimal(position['positionAmt'])
-                       for position in demo_signed('/fapi/v3/account')['positions']):
-                    raise ValueError(asset + ' 仍有持仓')
+                if pending:
+                    raise ValueError(asset + ' 仍有待核对委托')
+                with ThreadPoolExecutor(max_workers=3) as pool:
+                    orders = pool.submit(demo_signed, '/fapi/v1/openOrders', symbol=symbol)
+                    protection = pool.submit(open_protection, symbol)
+                    account = pool.submit(demo_signed, '/fapi/v3/account')
+                    if orders.result() or protection.result():
+                        raise ValueError(asset + ' 仍有挂单')
+                    if any(position['symbol'] == symbol and Decimal(position['positionAmt'])
+                           for position in account.result()['positions']):
+                        raise ValueError(asset + ' 仍有持仓')
                 self.assets = [item for item in self.assets if item != asset]
                 self.checks = {key: value for key, value in self.checks.items() if key != asset}
             self.wake.set()
@@ -2510,6 +2516,8 @@ class Handler(BaseHTTPRequestHandler):
             except (OSError, ValueError, KeyError, ArithmeticError, sqlite3.Error) as error:
                 self.send(409, 'application/json', json.dumps({'error': str(error)}).encode())
                 return
+            self.send(200, 'application/json', json.dumps({'assets': strategy.assets}).encode())
+            return
         elif parsed.path == '/strategy/start':
             params = parse_qs(parsed.query)
             assets = set(params.get('asset', ()))
