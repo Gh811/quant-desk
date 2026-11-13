@@ -364,8 +364,23 @@ function savePreferences() {
   writeSaved('config', {assets:new FormData(config).getAll('asset'), strategy:strategyMode.value,
     sizing:strategySizing.value, notional:strategyNotional.value});
 }
+const usStrategyAssets = new Set('SNDK SOXL KORU MU NVDA QQQ GOOGL SPCX META TSLA AMZN'.split(' '));
+if (strategyMode.value === 'us_open') {
+  for (const checkbox of config.querySelectorAll('[name=asset]')) {
+    if (!usStrategyAssets.has(checkbox.value)) checkbox.checked = false;
+  }
+}
 config.addEventListener('change', savePreferences);
-strategyMode.addEventListener('change', savePreferences);
+strategyMode.addEventListener('change', () => {
+  if (strategyMode.value === 'us_open') {
+    for (const checkbox of config.querySelectorAll('[name=asset]')) {
+      checkbox.checked = usStrategyAssets.has(checkbox.value);
+    }
+    renderMarketRows();
+  }
+  renderStrategyControls();
+  savePreferences();
+});
 strategySizing.addEventListener('change', () => {
   savePreferences();
   renderStrategyControls();
@@ -840,7 +855,9 @@ function renderStrategyControls() {
   stop.textContent = stopping ? '正在停止并平仓…' : '停止并平仓';
   entries.disabled = typeof strategyState?.entries_paused !== 'boolean' || !running || stopping || strategyAction !== null;
   entries.textContent = strategyState?.entries_paused ? '恢复开新仓' : '停止开新仓';
-  for (const checkbox of config.querySelectorAll('[name=asset]')) checkbox.disabled = locked;
+  for (const checkbox of config.querySelectorAll('[name=asset]')) {
+    checkbox.disabled = locked || (strategyMode.value === 'us_open' && !usStrategyAssets.has(checkbox.value));
+  }
 }
 function setMarketPill(cell, label, tone) {
   if (cell.firstElementChild?.textContent === label && cell.firstElementChild.dataset.tone === tone) return;
@@ -1189,15 +1206,22 @@ summary{cursor:pointer;font-weight:600}details .scroll{margin-top:10px}
 <form id="backtest">
   <label>标的<select name="asset" id="asset"></select></label>
   <label>策略<select name="strategy"><option value="all">比较适用策略</option><option value="fast">5 分钟双向</option><option value="intraday">15 分钟双向</option><option value="swing">1 小时双向</option><option value="us_open">美股双向</option></select></label>
-  <label>开始日期<input type="date" name="start" required></label>
-  <label>结束日期<input type="date" name="end" required></label>
+  <label>回测跨度<select name="days"><option value="1">最近 1 天</option><option value="7" selected>最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option><option value="60">最近 60 天</option></select></label>
   <label>事件时间（可选，北京时间）<input type="datetime-local" name="event_at"></label>
-  <button type="submit">运行回测</button>
+  <button type="submit">检查区间</button>
 </form>
-<p id="status" role="status">行情来源为币安实盘公开数据。日期按北京时间，最多 7 天。每个策略以 10,000 USDT 虚拟本金独立运行。</p>
+<p id="status" role="status">行情来源为币安实盘公开数据。终点自动取最新已收盘的 1 分钟 K 线，时间按北京时间显示。每个策略以 10,000 USDT 虚拟本金独立运行。</p>
+<dialog id="confirm-range">
+  <p id="range-summary"></p>
+  <form method="dialog">
+    <button value="cancel" autofocus>返回修改</button>
+    <button value="run">开始回测</button>
+  </form>
+</dialog>
 <div id="results"></div>
 <details><summary>数据与成交假设</summary>
   <p>5 分钟策略用 5 分钟找信号、15 分钟确认、1 小时过滤逆势。15 分钟和美股双向用 15 分钟、1 小时、4 小时。1 小时策略用 1 小时、4 小时、日线。信号还用成交量、主动成交占比和波动。</p>
+  <p>可用起点取成交 K 线和标记价共同覆盖，并为所选策略预留指标预热时间。区间内出现数据缺口会报错。</p>
   <p>信号只看已收盘 K 线。下一分钟开盘价加估算滑点入场，止盈止损用 1 分钟标记价判断，同一根同时碰到两条线时按止损计算。按单边手续费 0.05%、单边滑点 0.03% 和可取得的历史资金费计账。</p>
   <p>移动止损按 1 分钟收盘近似更新。填写已知事件时间后，前后 15 分钟跳过新的入场信号，已有仓位继续管理。历史盘口排队、动态止盈、组合仓位限制与自动新闻数据尚未接入。结果用于比较规则在相同假设下的表现。</p>
 </details>
@@ -1278,22 +1302,49 @@ function render(data) {
     results.append(details);
   }
 }
-const today = new Date(Date.now()+8*3600000).toISOString().slice(0,10);
-const previous = days => new Date(Date.parse(today)-days*86400000).toISOString().slice(0,10);
-form.elements.start.value=previous(3);form.elements.end.value=previous(1);
-form.elements.start.max=today;form.elements.end.max=today;
-for (const symbol of 'ETH BTC XAU SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN'.split(' ')) {
-  const option=element('option',({SAMSUNG:'三星电子',XAU:'黄金（XAU）'})[symbol] || symbol);option.value=symbol;
-  form.elements.asset.append(option);
+const assets = 'ETH BTC XAU SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN'.split(' ');
+const usEquities = 'SNDK SOXL KORU MU NVDA QQQ GOOGL SPCX META TSLA AMZN'.split(' ');
+function updateBacktestAssets() {
+  const select = form.elements.asset;
+  const equitiesOnly = form.elements.strategy.value === 'us_open';
+  const list = equitiesOnly ? usEquities : assets;
+  const previous = select.value;
+  select.replaceChildren(...list.map(symbol => {
+    const option = element('option', ({SAMSUNG:'三星电子',XAU:'黄金（XAU）'})[symbol] || symbol);
+    option.value = symbol;
+    return option;
+  }));
+  select.value = list.includes(previous) ? previous : equitiesOnly ? 'QQQ' : 'BTC';
 }
-form.elements.asset.value='BTC';
+form.elements.strategy.addEventListener('change', updateBacktestAssets);
+updateBacktestAssets();
 window.addEventListener('resize',()=>chart?.());
 form.onsubmit=async event=>{
   event.preventDefault();
   const button=form.querySelector('button');button.disabled=true;
-  status.textContent='正在读取历史数据并回测…';
+  status.textContent='正在检查历史覆盖和指标预热数据…';
   try {
-    const response=await fetch('./backtest/results?'+new URLSearchParams(new FormData(form)),{signal:AbortSignal.timeout(55000)});
+    const params = new URLSearchParams(new FormData(form));
+    const checked = await fetch('./backtest/coverage?'+params,{signal:AbortSignal.timeout(20000)});
+    const range = await checked.json();
+    if (!checked.ok) throw Error(range.error || 'HTTP '+checked.status);
+    const dialog = document.getElementById('confirm-range');
+    const limited = range.start > range.requested_start;
+    document.getElementById('range-summary').textContent =
+      params.get('asset')+'USDT · '+range.strategies.join(' / ')+'。'+
+      (limited ? '历史或预热数据不足，请求起点 '+formatTime(range.requested_start)+'，实际可回测区间缩短为 ' : '回测区间为 ')+
+      formatTime(range.start)+' 至 '+formatTime(range.end)+'（北京时间）。';
+    dialog.returnValue = 'cancel';
+    dialog.showModal();
+    await new Promise(resolve => dialog.addEventListener('close',resolve,{once:true}));
+    if (dialog.returnValue !== 'run') {
+      status.textContent='已取消，可以调整标的或跨度。';
+      return;
+    }
+    params.set('start_at', range.start);
+    params.set('end_at', range.end);
+    status.textContent='正在读取历史数据并回测，30 至 60 天可能需要几分钟…';
+    const response=await fetch('./backtest/results?'+params,{signal:AbortSignal.timeout(300000)});
     const data=await response.json();
     if (!response.ok) throw Error(data.error || 'HTTP '+response.status);
     render(data);
