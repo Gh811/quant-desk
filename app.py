@@ -894,18 +894,57 @@ def evaluate_entry_signal(symbol, mode, now, read):
 
 
 BACKTEST_LOCK = threading.Lock()
+BACKTEST_FEEDS = {'live': ('Binance', '币安实盘行情'), 'demo': (DEMO_VENUE, '币安模拟盘行情')}
+backtest_request_lock = threading.Lock()
+backtest_next_request = {}
+
+
+def backtest_feed(params):
+    source = params.get('source', ['live'])[0]
+    if source not in BACKTEST_FEEDS:
+        raise ValueError('回测行情来源无效')
+    return BACKTEST_FEEDS[source]
+
+
+def backtest_request(venue, endpoint, **params):
+    for attempt in range(2):
+        while True:
+            with backtest_request_lock:
+                now = time.monotonic()
+                delay = backtest_next_request.get(venue, 0) - now
+                if delay <= 0:
+                    backtest_next_request[venue] = now + .10
+                    break
+            if delay > 30:
+                raise ValueError(f'{venue} 行情接口限流（429），请稍后重试或缩短回测跨度')
+            time.sleep(delay)
+        try:
+            return request(venue, endpoint, **params)
+        except HTTPError as error:
+            if error.code != 429:
+                raise
+            try:
+                retry_after = max(2, int(error.headers.get('Retry-After', '5')))
+            except (AttributeError, ValueError):
+                retry_after = 5
+            error.close()
+            with backtest_request_lock:
+                backtest_next_request[venue] = max(backtest_next_request[venue], time.monotonic()+retry_after)
+            if attempt or retry_after > 30:
+                raise ValueError(f'{venue} 行情接口限流（429），请稍后重试或缩短回测跨度') from None
 
 
 def historical_bars(venue, symbol, interval, start, end, *, mark=False):
     step = (1 if interval == '1m' else TIMEFRAME_MINUTES[interval]) * 60000
     first = start // step * step
     path = '/fapi/v1/markPriceKlines' if mark else '/fapi/v1/klines'
+    batch_size = 499
     def fetch_chunk(cursor):
-        batch_end = min(end, cursor + 1000*step)
+        batch_end = min(end, cursor + batch_size*step)
         for attempt in range(2):
             try:
-                return request(venue, path, symbol=symbol, interval=interval,
-                               startTime=cursor, endTime=batch_end-1, limit=1000)
+                return backtest_request(venue, path, symbol=symbol, interval=interval,
+                                        startTime=cursor, endTime=batch_end-1, limit=batch_size)
             except HTTPError:
                 raise
             except (OSError, ValueError):
@@ -914,7 +953,7 @@ def historical_bars(venue, symbol, interval, start, end, *, mark=False):
 
     rows = []
     with ThreadPoolExecutor(max_workers=4) as pool:
-        for batch in pool.map(fetch_chunk, range(first, end-step+1, 1000*step)):
+        for batch in pool.map(fetch_chunk, range(first, end-step+1, batch_size*step)):
             for raw in batch:
                 stamp = int(raw[0])
                 if stamp + step > end:
@@ -1137,6 +1176,7 @@ def backtest_range(params):
 
 def backtest_coverage(params):
     assets, modes, intervals, requested_start, requested_end = backtest_range(params)
+    venue, source_label = backtest_feed(params)
     feeds = [(interval, '/fapi/v1/klines', 50) for interval in intervals]
     feeds += [('1m', '/fapi/v1/klines', 0), ('1m', '/fapi/v1/markPriceKlines', 0)]
 
@@ -1144,10 +1184,10 @@ def backtest_coverage(params):
         asset, interval, endpoint, warmup = feed
         step = TIMEFRAME_MINUTES.get(interval, 1) * 60000
         desired = requested_start // step * step - warmup*step
-        rows = request('Binance', endpoint, symbol=asset+'USDT', interval=interval,
-                       startTime=desired, endTime=requested_end-1, limit=1)
+        rows = backtest_request(venue, endpoint, symbol=asset+'USDT', interval=interval,
+                                startTime=desired, endTime=requested_end-1, limit=1)
         if not rows:
-            raise ValueError(f'{asset} {interval} 历史行情不足或不可用')
+            raise ValueError(f'{source_label}中 {asset} 的 {interval} 历史行情不足或不可用')
         first = int(rows[0][0])
         return requested_start if first == desired else first + warmup*step
 
@@ -1156,7 +1196,8 @@ def backtest_coverage(params):
     start = max(requested_start, *starts)
     if start >= requested_end:
         raise ValueError('该标的历史不足以完成所选策略的预热，无法回测')
-    return dict(assets=assets, start=start, end=requested_end, requested_start=requested_start,
+    return dict(assets=assets, venue=venue, source_label=source_label, start=start, end=requested_end,
+                requested_start=requested_start,
                 strategies=[STRATEGY_NAMES[key] for key in modes])
 
 
@@ -1166,7 +1207,7 @@ def run_backtest(params):
     if variant not in {*BACKTEST_RULES, 'compare'}:
         raise ValueError('回测规则无效')
     variants = list(BACKTEST_RULES) if variant == 'compare' else [variant]
-    venue = 'Binance'
+    venue, source_label = backtest_feed(params)
     event_value = params.get('event_at', [''])[0]
     event_at = int(datetime.fromisoformat(event_value+'+08:00').timestamp()*1000) if event_value else None
     if event_at is not None and not start <= event_at < end:
@@ -1180,7 +1221,8 @@ def run_backtest(params):
         rows = []
         cursor = start
         while cursor < end:
-            batch = request(venue, '/fapi/v1/fundingRate', symbol=symbol, startTime=cursor, endTime=end-1, limit=1000)
+            batch = backtest_request(venue, '/fapi/v1/fundingRate', symbol=symbol,
+                                     startTime=cursor, endTime=end-1, limit=1000)
             rows.extend(batch)
             if len(batch) < 1000:
                 break
@@ -1194,7 +1236,7 @@ def run_backtest(params):
 
     markets = {asset: load(asset) for asset in assets}
     fee, slippage = Decimal('.0005'), Decimal('.0003')
-    return dict(assets=assets, venue=venue, start=start, end=end,
+    return dict(assets=assets, venue=venue, source_label=source_label, start=start, end=end,
                 funding_samples=sum(len(funding) for _, _, funding in markets.values()),
                 results=[replay_portfolio(key, markets, start, end, fee, slippage, event_at, rules=rules)
                          for key in modes for rules in variants if not (
@@ -1402,6 +1444,8 @@ class DemoStrategy:
                     recovering = False
                     record_runtime('账户核对完成', mode=mode, detail=f'已接管 {len(holdings)} 个持仓')
                 closed_symbols = holdings.keys() - positions.keys()
+                if closed_symbols:
+                    external_demo_close_wake.set()
                 for symbol in closed_symbols:
                     amount, opened, leverage, _, opening_id = holdings.pop(symbol)
                     if cost_control:
@@ -1937,6 +1981,8 @@ class LiveMarketSimulation:
         intent = payload.get('intent', {})
         response = payload.get('response', {})
         symbol = payload.get('symbol') or intent.get('symbol')
+        if intent.get('external_close'):
+            return
         protection = kind == 'demo_protection_confirmed'
         if protection:
             opening_id = (intent.get('context') or {}).get('opening_id')
@@ -2379,16 +2425,30 @@ def recent_orders(limit=50):
             "SELECT created_at, kind, payload FROM events WHERE kind LIKE 'demo_order_%' ORDER BY id DESC"
         )
         orders = {}
+        seen = set()
+        closes = {}
         for timestamp, kind, raw in rows:
             payload = json.loads(raw)
             intent = payload.get('intent', payload)
             key = intent['clientOrderId']
-            if key in orders:
+            if key in seen:
                 continue
+            seen.add(key)
             response = payload.get('response', {})
             executed_at = response.get('updateTime') if (response.get('status') == 'FILLED' or
                 (strategy_limit_entry(intent) and Decimal(response.get('executedQty') or '0') > 0)) else None
             is_close = intent.get('reduce_only')
+            exchange_id = response.get('orderId')
+            if is_close and exchange_id is not None:
+                exchange_key = (intent['symbol'], str(exchange_id))
+                priority = (payload.get('net_pnl') is not None, not intent.get('external_close'))
+                previous = closes.get(exchange_key)
+                if previous:
+                    previous_key, previous_priority = previous
+                    if priority <= previous_priority:
+                        continue
+                    del orders[previous_key]
+                closes[exchange_key] = (key, priority)
             orders[key] = dict(intent, time=timestamp, filled=payload.get('filled_quote') or response.get('cumQuote'),
                                entry_value=payload.get('entry_value'),
                                entry_price=payload.get('entry_price'), exit_price=payload.get('exit_price'),
@@ -2405,9 +2465,7 @@ def recent_orders(limit=50):
                                    'demo_order_http_error': '接口报错',
                                    'demo_order_unknown': '待核对',
                                }.get(kind, '待核对'))
-            if limit is not None and len(orders) == limit:
-                break
-        return list(orders.values())
+        return list(orders.values())[:limit]
 
 
 def demo_history(page):
@@ -2581,6 +2639,159 @@ def strategy_statistics():
 def trade_quote(fill):
     quote = fill.get('quoteQty')
     return Decimal(quote) if quote else Decimal(fill['qty']) * Decimal(fill['price'])
+
+
+external_demo_close_wake = threading.Event()
+
+
+def demo_trade_window(symbol, start, end):
+    rows = demo_signed('/fapi/v1/userTrades', symbol=symbol, startTime=start, endTime=end, limit=1000)
+    if len(rows) < 1000:
+        return sorted(rows, key=lambda fill: (int(fill['time']), int(fill['id'])))
+    if start == end:
+        raise ValueError('同一毫秒的成交明细超出接口上限')
+    middle = (start + end) // 2
+    return demo_trade_window(symbol, start, middle) + demo_trade_window(symbol, middle+1, end)
+
+
+def find_demo_position_fills(order, now):
+    symbol = order['symbol']
+    opening_id = str(order['exchange_order_id'])
+    expected = Decimal(order['executed_qty'])
+    opening = demo_signed('/fapi/v1/userTrades', symbol=symbol, orderId=opening_id, limit=1000)
+    if (not opening or len(opening) >= 1000 or sum(Decimal(fill['qty']) for fill in opening) != expected
+            or any(str(fill['orderId']) != opening_id or fill['side'] != order['side']
+                   or fill.get('positionSide', 'BOTH') != 'BOTH' for fill in opening)):
+        return None
+    first = min(int(fill['time']) for fill in opening)
+    opening_key = min((int(fill['time']), int(fill['id'])) for fill in opening)
+    remaining = Decimal(0)
+    exits = []
+    cursor = first
+    while cursor <= now:
+        end = min(now, cursor+7*24*HOUR-1)
+        for fill in demo_trade_window(symbol, cursor, end):
+            if (int(fill['time']), int(fill['id'])) < opening_key or fill.get('positionSide', 'BOTH') != 'BOTH':
+                continue
+            quantity = Decimal(fill['qty'])
+            if str(fill['orderId']) == opening_id:
+                remaining += quantity
+            elif fill['side'] != ('SELL' if order['side'] == 'BUY' else 'BUY') or quantity > remaining:
+                return None
+            else:
+                exits.append(fill)
+                remaining -= quantity
+                if not remaining:
+                    if sum(Decimal(exit_fill['qty']) for exit_fill in exits) != expected:
+                        return None
+                    return opening, exits
+        cursor = end+1
+    return None
+
+
+def sync_external_demo_close(order, known, now):
+    fills = find_demo_position_fills(order, now)
+    if fills is None:
+        return False
+    opening, exits = fills
+    groups = {}
+    for fill in exits:
+        groups.setdefault(str(fill['orderId']), []).append(fill)
+    missing = {key: group for key, group in groups.items()
+               if known.get((order['symbol'], key), {}).get('pnl') is None}
+    if not missing:
+        return True
+    if any(fill['commissionAsset'] != 'USDT' for fill in opening + exits):
+        raise ValueError('外部平仓手续费币种需要换算')
+    symbol = order['symbol']
+    start, end = min(int(fill['time']) for fill in opening), int(exits[-1]['time'])
+    funding_rows = demo_signed('/fapi/v1/income', symbol=symbol, incomeType='FUNDING_FEE',
+                               startTime=start+1, endTime=end-1, limit=1000) if end-start > 1 else []
+    if len(funding_rows) >= 1000 or any(row['asset'] != 'USDT' or not start < int(row['time']) < end
+                                       for row in funding_rows):
+        raise ValueError('外部平仓资金费明细待核对')
+    funded_exits = {}
+    for row in funding_rows:
+        at = int(row['time'])
+        eligible = [fill for fill in exits if int(fill['time']) > at]
+        exposed = (sum(Decimal(fill['qty']) for fill in opening if int(fill['time']) < at)
+                   - sum(Decimal(fill['qty']) for fill in exits if int(fill['time']) <= at))
+        eligible_qty = sum(Decimal(fill['qty']) for fill in eligible)
+        if exposed != eligible_qty or not exposed:
+            raise ValueError('资金费时点仓位待核对')
+        for fill in eligible:
+            funded_exits.setdefault(str(fill['orderId']), []).append(
+                (at, Decimal(row['income']) * Decimal(fill['qty']) / exposed))
+
+    opening_qty = sum(Decimal(fill['qty']) for fill in opening)
+    opening_value = sum(trade_quote(fill) for fill in opening)
+    baseline = demo_return_baseline()
+    for close_id, group in missing.items():
+        closed_at = max(int(fill['time']) for fill in group)
+        quantity = sum(Decimal(fill['qty']) for fill in group)
+        share = quantity/opening_qty
+        entry_value = opening_value*share
+        exit_value = sum(trade_quote(fill) for fill in group)
+        gross = sum(Decimal(fill['realizedPnl']) for fill in group)
+        fees = share*sum(Decimal(fill['commission']) for fill in opening) + sum(Decimal(fill['commission']) for fill in group)
+        funding = sum((value for _, value in funded_exits.get(close_id, [])), Decimal(0))
+        net = gross-fees+funding
+        return_pnl = None
+        if baseline is not None and closed_at > baseline[1]:
+            since = baseline[1]
+            return_pnl = str(sum(Decimal(fill['realizedPnl'])-Decimal(fill['commission'])
+                                 for fill in group if int(fill['time']) > since)
+                             - share*sum(Decimal(fill['commission']) for fill in opening if int(fill['time']) > since)
+                             + sum(value for at, value in funded_exits.get(close_id, []) if at > since))
+        previous = known.get((symbol, close_id))
+        client_id = f'demo-external-{symbol}-{close_id}'
+        decision = ((previous or {}).get('decision') or
+                    dict(reason='币安模拟盘外部平仓', detail='按交易所成交与资金费对账'))
+        intent = dict(clientOrderId=client_id, symbol=symbol, side=group[0]['side'], quantity=str(quantity),
+                      reduce_only=True, opening_id=order['exchange_order_id'], external_close=True,
+                      strategy=order.get('strategy'), leverage=order.get('leverage'), decision=decision)
+        response = dict(orderId=int(close_id), status='FILLED', executedQty=str(quantity), updateTime=closed_at)
+        journal('demo_order_settled', dict(intent=intent, response=response, net_pnl=str(net),
+                net_roi=float(net/entry_value), fees=str(fees), funding=str(funding), return_pnl=return_pnl,
+                entry_value=str(entry_value), filled_quote=str(exit_value), entry_price=str(entry_value/quantity),
+                exit_price=str(exit_value/quantity), opened_at=start, closed_at=closed_at))
+    return True
+
+
+def external_demo_close_watch():
+    next_check = {}
+    while True:
+        external_demo_close_wake.clear()
+        try:
+            now = demo_now_ms()
+            orders = recent_orders(limit=None)
+            known, settled = {}, {}
+            for order in orders:
+                if order.get('reduce_only') and order['exchange_order_id'] is not None:
+                    known[(order['symbol'], str(order['exchange_order_id']))] = order
+                    if order.get('opening_id') is not None and order.get('pnl') is not None:
+                        key = (order['symbol'], str(order['opening_id']))
+                        settled[key] = settled.get(key, Decimal(0)) + Decimal(order['executed_qty'])
+            due = []
+            for order in orders:
+                if (order.get('reduce_only') or order['status'] not in DEMO_ORDER_TERMINAL or not has_order_fill(order)
+                        or not order.get('opened') or order['exchange_order_id'] is None
+                        or int(order['opened']) < now-89*24*HOUR):
+                    continue
+                key = (order['symbol'], str(order['exchange_order_id']))
+                deadline = next_check.get(key, 0)
+                if deadline <= now and settled.get(key, 0) < Decimal(order['executed_qty']):
+                    due.append((deadline, order, key))
+            for _, order, key in sorted(due, key=lambda item: (item[0], -int(item[1]['opened'])))[:4]:
+                age = now-int(order['opened'])
+                next_check[key] = now + (15_000 if age < 2*24*HOUR else 5*60_000)
+                try:
+                    sync_external_demo_close(order, known, now)
+                except (OSError, ValueError, KeyError, TypeError, ArithmeticError, sqlite3.Error) as error:
+                    print(f'外部平仓 {key[0]} {key[1]} 待核对：{error}', flush=True)
+        except (OSError, ValueError, KeyError, ArithmeticError, sqlite3.Error) as error:
+            print(f'外部平仓对账失败：{error}', flush=True)
+        external_demo_close_wake.wait(5)
 
 
 def position_breakeven_costs(symbol, opening_id, amount, cache):
@@ -2849,6 +3060,7 @@ if __name__ == '__main__':
     server.shadow = LiveMarketSimulation(journal_path().with_name('live-market-mirror.json'))
     if os.getenv('BINANCE_DEMO_API_KEY') and os.getenv('BINANCE_DEMO_API_SECRET'):
         threading.Thread(target=protection_watch, daemon=True).start()
+        threading.Thread(target=external_demo_close_watch, daemon=True).start()
     print('http://127.0.0.1:8765', flush=True)
     webbrowser.open('http://127.0.0.1:8765')
     server.serve_forever()
