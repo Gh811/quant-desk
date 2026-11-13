@@ -20,7 +20,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
-ASSETS = 'ETH BTC SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN'.split()
+ASSETS = 'ETH BTC XAU SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN'.split()
 US_EQUITY_ASSETS = set('SNDK SOXL KORU MU NVDA QQQ GOOGL SPCX META TSLA AMZN'.split())
 HOSTS = {'OKX': 'https://openapi.okx.com', 'Binance': 'https://fapi.binance.com'}
 DEMO_VENUE = 'Binance 模拟盘'
