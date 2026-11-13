@@ -891,23 +891,31 @@ def historical_bars(venue, symbol, interval, start, end, *, mark=False):
     step = (1 if interval == '1m' else TIMEFRAME_MINUTES[interval]) * 60000
     first = start // step * step
     path = '/fapi/v1/markPriceKlines' if mark else '/fapi/v1/klines'
+    def fetch_chunk(cursor):
+        batch_end = min(end, cursor + 1000*step)
+        for attempt in range(2):
+            try:
+                return request(venue, path, symbol=symbol, interval=interval,
+                               startTime=cursor, endTime=batch_end-1, limit=1000)
+            except HTTPError:
+                raise
+            except (OSError, ValueError):
+                if attempt:
+                    raise
+
     rows = []
-    cursor = first
-    while cursor + step <= end:
-        batch_end = min(end, cursor + 1000 * step)
-        batch = request(venue, path, symbol=symbol, interval=interval,
-                        startTime=cursor, endTime=batch_end-1, limit=1000)
-        for raw in batch:
-            stamp = int(raw[0])
-            if stamp + step > end:
-                break
-            if stamp != first + len(rows)*step or int(raw[6]) != stamp + step - 1:
-                raise ValueError(f'{symbol} {interval} K 线存在缺口或预热数据不足')
-            bar = (stamp, *map(float, raw[1:5]))
-            if not all(math.isfinite(p) and p > 0 for p in bar[1:]):
-                raise ValueError(f'{symbol} {interval} K 线价格无效')
-            rows.append((bar, raw))
-        cursor = batch_end
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for batch in pool.map(fetch_chunk, range(first, end-step+1, 1000*step)):
+            for raw in batch:
+                stamp = int(raw[0])
+                if stamp + step > end:
+                    break
+                if stamp != first + len(rows)*step or int(raw[6]) != stamp + step - 1:
+                    raise ValueError(f'{symbol} {interval} K 线存在缺口或预热数据不足')
+                bar = (stamp, *map(float, raw[1:5]))
+                if not all(math.isfinite(p) and p > 0 for p in bar[1:]):
+                    raise ValueError(f'{symbol} {interval} K 线价格无效')
+                rows.append((bar, raw))
     if len(rows) != (end-first)//step:
         raise ValueError(f'{symbol} {interval} K 线覆盖不足，请缩短区间或选较晚日期')
     return rows
@@ -1018,34 +1026,79 @@ def replay_strategy(asset, mode, data, marks, funding, start, end, fee, slippage
                 curve=curve, trades=list(reversed(trades)), event_skips=event_skips)
 
 
-def run_backtest(params):
+def backtest_range(params):
     asset = params.get('asset', ['BTC'])[0]
     mode = params.get('strategy', ['all'])[0]
-    venue = 'Binance'
     if asset not in ASSETS or mode not in {*STRATEGY_NAMES, 'all'}:
         raise ValueError('标的或策略无效')
     if mode == 'us_open' and asset not in US_EQUITY_ASSETS:
         raise ValueError('美股双向策略仅用于美股类标的')
-    start, end = (int(datetime.fromisoformat(params[key][0]+'T00:00:00+08:00').timestamp()*1000)
-                  for key in ('start','end'))
-    end = min(end+24*HOUR, (time.time_ns()//1_000_000)//60000*60000)
-    if not 0 < end-start <= 7*24*HOUR:
-        raise ValueError('请选择已开始且不超过 7 天的区间')
+    modes = ([key for key in STRATEGY_NAMES if key != 'us_open' or asset in US_EQUITY_ASSETS]
+             if mode == 'all' else [mode])
+    intervals = sorted({frame for key in modes for frame in SIGNAL_TIMEFRAMES[key]})
+    now = time.time_ns() // 1_000_000 // 60000 * 60000
+    if 'start_at' in params:
+        start, end = (int(params[key][0]) for key in ('start_at', 'end_at'))
+    elif 'start' in params and 'end' in params:
+        start, end = (int(datetime.fromisoformat(params[key][0]+'T00:00:00+08:00').timestamp()*1000)
+                      for key in ('start', 'end'))
+        end = min(end+24*HOUR, now)
+    else:
+        days = int(params.get('days', ['7'])[0])
+        end = now
+        start = end-days*24*HOUR
+    if start < 0 or end > now or not 0 < end-start <= 60*24*HOUR or start % 60000 or end % 60000:
+        raise ValueError('回测跨度须在 1 分钟至 60 天之间，终点不能晚于最新收盘')
+    return asset, modes, intervals, start, end
+
+
+def backtest_coverage(params):
+    asset, modes, intervals, requested_start, requested_end = backtest_range(params)
+    feeds = [(interval, '/fapi/v1/klines', 50) for interval in intervals]
+    feeds += [('1m', '/fapi/v1/klines', 0), ('1m', '/fapi/v1/markPriceKlines', 0)]
+
+    def first_usable(feed):
+        interval, endpoint, warmup = feed
+        step = TIMEFRAME_MINUTES.get(interval, 1) * 60000
+        desired = requested_start // step * step - warmup*step
+        rows = request('Binance', endpoint, symbol=asset+'USDT', interval=interval,
+                       startTime=desired, endTime=requested_end-1, limit=1)
+        if not rows:
+            raise ValueError(f'{asset} {interval} 历史行情不足或不可用')
+        first = int(rows[0][0])
+        return requested_start if first == desired else first + warmup*step
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        start = max(requested_start, *pool.map(first_usable, feeds))
+    if start >= requested_end:
+        raise ValueError('该标的历史不足以完成所选策略的预热，无法回测')
+    return dict(start=start, end=requested_end, requested_start=requested_start,
+                strategies=[STRATEGY_NAMES[key] for key in modes])
+
+
+def run_backtest(params):
+    asset, modes, intervals, start, end = backtest_range(params)
+    venue = 'Binance'
     event_value = params.get('event_at', [''])[0]
     event_at = int(datetime.fromisoformat(event_value+'+08:00').timestamp()*1000) if event_value else None
     if event_at is not None and not start <= event_at < end:
         raise ValueError('事件时间须在回测区间内')
-    modes = ([key for key in STRATEGY_NAMES if key != 'us_open' or asset in US_EQUITY_ASSETS]
-             if mode == 'all' else [mode])
-    intervals = {frame for key in modes for frame in SIGNAL_TIMEFRAMES[key]}
     symbol = asset+'USDT'
     data = {frame:historical_bars(venue, symbol, frame, start-50*TIMEFRAME_MINUTES[frame]*60000, end)
             for frame in sorted(intervals)}
     data['1m'] = historical_bars(venue, symbol, '1m', start, end)
     marks = historical_bars(venue, symbol, '1m', start, end, mark=True)
-    rows = request(venue, '/fapi/v1/fundingRate', symbol=symbol, startTime=start, endTime=end-1, limit=1000)
-    if len(rows) >= 1000:
-        raise ValueError('资金费数据超出回测范围')
+    rows = []
+    cursor = start
+    while cursor < end:
+        batch = request(venue, '/fapi/v1/fundingRate', symbol=symbol, startTime=cursor, endTime=end-1, limit=1000)
+        rows.extend(batch)
+        if len(batch) < 1000:
+            break
+        next_cursor = int(batch[-1]['fundingTime']) + 1
+        if next_cursor <= cursor:
+            raise ValueError('资金费分页时间无效')
+        cursor = next_cursor
     funding = [(int(row['fundingTime'])//60000*60000, Decimal(row['fundingRate']), Decimal(row['markPrice']))
                for row in rows]
     fee, slippage = Decimal('.0005'), Decimal('.0003')
@@ -1996,6 +2049,10 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path in {'/', '/backtest'}:
                 main, _, backtest = Path(__file__).with_name('index.html').read_bytes().partition(b'<!-- backtest-page -->')
                 self.send(200, 'text/html', backtest if parsed.path == '/backtest' else main)
+                return
+            if parsed.path == '/backtest/coverage':
+                coverage = backtest_coverage(parse_qs(parsed.query))
+                self.send(200, 'application/json', json.dumps(coverage).encode())
                 return
             if parsed.path == '/backtest/results':
                 if not BACKTEST_LOCK.acquire(blocking=False):
