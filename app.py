@@ -1507,6 +1507,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
     trades = []
     learning_samples = {side: deque(maxlen=500) for side in (1, -1)}
     event_skips = capacity_skips = peak_positions = 0
+    entry_checks = Counter()
     curve = [dict(time=start, equity=float(initial))]
     interval = STRATEGY_INTERVALS[mode]
     fast_trend = mode == 'fast'
@@ -1521,11 +1522,19 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
         if stamp % interval == 0 and equity > 0:
             candidates = []
             for asset in assets:
-                if asset in positions or stamp < reentry_at.get(asset, 0):
+                if asset in positions:
+                    entry_checks['持仓中'] += 1
+                    continue
+                if stamp < reentry_at.get(asset, 0):
+                    entry_checks['平仓冷却'] += 1
                     continue
                 _, score, volatility, reason, context = backtest_entry_signal(
                     asset+'USDT', mode, stamp, lambda frame, cutoff, required: read(asset, frame, cutoff, required), rules)
-                if score is not None:
+                if score is None:
+                    label = reason.split(' · ')[-1].split('（')[0]
+                    entry_checks[label or '无入场信号'] += 1
+                else:
+                    entry_checks['通过信号过滤'] += 1
                     if event_at is not None and abs(stamp-event_at) <= 15*60000:
                         event_skips += 1
                     else:
@@ -1550,6 +1559,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 entry = opening * (1 + direction*slippage)
                 if (direction*(opening/context['close']-1) > volatility/2 or
                         direction*(opening/context['boundary']-1) < (0 if context['stressed'] else -volatility/4)):
+                    entry_checks['开盘价偏离信号'] += 1
                     continue
                 contract = (contracts or {}).get(asset)
                 stop = entry_stop_fraction(asset, mode, volatility, us_equity=equity_kind(asset+'USDT', contract) == 'us')
@@ -1559,9 +1569,11 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                                                    contract['contractType'] if contract else
                                                    ('PERPETUAL' if asset in FAST_CRYPTO_ASSETS else 'TRADIFI_PERPETUAL'))
                     except ValueError:
+                        entry_checks['结构止损超限'] += 1
                         continue
                 cost = 2*(fee+slippage)
                 if cost > stop*cost_cap:
+                    entry_checks['预估成本过高'] += 1
                     continue
                 target_return = take_multiple*stop
                 if fast_trend:
@@ -1569,13 +1581,16 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                         target_return, _ = fast_take_target(entry, direction, stop, volatility, cost,
                                                             context.get('obstacles', ()))
                     except ValueError:
+                        entry_checks['止盈空间不足'] += 1
                         continue
                 leverage = 5 if mode == 'fast' else min(5 if mode == 'swing' else 3, max(1, int(Decimal('.05')/stop)))
                 risk_scale = Decimal(str(evidence['risk_scale'])) if evidence else 1
                 notional = entry_notional_budget(mode, equity, free_margin, leverage,
                                                  BACKTEST_MAX_POSITIONS-len(positions), stop, cost, risk_scale)
                 if notional <= 0:
+                    entry_checks['风险预算不足'] += 1
                     continue
+                entry_checks['模拟开仓'] += 1
                 margin = notional/leverage
                 free_margin -= margin
                 positions[asset] = dict(opened=stamp, entry=entry, direction=direction, amount=notional/entry,
@@ -1683,7 +1698,8 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 profit_factor=sum(wins)/sum(losses) if losses else None,
                 expectancy=float(net/len(trades)) if trades else None,
                 curve=curve, trades=list(reversed(trades)), event_skips=event_skips,
-                capacity_skips=capacity_skips, peak_positions=peak_positions, assets=assets)
+                capacity_skips=capacity_skips, peak_positions=peak_positions, assets=assets,
+                entry_checks=dict(entry_checks.most_common()))
 
 
 def backtest_range(params):
