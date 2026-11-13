@@ -4,6 +4,7 @@ import math
 import os
 import time
 from datetime import datetime
+from collections import Counter, deque
 import threading
 import sys
 import sqlite3
@@ -128,30 +129,35 @@ def demo_entry_book(symbol, contract_type):
     return book, bid, ask
 
 
-def select_demo_entry(direction, book, bid, ask, budget, step, stop_loss, cost):
+def select_demo_entry(direction, book, bid, ask, budget, step, stop_loss, cost, *, minimum_quantity=None):
     price = ask if direction > 0 else bid
     amount = (budget / price // step) * step
     try:
         depth = Decimal(book.get('askQty' if direction > 0 else 'bidQty') or '0')
     except (ValueError, TypeError, InvalidOperation):
         depth = Decimal(0)
-    if depth.is_finite() and 0 < amount <= depth and cost <= stop_loss / 2:
-        return price, amount, 'IOC'
+    if depth.is_finite() and depth > 0 and cost <= stop_loss / 2:
+        if 0 < amount <= depth:
+            return price, amount, 'IOC'
+        if minimum_quantity is not None:
+            available = (depth // step) * step
+            if available >= max(minimum_quantity, amount * Decimal('.6')):
+                return price, available, 'IOC'
     price = bid if direction > 0 else ask
     return price, (budget / price // step) * step, 'GTX'
 
 
-def entry_retry_block(previous, current, cooldown_seconds):
+def entry_retry_block(previous, current, cooldown_seconds, *, max_ioc_upgrade=Decimal(0)):
     if previous is None or previous[:2] != current[:2]:
         return None
     _, direction, now, price, time_in_force, cost = current
     _, _, last_at, last_price, last_time_in_force, last_cost = previous
     if now - last_at < cooldown_seconds * 1000:
         return '短暂冷却，之后继续复查盘口'
-    if direction * (price - last_price) > 0:
+    upgrade = last_time_in_force == 'GTX' and time_in_force == 'IOC'
+    if direction * (price - last_price) > (max_ioc_upgrade if upgrade else 0):
         return '价格较上次委托不利，等待更合适的盘口'
-    if (price == last_price and not (last_time_in_force == 'GTX' and time_in_force == 'IOC')
-            and cost >= last_cost * Decimal('.9')):
+    if price == last_price and not upgrade and cost >= last_cost * Decimal('.9'):
         return '同价委托已尝试，等待成交条件改善'
     return None
 
@@ -742,6 +748,8 @@ SHORT_REENTRY_COOLDOWN_BARS = 3
 FAST_TREND_TARGET = Decimal('3')
 FAST_TREND_TRAIL_START = Decimal('1.5')
 FAST_REVIEW_RETRY_MS = 30000
+FAST_LEARNING_WINDOW = 60 * 24 * HOUR
+FAST_LEARNING_HALF_LIFE = 14 * 24 * HOUR
 
 
 def entry_stop_fraction(asset, mode, volatility):
@@ -967,6 +975,103 @@ def fast_entry_setup(context, volatility):
     return dict(boundary=str(context['boundary']), extreme=str(context['extreme']), atr=str(volatility))
 
 
+def fast_signal_family(reason):
+    if reason in {'突破做多', '跌破做空'}:
+        return 'breakout'
+    if reason in {'高波动回踩做多', '高波动反抽做空'}:
+        return 'volatile_retest'
+    if reason in {'回踩做多', '反抽做空'}:
+        return 'retest'
+    return None
+
+
+def fast_entry_evidence(samples, symbol, direction, reason, now):
+    family = fast_signal_family(reason)
+    weight_sum = wins = net_r = 0.0
+    count = 0
+    for closed, other_symbol, side, other_family, result_r in samples:
+        age = now - closed
+        if side != direction or not 0 <= age <= FAST_LEARNING_WINDOW:
+            continue
+        similarity = 1.0 if other_family == family else .35
+        if other_symbol != symbol:
+            similarity *= .65
+        weight = similarity * 2 ** (-age / FAST_LEARNING_HALF_LIFE)
+        weight_sum += weight
+        wins += weight * (result_r > 0)
+        net_r += weight * result_r
+        count += 1
+    # Eight neutral prior samples keep sparse history from driving the decision.
+    probability = (wins + 4) / (weight_sum + 8)
+    expectancy = net_r / (weight_sum + 8)
+    adjustment = max(-.30, min(.30, .5 * expectancy + .25 * (probability - .5)))
+    risk_scale = 1.0
+    if weight_sum >= 12 and expectancy < -.1:
+        risk_scale = max(.8, 1 + expectancy * .25)
+    return dict(samples=count, weight=weight_sum, probability=probability if count else None,
+                expectancy=expectancy if count else None, adjustment=adjustment, risk_scale=risk_scale)
+
+
+def fast_evidence_label(evidence):
+    if not evidence['samples']:
+        return '同方向暂无已结算样本 · 按当前信号判断'
+    return (f'历史净盈利估计 {evidence["probability"]:.0%} · '
+            f'净期望 {evidence["expectancy"]:+.2f}R · 同向 {evidence["samples"]} 笔'
+            f'（加权 {evidence["weight"]:.1f}） · 排序 {evidence["adjustment"]:+.2f}'
+            f' · 风险预算 {evidence["risk_scale"]:.0%}')
+
+
+def settled_fast_samples(orders, now):
+    openings = {}
+    exits = {}
+    for order in orders:
+        order_id = order.get('exchange_order_id')
+        if order_id is None:
+            continue
+        symbol = order['symbol']
+        if order.get('reduce_only'):
+            opening_id = order.get('opening_id')
+            if opening_id is not None and order.get('pnl') is not None and order.get('closed'):
+                exits.setdefault((symbol, str(opening_id)), {})[str(order_id)] = order
+        elif order.get('strategy') == 'fast' and order['status'] in DEMO_ORDER_TERMINAL and has_order_fill(order):
+            openings[(symbol, str(order_id))] = order
+
+    samples = []
+    for key, opening in openings.items():
+        family = fast_signal_family((opening.get('decision') or {}).get('reason'))
+        closed_orders = list(exits.get(key, {}).values())
+        if not family or not closed_orders or opening.get('side') not in {'BUY', 'SELL'}:
+            continue
+        direction = 1 if opening['side'] == 'BUY' else -1
+        if any(order.get('side') != exit_side(direction) or
+               (order.get('decision') or {}).get('reason') in {'币安模拟盘外部平仓', '停止策略并清仓'}
+               for order in closed_orders):
+            continue
+        try:
+            closed = max(int(order['closed']) for order in closed_orders)
+            if not 0 <= now - closed <= FAST_LEARNING_WINDOW:
+                continue
+            quantities = [Decimal(order['executed_qty']) for order in closed_orders]
+            if any(not qty.is_finite() or qty <= 0 for qty in quantities):
+                continue
+            if sum(quantities) != Decimal(opening['executed_qty']):
+                continue
+            values = [Decimal(order['entry_value']) for order in closed_orders]
+            stop = Decimal(opening['stop_loss'])
+            if any(not value.is_finite() or value <= 0 for value in values) or not 0 < stop < 1:
+                continue
+            risk = sum(values) * stop
+            net = sum(Decimal(order['pnl']) for order in closed_orders)
+            if not risk.is_finite() or risk <= 0 or not net.is_finite():
+                continue
+        except (TypeError, ValueError, KeyError, ArithmeticError):
+            continue
+        # Cap outliers in the expectancy estimate, while preserving win/loss signs.
+        result = float(max(Decimal(-3), min(Decimal(3), net / risk)))
+        samples.append((closed, key[0], direction, family, result))
+    return samples
+
+
 
 BACKTEST_LOCK = threading.Lock()
 BACKTEST_FEEDS = {'live': ('Binance', '币安实盘行情'), 'demo': (DEMO_VENUE, '币安模拟盘行情')}
@@ -1096,6 +1201,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
     drawdown = fees_paid = estimated_slippage = funding_net = Decimal(0)
     positions = {}
     trades = []
+    learning_samples = {side: deque(maxlen=500) for side in (1, -1)}
     event_skips = capacity_skips = peak_positions = 0
     curve = [dict(time=start, equity=float(initial))]
     interval = STRATEGY_INTERVALS[mode]
@@ -1120,10 +1226,16 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                     if event_at is not None and abs(stamp-event_at) <= 15*60000:
                         event_skips += 1
                     else:
-                        candidates.append((context['priority'], asset, score, volatility, reason, context))
+                        evidence = None
+                        if fast_trend:
+                            direction = 1 if score > 0 else -1
+                            evidence = fast_entry_evidence(learning_samples[direction], asset+'USDT', direction,
+                                                           reason, stamp)
+                        priority = context['priority'] + (evidence['adjustment'] if evidence else 0)
+                        candidates.append((priority, asset, score, volatility, reason, context, evidence))
 
             free_margin = max(Decimal(0), equity - sum(p['margin'] for p in positions.values()))
-            for _, asset, score, volatility, reason, context in sorted(candidates, key=lambda row: (-row[0], row[1])):
+            for _, asset, score, volatility, reason, context, evidence in sorted(candidates, key=lambda row: (-row[0], row[1])):
                 if len(positions) == BACKTEST_MAX_POSITIONS:
                     capacity_skips += 1
                     continue
@@ -1148,8 +1260,9 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                     continue
                 leverage = 5 if mode == 'fast' else min(5 if mode == 'swing' else 3, max(1, int(Decimal('.05')/stop)))
                 margin_budget = free_margin*Decimal('.95')/(BACKTEST_MAX_POSITIONS-len(positions))
+                risk_scale = Decimal(str(evidence['risk_scale'])) if evidence else 1
                 notional = min(equity*(3 if mode == 'swing' else 1), leverage*margin_budget,
-                               equity*equity_risk/(stop+cost))
+                               equity*equity_risk*risk_scale/(stop+cost))
                 if notional <= 0:
                     continue
                 margin = notional/leverage
@@ -1159,7 +1272,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                                         take=entry*(1+direction*take_multiple*stop),
                                         setup=fast_entry_setup(context, volatility) if fast_trend else None,
                                         entry_slippage=abs(entry-opening)*notional/entry,
-                                        peak=Decimal(0), funding=Decimal(0), signal=reason)
+                                        peak=Decimal(0), funding=Decimal(0), signal=reason, evidence=evidence)
                 peak_positions = max(peak_positions, len(positions))
 
         for asset, position in list(positions.items()):
@@ -1219,8 +1332,14 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 funding_net += position['funding']
                 net = direction*amount*(price-entry)-fees+position['funding']
                 balance += net
+                family = fast_signal_family(position['signal'])
+                if fast_trend and family and reason != '回测结束结算':
+                    result_r = net / (entry * amount * stop)
+                    learning_samples[direction].append((stamp + 60000, asset+'USDT', direction, family,
+                                                        float(max(Decimal(-3), min(Decimal(3), result_r)))))
                 trades.append(dict(symbol=asset+'USDT', opened=position['opened'], closed=stamp, entry=float(entry), exit=float(price),
-                                   direction=direction, net=float(net), reason=reason, signal=position['signal']))
+                                   direction=direction, net=float(net), reason=reason, signal=position['signal'],
+                                   evidence=position['evidence']))
                 if cost_control:
                     reentry_at[asset] = stamp + SHORT_REENTRY_COOLDOWN_BARS * interval
                 del positions[asset]
@@ -1535,6 +1654,11 @@ class DemoStrategy:
         recovering = True
         last_scan_log = None
         next_entry_scan = 0
+        learning_samples = {1: [], -1: []}
+        next_learning_refresh = 0
+        entry_outcomes = Counter()
+        entry_blockers = Counter()
+        entry_signal_count = 0
 
         def forget_protection(symbol):
             for state in (peaks, ticks, protection_errors, breakeven_costs, trailing_stops, take_reviewed,
@@ -1785,6 +1909,16 @@ class DemoStrategy:
                         pending_symbols.setdefault(order['symbol'], order.get('status') or '交易所有挂单')
                     catalog = request(DEMO_VENUE, '/fapi/v1/exchangeInfo')['symbols']
                     started = time.monotonic()
+                    if fast_trend and started >= next_learning_refresh:
+                        next_learning_refresh = started + 30
+                        try:
+                            samples = settled_fast_samples(recent_orders(limit=None), demo_now_ms())
+                        except (OSError, ValueError, KeyError, TypeError, ArithmeticError, sqlite3.Error) as error:
+                            record_runtime('入场历史刷新失败', mode=mode, detail=str(error))
+                        else:
+                            samples.sort(key=lambda sample: sample[0], reverse=True)
+                            learning_samples = {side: [sample for sample in samples if sample[2] == side][:500]
+                                                for side in (1, -1)}
                     self.status = '正在检查行情与入场信号'
                     candidates = []
                     listed = {item['symbol']: item for item in catalog}
@@ -1847,8 +1981,14 @@ class DemoStrategy:
                             try:
                                 candle, score, volatility, reason, signal_context = job.result()
                                 if score is not None:
-                                    candidates.append((signal_context['priority'], symbol, candle, volatility,
-                                                       reason, item, score, signal_context))
+                                    evidence = None
+                                    if fast_trend:
+                                        direction = 1 if score > 0 else -1
+                                        evidence = fast_entry_evidence(learning_samples[direction], symbol, direction,
+                                                                       reason, scan_at)
+                                    priority = signal_context['priority'] + (evidence['adjustment'] if evidence else 0)
+                                    candidates.append((priority, symbol, candle, volatility,
+                                                       reason, item, score, signal_context, evidence))
                                     reason = f'信号成立 · {reason} · 等待下单检查'
                             except (OSError, ValueError, KeyError, IndexError, TypeError, ArithmeticError) as error:
                                 reason = f'行情不可用 · {error}'
@@ -1856,14 +1996,16 @@ class DemoStrategy:
                             self.checks = checks.copy()
                     self.checked_at = demo_now_ms()
                     self.scan_ms = round((time.monotonic()-started)*1000)
-                    if last_scan_log is None or self.checked_at - last_scan_log >= 60000:
+                    log_scan = last_scan_log is None or self.checked_at - last_scan_log >= 60000
+                    scan_signals = len(candidates)
+                    if log_scan:
                         unavailable = sum(label.startswith('行情不可用') for label in checks.values())
                         record_runtime('行情扫描完成', mode=mode, at=self.checked_at,
                                        detail=f'读取 {len(jobs)} 个标的 · 行情不可用 {unavailable} 个 · 耗时 {self.scan_ms} ms')
                         last_scan_log = self.checked_at
                     free_margin = Decimal(account['availableBalance'])
-                    for _, symbol, candle, volatility, reason, item, score, signal_context in sorted(
-                            candidates, key=lambda candidate: candidate[0], reverse=True):
+                    for _, symbol, candle, volatility, reason, item, score, signal_context, evidence in sorted(
+                            candidates, key=lambda candidate: (-candidate[0], candidate[1])):
                         if self.wake.is_set() or self.stop.is_set() or self.entries_paused.is_set() or len(occupied) >= max_positions:
                             break
                         filters = {f['filterType']: f for f in item['filters']}
@@ -1920,21 +2062,26 @@ class DemoStrategy:
                                            else min(leverage_cap, max(1, int(Decimal('.05') / stop_loss))))
                         margin_budget = free_margin * Decimal('.95') / (max_positions - len(occupied))
                         budget = max(Decimal(0), min((equity if short_term else 3 * equity), leverage_target * margin_budget))
-                        risk_budget = equity * equity_risk / (stop_loss + cost)
+                        risk_scale = Decimal(str(evidence['risk_scale'])) if evidence else 1
+                        risk_budget = equity * equity_risk * risk_scale / (stop_loss + cost)
                         budget = min(budget, risk_budget)
                         if fixed_notional is not None:
                             budget = min(budget, fixed_notional)
+                        minimum = Decimal(filters.get('MIN_NOTIONAL', {}).get('notional', '0'))
+                        aggressive_price = ask if direction > 0 else bid
+                        minimum_quantity = max(Decimal(lot['minQty']), minimum / aggressive_price)
                         price, amount, time_in_force = select_demo_entry(
-                            direction, book, bid, ask, budget, step, stop_loss, cost)
+                            direction, book, bid, ask, budget, step, stop_loss, cost,
+                            minimum_quantity=minimum_quantity if fast_trend else None)
                         attempt = (candle, direction, demo_now_ms(), price, time_in_force, cost)
-                        retry_block = entry_retry_block(entry_attempts.get(symbol), attempt,
-                                                        ENTRY_RETRY_COOLDOWN_SECONDS[mode])
+                        retry_block = entry_retry_block(
+                            entry_attempts.get(symbol), attempt, ENTRY_RETRY_COOLDOWN_SECONDS[mode],
+                            max_ioc_upgrade=aggressive_price * stop_loss / 4 if fast_trend else Decimal(0))
                         if retry_block:
                             checks[symbol[:-4]] = f'等待复查 · {retry_block}'
                             self.checks = checks.copy()
                             continue
                         notional = amount * price
-                        minimum = Decimal(filters.get('MIN_NOTIONAL', {}).get('notional', '0'))
                         if not Decimal(lot['minQty']) <= amount <= Decimal(lot['maxQty']) or notional < minimum or not amount:
                             checks[symbol[:-4]] = '跳过 · 数量或名义金额不符合合约要求'
                             self.checks = checks.copy()
@@ -1991,10 +2138,16 @@ class DemoStrategy:
                                         detail=detail, signal_at=signal_at)
                         if fast_trend:
                             decision['setup'] = fast_entry_setup(signal_context, volatility)
+                            decision['evidence'] = evidence
+                            decision['detail'] += ' · ' + fast_evidence_label(evidence)
+                            if time_in_force == 'IOC' and (budget / price // step) * step > amount:
+                                decision['detail'] += ' · 按一档可成交深度缩量'
                         entry_attempts[symbol] = (candle, direction, now, price, time_in_force, cost)
                         order = submit_demo_limit_entry(symbol, amount, price, leverage_target, mode,
                                                         stop_loss, tick, self.wake, decision,
                                                         side=entry_side(direction), time_in_force=time_in_force)
+                        if fast_trend:
+                            entry_outcomes[f'{time_in_force} {order["status"]}'] += 1
                         if order['status'] in DEMO_ORDER_PENDING:
                             pending_symbols[symbol] = order['status']
                             occupied.add(symbol)
@@ -2057,6 +2210,20 @@ class DemoStrategy:
                                 checks[other_asset] = '信号成立 · 等待下一轮仓位检查'
                         self.checks = checks.copy()
                         break
+                    if fast_trend:
+                        entry_signal_count += scan_signals
+                        entry_blockers.update(checks[symbol[:-4]].split('：', 1)[0]
+                                              for _, symbol, *_ in candidates
+                                              if checks[symbol[:-4]].startswith(('跳过', '等待复查')))
+                        if log_scan:
+                            counts = '、'.join(f'{label} {count}' for label, count in entry_blockers.most_common()) or '无'
+                            outcomes = '、'.join(f'{label} {count}' for label, count in entry_outcomes.items()) or '无'
+                            record_runtime('5 分钟入场检查', mode=mode,
+                                           detail=f'候选累计 {entry_signal_count} · 占用 {len(occupied)}/{max_positions}'
+                                                  f' · 下单回报 {outcomes} · 拦截 {counts}')
+                            entry_signal_count = 0
+                            entry_blockers.clear()
+                            entry_outcomes.clear()
                 self.status = '监控中 · ' + (f'持仓 {len(holdings)}/{max_positions}' if holdings else '等待入场信号')
                 if pending_symbols:
                     self.status += f' · {len(pending_symbols)} 个标的有待处理委托'
