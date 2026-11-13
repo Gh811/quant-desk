@@ -76,6 +76,13 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 .research-scroll{overflow-x:auto}.market-research table{margin:8px 0 0;min-width:550px}
 .market-research th{font-size:12px;font-weight:650}.market-research td{font-size:13px}
 .market-research button{width:auto;white-space:nowrap}.market-research tbody button{padding:4px 9px}
+.opportunity-history{margin-top:16px;padding-top:12px;border-top:1px solid #d5dfeb}
+.opportunity-history h3{margin:0 0 8px;font-size:14px}
+.opportunity-history-grid{display:flex;flex-wrap:wrap;gap:6px;max-height:200px;overflow:auto;padding:3px}
+.opportunity-history-grid button{display:inline-flex;gap:8px;align-items:center;margin:0;padding:5px 8px;background:#e3effa;color:#174f91;font-size:12px}
+.opportunity-history-grid button[data-direction="空"]{background:#f7e2e6;color:#9e3042;border-color:#e8b8c1}
+.opportunity-history-grid time{font-variant-numeric:tabular-nums}
+#opportunity-history-status{margin:4px 0 0;font-size:12px}
 .asset-code{font-family:ui-monospace,SFMono-Regular,monospace;font-weight:600}
 #pool-search{padding:7px 9px;border:1px solid #bdcadd;border-radius:5px;max-width:100%}
 #assets label[data-unavailable=true]{color:#52647a}
@@ -227,6 +234,11 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <div class="research-header"><div><h2 id="opportunity-title">AI 选股 · 多空机会</h2><small>后台每根 5 分钟 K 线收盘后扫描全部候选。参考价未计盘口与费用。</small><p id="opportunity-status" role="status">正在连接机会扫描…</p></div></div>
   <div class="research-scroll" id="opportunity-results" hidden><table><thead><tr><th>合约</th><th>方向</th><th>状态</th><th>依据</th><th>参考入场价</th><th>参考止损 / 止盈</th><th>模拟盘</th></tr></thead><tbody id="opportunity-rows"></tbody></table></div>
   <nav id="opportunity-pages" class="pagination" aria-label="机会分页" hidden></nav>
+  <div class="opportunity-history">
+    <h3>最近 24 小时选股</h3>
+    <div class="opportunity-history-grid" id="opportunity-history"></div>
+    <p id="opportunity-history-status" role="status"></p>
+  </div>
 </div></section></main>
 <script>
 const el = id => document.getElementById(id);
@@ -896,6 +908,34 @@ let strategyAction = null;
 let strategyStatusFailed = false;
 let marketCatalog = null;
 let marketByAsset = new Map();
+function assetBusy(asset) {
+  return Boolean(strategyState?.running && strategyState.busy_assets?.includes(asset));
+}
+function assetEditingLocked() {
+  return !strategyState || strategyState.draining || strategyState.switch_blocked || strategyAction !== null;
+}
+async function changeRunningAsset(asset, enabled) {
+  if (assetEditingLocked()) return false;
+  strategyAction = 'asset';
+  renderStrategyControls();
+  let error;
+  try {
+    const params = new URLSearchParams({asset, enabled:enabled ? '1' : '0'});
+    const response = await fetch('./strategy/asset?' + params, {
+      method:'POST', headers:{'X-Quant-Demo':'strategy'}, signal:AbortSignal.timeout(30000)
+    });
+    if (!response.ok) throw Error((await response.json()).error);
+  } catch (failure) {
+    error = failure.message;
+  } finally {
+    if (statusRequest) await statusRequest;
+    await strategyStatus();
+    strategyAction = null;
+    renderStrategyControls();
+    if (error) el('strategy-status').textContent = error;
+  }
+  return !error;
+}
 function renderStrategyControls() {
   const start = el('strategy-start');
   const stop = el('strategy-stop');
@@ -925,11 +965,10 @@ function renderStrategyControls() {
   entries.textContent = strategyState?.entries_paused ? '恢复开新仓' : '停止开新仓';
   for (const checkbox of config.querySelectorAll('[name=asset]')) {
     const market = marketByAsset.get(checkbox.value);
-    checkbox.disabled = locked || !market?.demo_tradeable || (strategyMode.value === 'us_open' && market.equity !== 'us');
+    checkbox.disabled = assetEditingLocked() || (checkbox.checked && assetBusy(checkbox.value)) || !market?.demo_tradeable || (strategyMode.value === 'us_open' && market.equity !== 'us');
     checkbox.parentElement.dataset.unavailable = String(!market?.demo_tradeable);
     checkbox.parentElement.title = market?.demo_tradeable ? '' : '模拟盘未确认可交易';
-    checkbox.closest('.asset-choice').querySelector('button').disabled = !strategyState ||
-      (running && strategyState.assets.includes(checkbox.value));
+    checkbox.closest('.asset-choice').querySelector('button').disabled = assetEditingLocked() || assetBusy(checkbox.value);
   }
 }
 function setMarketPill(cell, label, tone) {
@@ -1010,8 +1049,9 @@ async function refreshStrategyStatus() {
     const state = await response.json();
     strategyChecks = state.checks || {};
     const wasRunning = strategyState?.running;
+    const busyChanged = JSON.stringify(strategyState?.busy_assets) !== JSON.stringify(state.busy_assets);
     strategyState = state;
-    if (Boolean(wasRunning) !== state.running && marketCatalog) renderPool();
+    if ((Boolean(wasRunning) !== state.running || busyChanged) && marketCatalog) renderPool();
     strategyStatusFailed = false;
     if (wasRunning && !state.running && accountMode.value === 'demo' && !demoSync.disabled) demoSync.click();
     const nextKey = JSON.stringify([state.status, state.checked_at, strategyChecks, state.running]);
@@ -1121,7 +1161,17 @@ function renderMarketRows() {
     renderStrategyCheck(item);
   }
 }
-config.addEventListener('change', () => { renderMarketRows(); renderStrategyControls(); });
+config.addEventListener('change', async event => {
+  const input = event.target;
+  if (input.name === 'asset' && strategyState?.running) {
+    const enabled = input.checked;
+    input.checked = strategyState.assets.includes(input.value);
+    await changeRunningAsset(input.value, enabled);
+    savePreferences();
+  }
+  renderMarketRows();
+  renderStrategyControls();
+});
 async function loadMarketStatus() {
   try {
     const response = await fetch('./market-universe', {signal:AbortSignal.timeout(20000)});
@@ -1168,16 +1218,17 @@ function renderPool() {
     const button = orderElement('button', 'compact-button', watched ? '移出列表' : '加入列表');
     button.classList.toggle('watch-remove', watched);
     button.type = 'button';
-    button.disabled = watched && (!strategyState || (strategyState.running && strategyState.assets.includes(market.asset)));
+    button.disabled = watched && (assetEditingLocked() || assetBusy(market.asset));
     button.addEventListener('click', () => setAssetWatch(market.asset, !watched));
     item.cells[4].append(button);
   }
   if (!rows.length) row('pool-rows', ['暂无匹配合约', '—', '—', '—', '—']);
 }
-function setAssetWatch(asset, watched) {
+async function setAssetWatch(asset, watched) {
   const input = [...config.querySelectorAll('[name=asset]')].find(input=>input.value === asset);
   if (!watched) {
-    if (!strategyState || (strategyState.running && strategyState.assets.includes(asset))) return;
+    if (assetEditingLocked() || assetBusy(asset)) return;
+    if (strategyState.running && strategyState.assets.includes(asset) && !(await changeRunningAsset(asset, false))) return;
     poolWatch.delete(asset);
     if (defaultAssets.includes(asset)) removedAssets.add(asset);
     input?.closest('.asset-choice').remove();
@@ -1212,6 +1263,42 @@ function renderOpportunities() {
   }
   el('opportunity-results').hidden = !opportunityRows.length;
 }
+let opportunityHistorySnapshot = '';
+let opportunityHistory = [];
+let opportunityCopyTimer;
+const opportunityHistoryTime = new Intl.DateTimeFormat('zh-CN', {hour:'2-digit', minute:'2-digit', hourCycle:'h23', timeZone:'Asia/Shanghai'});
+function renderOpportunityHistory(history) {
+  const cutoff = Date.now() - 86400000;
+  const visible = (history || []).filter(item => item.candle_at > cutoff);
+  const snapshot = JSON.stringify([history === null, visible]);
+  if (snapshot === opportunityHistorySnapshot) return;
+  opportunityHistorySnapshot = snapshot;
+  const cards = visible.map(item => {
+    const card = orderElement('button', '');
+    card.type = 'button';
+    card.dataset.direction = item.direction;
+    card.setAttribute('aria-label', '复制 ' + item.symbol + ' · 做' + item.direction);
+    const time = orderElement('time', '', opportunityHistoryTime.format(item.candle_at));
+    time.dateTime = new Date(item.candle_at).toISOString();
+    card.append(orderElement('span', 'asset-code', item.symbol), '做' + item.direction,
+                orderElement('span', '', '参考开仓 ' + item.reference), time);
+    card.onclick = async () => {
+      const status = el('opportunity-history-status');
+      clearTimeout(opportunityCopyTimer);
+      try {
+        await navigator.clipboard.writeText(item.symbol);
+        status.textContent = '已复制 ' + item.symbol;
+      } catch {
+        status.textContent = '复制失败 · ' + item.symbol;
+      }
+      opportunityCopyTimer = setTimeout(() => { status.textContent = ''; }, 2500);
+    };
+    return card;
+  });
+  el('opportunity-history').replaceChildren(...cards);
+  clearTimeout(opportunityCopyTimer);
+  el('opportunity-history-status').textContent = history === null ? '历史记录暂不可用' : visible.length ? '' : '最近 24 小时暂无记录';
+}
 let opportunityRequest = false;
 let opportunitySnapshot = '';
 let opportunityCandle = null;
@@ -1222,6 +1309,8 @@ async function refreshOpportunities() {
     const response = await fetch('./opportunities', {cache:'no-store', signal:AbortSignal.timeout(6000)});
     const report = await response.json();
     if (!response.ok) throw Error(report.error || 'HTTP ' + response.status);
+    opportunityHistory = report.history ?? null;
+    renderOpportunityHistory(opportunityHistory);
     if (report.candle_at !== opportunityCandle) {
       opportunityCandle = report.candle_at;
       el('opportunity-pages').dataset.page = 1;
@@ -1242,6 +1331,7 @@ async function refreshOpportunities() {
     if (label.textContent !== status) label.textContent = status;
   } catch {
     opportunitySnapshot = '';
+    renderOpportunityHistory(opportunityHistory);
     if (opportunityRows.length) {
       opportunityRows = [];
       renderOpportunities();
