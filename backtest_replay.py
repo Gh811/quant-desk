@@ -59,7 +59,9 @@ def backtest_entry_signal(symbol, mode, now, read, rules):
     return candle, score, volatility, reason, context
 
 
-def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *, rules='current', contracts=None):
+def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *, rules='current', contracts=None, maker_fee=None):
+    entry_fee = fee if maker_fee is None else maker_fee
+    entry_slip = slippage if maker_fee is None else Decimal(0)
     starts = {asset: {frame: series[0][0][0] for frame, series in data.items()}
               for asset, (data, _, _) in markets.items()}
     funding = {asset: {stamp: (rate, price) for stamp, rate, price in rows}
@@ -74,7 +76,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
 
     def value(position, price):
         direction, amount, entry = (position[key] for key in ('direction', 'amount', 'entry'))
-        return amount*(direction*(price-entry)-fee*(price+entry)) + position['funding']
+        return amount*(direction*(price-entry)-(entry_fee*entry + fee*price)) + position['funding']
 
     initial = Decimal(10000)
     balance = high_water = equity = initial
@@ -133,7 +135,9 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                         any(other in FAST_CORRELATED_ASSETS and p['direction'] == direction for other, p in positions.items())):
                     continue
                 opening = Decimal(str(markets[asset][0]['1m'][index][0][1]))
-                entry = opening * (1 + direction*slippage)
+                entry = opening * (1 + direction*entry_slip)
+                if maker_fee is not None:
+                    entry = opening * (1 - direction*Decimal('.0001'))
                 if (direction*(opening/context['close']-1) > volatility/2 or
                         direction*(opening/context['boundary']-1) < (0 if context['stressed'] else -volatility/4)):
                     entry_checks['开盘价偏离信号'] += 1
@@ -148,7 +152,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                     except ValueError:
                         entry_checks['结构止损超限'] += 1
                         continue
-                cost = 2*(fee+slippage)
+                cost = entry_fee + fee + entry_slip + slippage
                 if cost > stop*cost_cap:
                     entry_checks['预估成本过高'] += 1
                     continue
@@ -167,6 +171,12 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 if notional <= 0:
                     entry_checks['风险预算不足'] += 1
                     continue
+                if maker_fee is not None:
+                    bar = markets[asset][0]['1m'][index][0]
+                    touch = Decimal(str(bar[3 if direction > 0 else 2]))
+                    if direction*(touch-entry) >= 0:
+                        entry_checks['挂单未成交'] += 1
+                        continue
                 entry_checks['模拟开仓'] += 1
                 margin = notional/leverage
                 free_margin -= margin
@@ -175,7 +185,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                                         take=entry*(1+direction*target_return),
                                         initial_take=entry*(1+direction*target_return),
                                         setup=fast_entry_setup(context, volatility) if fast_trend else None,
-                                        entry_slippage=abs(entry-opening)*notional/entry,
+                                        entry_slippage=abs(entry-opening)*notional/entry if maker_fee is None else Decimal(0),
                                         peak=Decimal(0), funding=Decimal(0), signal=reason, evidence=evidence)
                 peak_positions = max(peak_positions, len(positions))
 
@@ -196,7 +206,8 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
             if fast_trend and stamp % interval == 0 and stamp > position['opened']:
                 market = fast_position_market(stamp, lambda frame, cutoff, required: read(asset, frame, cutoff, required))
                 position['review'] = fast_position_assessment(market, position['opened'], direction, position['setup'])
-            if fast_trend:
+            maker_fill_bar = maker_fee is not None and stamp == position['opened']
+            if fast_trend and not maker_fill_bar:
                 review, detail = position.get('review', (None, ''))
                 mark = Decimal(str(mark_open))
                 current = direction*(mark/entry-1)
@@ -208,7 +219,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                     reason, price = f'行情走弱触及收紧保护线 · {detail}', Decimal(str(trade_open))
                 if stop_return is not None and reason is None:
                     candidate = entry*(1+direction*stop_return)
-                    breakeven = (entry*(1+direction*fee)-direction*position['funding']/amount)/(1-direction*fee)
+                    breakeven = (entry*(1+direction*entry_fee)-direction*position['funding']/amount)/(1-direction*fee)
                     if direction*(mark-breakeven) > 0:
                         candidate = (max if direction > 0 else min)(candidate, breakeven)
                     if direction*(mark-candidate) > 0:
@@ -220,8 +231,8 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
             if reason is None:
                 if direction*(adverse-trail) <= 0:
                     reason = '移动止损' if trail != entry*(1-direction*stop) else '止损'
-                    price = (min if direction > 0 else max)(trail, Decimal(str(trade_open)))
-                elif direction*(favorable-take) >= 0:
+                    price = trail if maker_fill_bar else (min if direction > 0 else max)(trail, Decimal(str(trade_open)))
+                elif not maker_fill_bar and direction*(favorable-take) >= 0:
                     reason, price = '动态止盈' if take != position['initial_take'] else '止盈', take
                 elif max_hours is not None and stamp-position['opened'] >= max_hours*HOUR:
                     reason, price = '持仓到期', Decimal(str(trade_open))
@@ -230,7 +241,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
             if reason:
                 price_before_slippage = price
                 price *= 1-direction*slippage
-                fees = fee*amount*(entry+price)
+                fees = amount*(entry_fee*entry+fee*price)
                 fees_paid += fees
                 estimated_slippage += position['entry_slippage'] + amount*abs(price-price_before_slippage)
                 funding_net += position['funding']
@@ -252,7 +263,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 peak = max(position['peak'], direction*(close/entry-1))
                 position['peak'] = peak
                 if not fast_trend and peak >= stop:
-                    breakeven = (entry*(1+direction*fee)-direction*position['funding']/amount)/(1-direction*fee)
+                    breakeven = (entry*(1+direction*entry_fee)-direction*position['funding']/amount)/(1-direction*fee)
                     candidate = (max if direction > 0 else min)(entry*(1+direction*(peak-stop)), breakeven)
                     if direction*(close-candidate) > 0 and direction*(candidate-trail) > 0:
                         position['trail'] = candidate

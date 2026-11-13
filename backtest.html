@@ -16,6 +16,10 @@
     <button type="button" id="select-assets">选中搜索结果</button>
     <button type="button" id="clear-assets">清空</button><div id="asset"></div>
   </fieldset>
+  <label>开仓成交模型<select name="execution"><option value="taker">吃单</option><option value="maker">只挂单</option></select></label>
+  <label>挂单费率（bp）<input type="number" name="maker_bps" min="0" max="100" step="any" value="2" required></label>
+  <label>吃单费率（bp）<input type="number" name="taker_bps" min="0" max="100" step="any" value="5" required></label>
+  <label>吃单滑点（bp/边）<input type="number" name="slippage_bps" min="0" max="100" step="any" value="1" required></label>
   <button type="submit">开始回测</button>
 </form>
 <p id="status" role="status">当前 5 分钟双向策略 · 各标的以 10,000 USDT 独立回放 · 北京时间</p>
@@ -33,7 +37,7 @@
 <div id="results"></div>
 <details><summary>数据与成交假设</summary>
   <p>只运行当前 5 分钟双向策略。信号使用已收盘的 5 分钟、15 分钟和 1 小时 K 线，持仓复评及止盈止损使用分钟级行情。历史覆盖不足会缩短区间，结果页显示实际区间。区间内有数据缺口会单独标记该标的失败。</p>
-  <p>按下一分钟开盘价和滑点估算入场，止盈止损用 1 分钟标记价判断，同一根同时碰到两条线时按止损计算。单边手续费 0.05%，单边滑点 0.03%，另计历史资金费。盘口排队、部分成交与多标的共用保证金未纳入。</p>
+  <p>1 bp = 0.01%。费率与滑点为可调估算，按标的和账户填写。吃单按下一分钟开盘价加滑点。只挂单以该开盘价向被动方向偏移 1 bp，分钟成交价穿过挂单价才记成交，挂单成交不加滑点。挂单成交当分钟按保守口径检查止损，下一分钟开始检查止盈。平仓按吃单计费和滑点，另计历史资金费。盘口排队和部分成交未建模。</p>
 </details>
 </main>
 <script src="./backtest.js"></script></html>

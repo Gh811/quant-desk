@@ -55,6 +55,11 @@ let chart;
 function render(data) {
   results.replaceChildren();
   const panel=element('div');panel.className='panel';
+  const cost = data.cost_settings;
+  panel.append(element('p', cost
+    ? (cost.execution === 'maker' ? '挂单开仓 ' + Number(cost.maker_bps) + ' bp' : '吃单开仓 ' + Number(cost.taker_bps) + ' bp')
+      + ' · 吃单平仓 ' + Number(cost.taker_bps) + ' bp · 吃单滑点 ' + Number(cost.slippage_bps) + ' bp/边'
+    : '旧版成本口径 · 双边各 5 bp 手续费及 3 bp 滑点'));
   const metric = value => value == null ? '—' : amount.format(value);
   panel.append(element('h2',data.assets[0]+' · '+data.source_label),element('p','实际回测区间 '+formatTime(data.start)+' 至 '+formatTime(data.end)),table(['策略','净盈亏 USDT','毛盈亏','手续费','滑点','资金费净额','收益率','最大回撤','胜率','平均盈亏比','盈利因子','每笔净收益 USDT','交易笔数','峰值仓位','满仓信号','事件过滤信号'],
     data.results.map(r=>[r.name,r.net,amount.format(r.gross),amount.format(r.fees),amount.format(r.slippage),amount.format(r.funding),percent(r.roi),percent(r.drawdown),percent(r.win_rate),metric(r.payoff_ratio),metric(r.profit_factor),metric(r.expectancy),r.count,r.peak_positions,r.capacity_skips,r.event_skips]),1));
@@ -235,6 +240,9 @@ form.onsubmit = async event => {
     const params = new URLSearchParams({source:feed, days:span === 'days' ? form.elements.day_count.value : span});
     if (form.elements.days.value === 'custom') {
       for (const field of ['start','end']) params.set(field, form.elements[field].value);
+    }
+    for (const field of ['execution','maker_bps','taker_bps','slippage_bps']) {
+      params.set(field, form.elements[field].value);
     }
     for (const asset of assets) params.append('asset', asset);
     const data = await fetchData('./backtest/jobs?'+params, {

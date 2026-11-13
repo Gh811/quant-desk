@@ -1239,6 +1239,9 @@ def backtest_database():
                 PRIMARY KEY (venue, symbol, path, frame, start)
             )
         """)
+        database.execute("""
+            CREATE TABLE IF NOT EXISTS backtest_costs (job TEXT PRIMARY KEY, settings TEXT NOT NULL)
+        """)
         yield database
 
 
@@ -1246,14 +1249,15 @@ def submit_backtests(params):
     assets, _, _, start, end = backtest_range(params)
     backtest_feed(params)
     source = params.get('source', ['live'])[0]
+    settings = json.dumps(backtest_cost_settings(params))
     jobs = []
     with BACKTEST_SUBMIT_LOCK:
         with backtest_database() as database:
             active = database.execute("""
-                SELECT id, asset, source, start, end FROM backtest_jobs
-                WHERE state IN ('queued', 'running')
+                SELECT id, asset, source, start, end, settings FROM backtest_jobs
+                LEFT JOIN backtest_costs ON job=id WHERE state IN ('queued', 'running')
             """).fetchall()
-            existing = {(asset, feed, begin, finish): job for job, asset, feed, begin, finish in active}
+            existing = {(asset, feed, begin, finish): job for job, asset, feed, begin, finish, cost in active if cost == settings}
             new = [asset for asset in assets if (asset, source, start, end) not in existing]
             if len(active) + len(new) > BACKTEST_JOB_LIMIT:
                 raise ValueError('待运行任务太多，请等部分标的完成后再提交')
@@ -1262,6 +1266,7 @@ def submit_backtests(params):
                 job = uuid.uuid4().hex
                 database.execute("INSERT INTO backtest_jobs VALUES (?, ?, ?, ?, ?, ?, 'queued', NULL, NULL)",
                                  (job, asset, source, start, end, created))
+                database.execute('INSERT INTO backtest_costs VALUES (?, ?)', (job, settings))
                 existing[asset, source, start, end] = job
                 jobs.append((job, asset))
         for job, asset in jobs:
@@ -1292,7 +1297,10 @@ def run_backtest_job(job, asset, source, start, end):
     try:
         update('running', '检查行情覆盖')
         params = {'asset': [asset], 'source': [source], 'start_at': [str(start)], 'end_at': [str(end)]}
-        result = run_backtest(params, lambda detail: update('running', detail))
+        with backtest_database() as database:
+            row = database.execute('SELECT settings FROM backtest_costs WHERE job=?', (job,)).fetchone()
+        settings = json.loads(row[0]) if row else None
+        result = run_backtest(params, lambda detail: update('running', detail), settings=settings)
         update('done', result=zlib.compress(json.dumps(result, allow_nan=False).encode()))
     except Exception as error:
         update('failed', str(error))
@@ -1321,7 +1329,23 @@ def backtest_jobs(params):
         return dict(jobs=[dict(zip(fields, row)) for row in rows], total=total, page=page)
 
 
-def run_backtest(params, progress):
+def backtest_cost_settings(params):
+    mode = params.get('execution', ['taker'])[0]
+    if mode not in {'maker', 'taker'}:
+        raise ValueError('成交模型无效')
+    settings = {'execution': mode}
+    for name, default in (('maker_bps', '2'), ('taker_bps', '5'), ('slippage_bps', '1')):
+        try:
+            value = Decimal(params.get(name, [default])[0])
+        except InvalidOperation:
+            raise ValueError('请输入有效的费率和滑点') from None
+        if not value.is_finite() or not 0 <= value <= 100:
+            raise ValueError('费率和滑点须为 0 至 100 bp')
+        settings[name] = str(value.normalize())
+    return settings
+
+
+def run_backtest(params, progress, *, settings=None):
     coverage = backtest_coverage(params)
     asset, = coverage['assets']
     venue, start, end = (coverage[key] for key in ('venue', 'start', 'end'))
@@ -1356,9 +1380,14 @@ def run_backtest(params, progress):
         mark_bars = [(bar, None) for bar, _ in marks.result()]
         funding_rows = funding.result()
     progress('运行 5 分钟策略')
+    if settings is None:
+        settings = {'execution': 'taker', 'maker_bps': '2', 'taker_bps': '5', 'slippage_bps': '3'}
+    fee = Decimal(settings['taker_bps']) / 10000
+    slippage = Decimal(settings['slippage_bps']) / 10000
+    maker_fee = Decimal(settings['maker_bps']) / 10000 if settings['execution'] == 'maker' else None
     result = replay_portfolio('fast', {asset: (data, mark_bars, funding_rows)}, start, end,
-                              Decimal('.0005'), Decimal('.0003'), contracts={asset: contract})
-    return {**coverage, 'funding_samples': len(funding_rows), 'results': [result]}
+                              fee, slippage, contracts={asset: contract}, maker_fee=maker_fee)
+    return {**coverage, 'cost_settings': settings, 'funding_samples': len(funding_rows), 'results': [result]}
 
 
 def restore_strategy_positions(positions, assets, mode):
