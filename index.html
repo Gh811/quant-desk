@@ -1191,7 +1191,7 @@ setInterval(() => {
 main{max-width:1180px;margin:auto;padding:24px clamp(14px,4vw,40px)}
 a{color:#174f91}h1{font-size:28px;margin:14px 0 20px}h2{font-size:17px}
 form,.panel,details{background:#fff;border:1px solid #d4dfeb;border-radius:10px;padding:16px;margin-bottom:14px}
-form{display:flex;flex-wrap:wrap;gap:12px;align-items:end}label{display:grid;gap:5px;color:#435670}
+form{display:flex;flex-wrap:wrap;gap:12px;align-items:end}.backtest-assets{width:100%;border:1px solid #d4dfeb;border-radius:6px}.backtest-assets #asset{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:8px}.backtest-assets label{display:flex;align-items:center;gap:4px}label{display:grid;gap:5px;color:#435670}
 input,select,button{font:inherit;padding:7px 9px;border:1px solid #b7c8dc;border-radius:6px;background:#fff;color:#22344b}
 button{background:#1756a9;color:#fff;cursor:pointer}button:disabled{opacity:.6;cursor:wait}
 .scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;white-space:nowrap}
@@ -1204,13 +1204,13 @@ summary{cursor:pointer;font-weight:600}details .scroll{margin-top:10px}
 <a href="./">← 返回交易仪表盘</a>
 <h1>历史回测</h1>
 <form id="backtest">
-  <label>标的<select name="asset" id="asset"></select></label>
+  <fieldset class="backtest-assets"><legend>标的</legend><button type="button" id="select-assets">全选</button><div id="asset"></div></fieldset>
   <label>策略<select name="strategy"><option value="all">比较适用策略</option><option value="fast">5 分钟双向</option><option value="intraday">15 分钟双向</option><option value="swing">1 小时双向</option><option value="us_open">美股双向</option></select></label>
   <label>回测跨度<select name="days"><option value="1">最近 1 天</option><option value="7" selected>最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option><option value="60">最近 60 天</option></select></label>
   <label>事件时间（可选，北京时间）<input type="datetime-local" name="event_at"></label>
   <button type="submit">检查区间</button>
 </form>
-<p id="status" role="status">行情来源为币安实盘公开数据。终点自动取最新已收盘的 1 分钟 K 线，时间按北京时间显示。每个策略以 10,000 USDT 虚拟本金独立运行。</p>
+<p id="status" role="status">行情来源为币安实盘公开数据。终点自动取最新已收盘的 1 分钟 K 线，时间按北京时间显示。每个策略以 10,000 USDT 虚拟本金独立运行，所选标的共享资金，最多同时 5 仓。</p>
 <dialog id="confirm-range">
   <p id="range-summary"></p>
   <form method="dialog">
@@ -1284,8 +1284,8 @@ let chart;
 function render(data) {
   results.replaceChildren();
   const panel=element('div');panel.className='panel';
-  panel.append(element('h2','策略对比'),table(['策略','净盈亏 USDT','收益率','最大回撤','胜率','交易笔数','事件过滤信号'],
-    data.results.map(r=>[r.name,r.net,percent(r.roi),percent(r.drawdown),percent(r.win_rate),r.count,r.event_skips]),1));
+  panel.append(element('h2','策略对比'),table(['策略','净盈亏 USDT','收益率','最大回撤','胜率','交易笔数','峰值仓位','满仓信号','事件过滤信号'],
+    data.results.map(r=>[r.name,r.net,percent(r.roi),percent(r.drawdown),percent(r.win_rate),r.count,r.peak_positions,r.capacity_skips,r.event_skips]),1));
   panel.append(element('h2','估算权益曲线'));
   const canvas=element('canvas');canvas.setAttribute('aria-label','回测权益随时间变化');
   const legend=element('div');legend.className='legend';
@@ -1296,26 +1296,28 @@ function render(data) {
   for (const r of data.results) {
     const details=element('details');
     details.append(element('summary',r.name+' · 成交明细（'+r.count+'）'));
-    if (r.trades.length) details.append(table(['入场','出场','方向','入场价','出场价','净盈亏 USDT','退出原因'],
-      r.trades.map(t=>[formatTime(t.opened),formatTime(t.closed),t.direction>0?'多':'空',t.entry,t.exit,t.net,t.reason]),5));
+    if (r.trades.length) details.append(table(['标的','入场','出场','方向','入场价','出场价','净盈亏 USDT','退出原因'],
+      r.trades.map(t=>[t.symbol,formatTime(t.opened),formatTime(t.closed),t.direction>0?'多':'空',t.entry,t.exit,t.net,t.reason]),6));
     else details.append(element('p','区间内无成交'));
     results.append(details);
   }
 }
 const assets = 'ETH BTC XAU SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN'.split(' ');
 const usEquities = 'SNDK SOXL KORU MU NVDA QQQ GOOGL SPCX META TSLA AMZN'.split(' ');
+const assetGroup = document.getElementById('asset');
 function updateBacktestAssets() {
-  const select = form.elements.asset;
-  const equitiesOnly = form.elements.strategy.value === 'us_open';
-  const list = equitiesOnly ? usEquities : assets;
-  const previous = select.value;
-  select.replaceChildren(...list.map(symbol => {
-    const option = element('option', ({SAMSUNG:'三星电子',XAU:'黄金（XAU）'})[symbol] || symbol);
-    option.value = symbol;
-    return option;
+  const list = form.elements.strategy.value === 'us_open' ? usEquities : assets;
+  assetGroup.replaceChildren(...list.map(symbol => {
+    const label = element('label');
+    const input = element('input');
+    Object.assign(input, {type:'checkbox', name:'asset', value:symbol, checked:true});
+    label.append(input, ({SAMSUNG:'三星电子',XAU:'黄金（XAU）'})[symbol] || symbol);
+    return label;
   }));
-  select.value = list.includes(previous) ? previous : equitiesOnly ? 'QQQ' : 'BTC';
 }
+document.getElementById('select-assets').onclick = () => {
+  for (const input of assetGroup.querySelectorAll('input')) input.checked = true;
+};
 form.elements.strategy.addEventListener('change', updateBacktestAssets);
 updateBacktestAssets();
 window.addEventListener('resize',()=>chart?.());
@@ -1325,13 +1327,14 @@ form.onsubmit=async event=>{
   status.textContent='正在检查历史覆盖和指标预热数据…';
   try {
     const params = new URLSearchParams(new FormData(form));
-    const checked = await fetch('./backtest/coverage?'+params,{signal:AbortSignal.timeout(20000)});
+    if (!params.has('asset')) throw Error('请选择至少一个标的');
+    const checked = await fetch('./backtest/coverage?'+params,{signal:AbortSignal.timeout(120000)});
     const range = await checked.json();
     if (!checked.ok) throw Error(range.error || 'HTTP '+checked.status);
     const dialog = document.getElementById('confirm-range');
     const limited = range.start > range.requested_start;
     document.getElementById('range-summary').textContent =
-      params.get('asset')+'USDT · '+range.strategies.join(' / ')+'。'+
+      range.assets.join('、')+' · '+range.strategies.join(' / ')+'。'+
       (limited ? '历史或预热数据不足，请求起点 '+formatTime(range.requested_start)+'，实际可回测区间缩短为 ' : '回测区间为 ')+
       formatTime(range.start)+' 至 '+formatTime(range.end)+'（北京时间）。';
     dialog.returnValue = 'cancel';
@@ -1344,11 +1347,11 @@ form.onsubmit=async event=>{
     params.set('start_at', range.start);
     params.set('end_at', range.end);
     status.textContent='正在读取历史数据并回测，30 至 60 天可能需要几分钟…';
-    const response=await fetch('./backtest/results?'+params,{signal:AbortSignal.timeout(300000)});
+    const response=await fetch('./backtest/results?'+params,{signal:AbortSignal.timeout(900000)});
     const data=await response.json();
     if (!response.ok) throw Error(data.error || 'HTTP '+response.status);
     render(data);
-    status.textContent=data.asset+'USDT · 币安实盘公开行情 · '+formatTime(data.start)+' 至 '+formatTime(data.end)+
+    status.textContent=data.assets.join('、')+' · 币安实盘公开行情 · '+formatTime(data.start)+' 至 '+formatTime(data.end)+
       '（北京时间） · 资金费记录 '+data.funding_samples+' 条';
   } catch(error) {
     status.textContent='回测失败：'+error.message;
