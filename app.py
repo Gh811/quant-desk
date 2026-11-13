@@ -11,6 +11,7 @@ import sys
 import sqlite3
 from contextlib import closing, contextmanager
 import uuid
+import zlib
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 import statistics
 import webbrowser
@@ -1352,7 +1353,9 @@ def settled_fast_samples(orders, now):
 
 
 
-BACKTEST_LOCK = threading.Lock()
+BACKTEST_WORKERS = ThreadPoolExecutor(max_workers=4)
+BACKTEST_SUBMIT_LOCK = threading.Lock()
+BACKTEST_JOB_LIMIT = 500
 BACKTEST_FEEDS = {'live': ('Binance', '币安实盘行情'), 'demo': (DEMO_VENUE, '币安模拟盘行情')}
 backtest_request_lock = threading.Lock()
 backtest_next_request = {}
@@ -1398,23 +1401,43 @@ def historical_bars(venue, symbol, interval, start, end, *, mark=False):
     first = start // step * step
     path = '/fapi/v1/markPriceKlines' if mark else '/fapi/v1/klines'
     batch_size = 499
+    width = batch_size * step
     def fetch_chunk(cursor):
-        batch_end = min(end, cursor + batch_size*step)
+        batch_end = min(end // step * step, cursor + width)
+        key = (venue, symbol, path, interval, cursor)
+        if batch_end == cursor + width:
+            with backtest_database() as database:
+                cached = database.execute("""
+                    SELECT bars FROM candle_cache WHERE venue=? AND symbol=? AND path=? AND frame=? AND start=?
+                """, key).fetchone()
+            if cached:
+                return json.loads(zlib.decompress(cached[0]))
         for attempt in range(2):
             try:
-                return backtest_request(venue, path, symbol=symbol, interval=interval,
-                                        startTime=cursor, endTime=batch_end-1, limit=batch_size)
+                batch = backtest_request(venue, path, symbol=symbol, interval=interval,
+                                         startTime=cursor, endTime=batch_end-1, limit=batch_size)
+                break
             except HTTPError:
                 raise
             except (OSError, ValueError):
                 if attempt:
                     raise
+        if batch_end == cursor + width and len(batch) == batch_size and all(
+                int(row[0]) == cursor + index*step and int(row[6]) == cursor + (index+1)*step - 1
+                for index, row in enumerate(batch)):
+            with backtest_database() as database:
+                database.execute("INSERT OR REPLACE INTO candle_cache VALUES (?, ?, ?, ?, ?, ?)",
+                                 (*key, zlib.compress(json.dumps(batch).encode(), 1)))
+        return batch
 
     rows = []
     with ThreadPoolExecutor(max_workers=4) as pool:
-        for batch in pool.map(fetch_chunk, range(first, end-step+1, batch_size*step)):
+        for batch in pool.map(fetch_chunk, range(first // width * width, end-step+1, width)):
             for raw in batch:
                 stamp = int(raw[0])
+                if stamp < first:
+                    continue
+
                 if stamp + step > end:
                     break
                 if stamp != first + len(rows)*step or int(raw[6]) != stamp + step - 1:
@@ -1459,7 +1482,7 @@ def backtest_entry_signal(symbol, mode, now, read, rules):
     return candle, score, volatility, reason, context
 
 
-def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *, rules='current'):
+def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *, rules='current', contracts=None):
     starts = {asset: {frame: series[0][0][0] for frame, series in data.items()}
               for asset, (data, _, _) in markets.items()}
     funding = {asset: {stamp: (rate, price) for stamp, rate, price in rows}
@@ -1527,11 +1550,13 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 if (direction*(opening/context['close']-1) > volatility/2 or
                         direction*(opening/context['boundary']-1) < (0 if context['stressed'] else -volatility/4)):
                     continue
-                stop = entry_stop_fraction(asset, mode, volatility)
+                contract = (contracts or {}).get(asset)
+                stop = entry_stop_fraction(asset, mode, volatility, us_equity=equity_kind(asset+'USDT', contract) == 'us')
                 if mode == 'fast':
                     try:
                         stop = fast_structure_stop(entry, direction, context['extreme'], volatility, stop,
-                                                   'PERPETUAL' if asset in FAST_CRYPTO_ASSETS else 'TRADIFI_PERPETUAL')
+                                                   contract['contractType'] if contract else
+                                                   ('PERPETUAL' if asset in FAST_CRYPTO_ASSETS else 'TRADIFI_PERPETUAL'))
                     except ValueError:
                         continue
                 cost = 2*(fee+slippage)
@@ -1662,14 +1687,11 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
 
 def backtest_range(params):
     assets = sorted(set(params.get('asset', ['BTC'])))
-    mode = params.get('strategy', ['all'])[0]
-    if not assets or not set(assets) <= set(ASSETS) or mode not in {*STRATEGY_NAMES, 'all'}:
-        raise ValueError('标的或策略无效')
-    if mode == 'us_open' and not set(assets) <= US_EQUITY_ASSETS:
-        raise ValueError('美股双向策略仅用于美股类标的')
-    modes = ([key for key in STRATEGY_NAMES if key != 'us_open' or set(assets) & US_EQUITY_ASSETS]
-             if mode == 'all' else [mode])
-    intervals = sorted({frame for key in modes for frame in SIGNAL_TIMEFRAMES[key]})
+    if not assets or len(assets) > 250 or any(not asset or len(asset) > 24 or not asset.isascii()
+                                             or not asset.isalnum() or asset != asset.upper() for asset in assets):
+        raise ValueError('标的代码无效')
+    modes = ['fast']
+    intervals = SIGNAL_TIMEFRAMES['fast']
     now = time.time_ns() // 1_000_000 // 60000 * 60000
     if 'start_at' in params:
         start, end = (int(params[key][0]) for key in ('start_at', 'end_at'))
@@ -1713,27 +1735,103 @@ def backtest_coverage(params):
                 strategies=[STRATEGY_NAMES[key] for key in modes])
 
 
-def run_backtest(params):
-    assets, modes, intervals, start, end = backtest_range(params)
-    variant = params.get('rules', ['current'])[0]
-    if variant in {'baseline', 'cost_control', 'fast_trend'}:
-        variant = 'current'
-    if variant not in {*BACKTEST_RULES, 'compare'}:
-        raise ValueError('回测规则无效')
-    variants = list(BACKTEST_RULES) if variant == 'compare' else [variant]
-    venue, source_label = backtest_feed(params)
-    event_value = params.get('event_at', [''])[0]
-    event_at = int(datetime.fromisoformat(event_value+'+08:00').timestamp()*1000) if event_value else None
-    if event_at is not None and not start <= event_at < end:
-        raise ValueError('事件时间须在回测区间内')
-    def load(asset):
-        symbol = asset+'USDT'
-        data = {frame:historical_bars(venue, symbol, frame, start-50*TIMEFRAME_MINUTES[frame]*60000, end)
-                for frame in sorted(intervals)}
-        data['1m'] = [(bar, None) for bar, _ in historical_bars(venue, symbol, '1m', start, end)]
-        marks = [(bar, None) for bar, _ in historical_bars(venue, symbol, '1m', start, end, mark=True)]
-        rows = []
-        cursor = start
+@contextmanager
+def backtest_database():
+    with closing(sqlite3.connect(journal_path().with_name('backtests.sqlite3'), timeout=15)) as database, database:
+        database.execute("""
+            CREATE TABLE IF NOT EXISTS backtest_jobs (
+                id TEXT PRIMARY KEY, asset TEXT NOT NULL, source TEXT NOT NULL,
+                start INTEGER NOT NULL, end INTEGER NOT NULL, created INTEGER NOT NULL,
+                state TEXT NOT NULL, detail TEXT, result BLOB
+            )
+        """)
+        database.execute("CREATE INDEX IF NOT EXISTS backtest_recent ON backtest_jobs(created DESC)")
+        database.execute("""
+            CREATE TABLE IF NOT EXISTS candle_cache (
+                venue TEXT, symbol TEXT, path TEXT, frame TEXT, start INTEGER, bars BLOB,
+                PRIMARY KEY (venue, symbol, path, frame, start)
+            )
+        """)
+        yield database
+
+
+def submit_backtests(params):
+    assets, _, _, start, end = backtest_range(params)
+    backtest_feed(params)
+    source = params.get('source', ['live'])[0]
+    jobs = []
+    with BACKTEST_SUBMIT_LOCK:
+        with backtest_database() as database:
+            active = database.execute("""
+                SELECT id, asset, source, start, end FROM backtest_jobs
+                WHERE state IN ('queued', 'running')
+            """).fetchall()
+            existing = {(asset, feed, begin, finish): job for job, asset, feed, begin, finish in active}
+            new = [asset for asset in assets if (asset, source, start, end) not in existing]
+            if len(active) + len(new) > BACKTEST_JOB_LIMIT:
+                raise ValueError('待运行任务太多，请等部分标的完成后再提交')
+            created = time.time_ns() // 1_000_000
+            for asset in new:
+                job = uuid.uuid4().hex
+                database.execute("INSERT INTO backtest_jobs VALUES (?, ?, ?, ?, ?, ?, 'queued', NULL, NULL)",
+                                 (job, asset, source, start, end, created))
+                existing[asset, source, start, end] = job
+                jobs.append((job, asset))
+        for job, asset in jobs:
+            BACKTEST_WORKERS.submit(run_backtest_job, job, asset, source, start, end)
+    return {'jobs': [existing[asset, source, start, end] for asset in assets]}
+
+
+def run_backtest_job(job, asset, source, start, end):
+    def update(state, detail=None, result=None):
+        with backtest_database() as database:
+            database.execute("UPDATE backtest_jobs SET state=?, detail=?, result=? WHERE id=?",
+                             (state, detail, result, job))
+
+    try:
+        update('running', '检查行情覆盖')
+        params = {'asset': [asset], 'source': [source], 'start_at': [str(start)], 'end_at': [str(end)]}
+        result = run_backtest(params, lambda detail: update('running', detail))
+        update('done', result=zlib.compress(json.dumps(result, allow_nan=False).encode()))
+    except Exception as error:
+        update('failed', str(error))
+
+
+def backtest_jobs(params):
+    job = params.get('id', [None])[0]
+    with backtest_database() as database:
+        if job is not None:
+            row = database.execute("SELECT result FROM backtest_jobs WHERE id=? AND state='done'", (job,)).fetchone()
+            if not row:
+                raise ValueError('该回测结果尚不可用')
+            return json.loads(zlib.decompress(row[0]))
+        filters, values = [], []
+        for column in ('source', 'asset'):
+            if params.get(column):
+                filters.append(column + '=?')
+                values.append(params[column][0])
+        where = ' WHERE ' + ' AND '.join(filters) if filters else ''
+        page = max(1, int(params.get('page', ['1'])[0]))
+        fields = ('id', 'asset', 'source', 'start', 'end', 'created', 'state', 'detail')
+        total = database.execute('SELECT COUNT(*) FROM backtest_jobs' + where, values).fetchone()[0]
+        page = min(page, max(1, (total + 24) // 25))
+        rows = database.execute('SELECT ' + ','.join(fields) + ' FROM backtest_jobs' + where +
+                                ' ORDER BY created DESC, rowid DESC LIMIT 25 OFFSET ?', (*values, (page-1)*25))
+        return dict(jobs=[dict(zip(fields, row)) for row in rows], total=total, page=page)
+
+
+def run_backtest(params, progress):
+    coverage = backtest_coverage(params)
+    asset, = coverage['assets']
+    venue, start, end = (coverage[key] for key in ('venue', 'start', 'end'))
+    symbol = asset + 'USDT'
+    contract = futures_catalog(venue).get(symbol)
+    if not tradable_future(contract):
+        raise ValueError(f'{coverage["source_label"]}未确认支持 {symbol}')
+    progress('读取历史 K 线与资金费')
+
+    def load_funding():
+        rows, cursor = [], start
         while cursor < end:
             batch = backtest_request(venue, '/fapi/v1/fundingRate', symbol=symbol,
                                      startTime=cursor, endTime=end-1, limit=1000)
@@ -1744,17 +1842,22 @@ def run_backtest(params):
             if next_cursor <= cursor:
                 raise ValueError('资金费分页时间无效')
             cursor = next_cursor
-        funding = [(int(row['fundingTime'])//60000*60000, Decimal(row['fundingRate']), Decimal(row['markPrice']))
-                   for row in rows]
-        return data, marks, funding
+        return [(int(row['fundingTime'])//60000*60000, Decimal(row['fundingRate']), Decimal(row['markPrice']))
+                for row in rows]
 
-    markets = {asset: load(asset) for asset in assets}
-    fee, slippage = Decimal('.0005'), Decimal('.0003')
-    return dict(assets=assets, venue=venue, source_label=source_label, start=start, end=end,
-                funding_samples=sum(len(funding) for _, _, funding in markets.values()),
-                results=[replay_portfolio(key, markets, start, end, fee, slippage, event_at, rules=rules)
-                         for key in modes for rules in variants if not (
-                             key == 'swing' and rules == 'retest' and variant == 'compare')])
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        trades = pool.submit(historical_bars, venue, symbol, '1m', start, end)
+        marks = pool.submit(historical_bars, venue, symbol, '1m', start, end, mark=True)
+        funding = pool.submit(load_funding)
+        data = {frame:historical_bars(venue, symbol, frame, start-50*TIMEFRAME_MINUTES[frame]*60000, end)
+                for frame in SIGNAL_TIMEFRAMES['fast']}
+        data['1m'] = [(bar, None) for bar, _ in trades.result()]
+        mark_bars = [(bar, None) for bar, _ in marks.result()]
+        funding_rows = funding.result()
+    progress('运行 5 分钟策略')
+    result = replay_portfolio('fast', {asset: (data, mark_bars, funding_rows)}, start, end,
+                              Decimal('.0005'), Decimal('.0003'), contracts={asset: contract})
+    return {**coverage, 'funding_samples': len(funding_rows), 'results': [result]}
 
 
 def restore_strategy_positions(positions, assets, mode):
@@ -2860,6 +2963,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         parsed = urlsplit(self.path)
         strategy = self.server.strategy
+        if parsed.path == '/backtest/jobs':
+            try:
+                submitted = submit_backtests(parse_qs(parsed.query))
+            except (ValueError, KeyError, OSError, sqlite3.Error) as error:
+                self.send(400, 'application/json', json.dumps({'error': str(error)}).encode())
+                return
+            self.send(202, 'application/json', json.dumps(submitted).encode())
+            return
         if parsed.path in {'/shadow/start', '/shadow/pause'}:
             try:
                 self.server.shadow.configure(parsed.path == '/shadow/start')
@@ -2965,19 +3076,8 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == '/version':
                 self.send(200, 'application/json', json.dumps(dict(commit=deployed_commit())).encode())
                 return
-            if parsed.path == '/backtest/coverage':
-                coverage = backtest_coverage(parse_qs(parsed.query))
-                self.send(200, 'application/json', json.dumps(coverage).encode())
-                return
-            if parsed.path == '/backtest/results':
-                if not BACKTEST_LOCK.acquire(blocking=False):
-                    self.send(429, 'application/json', json.dumps({'error':'已有回测正在运行'}).encode())
-                    return
-                try:
-                    result = run_backtest(parse_qs(parsed.query))
-                finally:
-                    BACKTEST_LOCK.release()
-                self.send(200, 'application/json', json.dumps(result, allow_nan=False).encode())
+            if parsed.path == '/backtest/jobs':
+                self.send(200, 'application/json', json.dumps(backtest_jobs(parse_qs(parsed.query))).encode())
                 return
             if parsed.path == '/account/binance-demo':
                 self.send(200, 'application/json', json.dumps(demo_account()).encode())
@@ -3819,6 +3919,9 @@ if __name__ == '__main__':
         except ValueError as error:
             sys.exit(str(error))
         sys.exit(0)
+    with backtest_database() as database:
+        database.execute("""UPDATE backtest_jobs SET state='failed', detail='服务重启，请重新提交'
+                            WHERE state IN ('queued', 'running')""")
     server = ThreadingHTTPServer(('127.0.0.1',8765),Handler)
     server.strategy = DemoStrategy()
     server.shadow = LiveMarketSimulation(journal_path().with_name('live-market-mirror.json'))
