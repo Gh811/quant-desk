@@ -80,8 +80,21 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 #pool-search{padding:7px 9px;border:1px solid #bdcadd;border-radius:5px;max-width:100%}
 #assets label[data-unavailable=true]{color:#52647a}
 .asset-choice{display:flex;align-items:center;justify-content:space-between;gap:6px}
-.asset-choice label{margin:4px 0}
-.asset-choice button{width:auto;padding:2px 5px;font-size:11px;color:#52647a;background:transparent;border:0}
+.asset-choice label{display:flex;align-items:center;gap:5px;margin:4px 0;min-width:0;white-space:nowrap}
+.asset-choice input{flex:none;margin:0}
+.asset-choice label span{overflow:hidden;text-overflow:ellipsis}
+.asset-choice button{flex:none;width:auto;padding:2px 5px;font-size:11px;white-space:nowrap}
+.watch-remove{color:#9e3042;background:#f7e2e6;border-color:#e8b8c1}
+#pool-scroll{--pool-row-height:54px;--pool-heading-height:34px;min-height:calc(var(--pool-heading-height) + var(--pool-row-height) * var(--pool-page-size,9) + 8px)}
+#pool-scroll th{height:var(--pool-heading-height)}
+#pool-scroll td{height:var(--pool-row-height)}
+#pool-scroll th,#pool-scroll td{white-space:nowrap}
+#pool-scroll table{table-layout:fixed}
+#pool-scroll th:nth-child(1){width:17%}
+#pool-scroll th:nth-child(2){width:31%}
+#pool-scroll th:nth-child(3),#pool-scroll th:nth-child(4){width:16%}
+#pool-pages{flex-wrap:nowrap;overflow-x:auto;padding:2px}
+#pool-pages>*{flex:none}
 </style><main><aside><div class="desk-brand"><strong>Quant Desk</strong><small>币安合约模拟盘</small>
 <small id="desk-version" class="desk-version" hidden>GitHub <a target="_blank" rel="noopener"></a></small></div>
 <p id="strategy-status" role="status">正在读取后台策略状态…</p>
@@ -207,7 +220,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <div class="research-header"><div><h2 id="pool-title">实盘美股候选池</h2><p id="pool-status" role="status">正在核对币安合约目录…</p></div>
   <div><input id="pool-search" type="search" aria-label="搜索实盘候选池" placeholder="搜索代码">
   <button id="pool-refresh" class="compact-button" type="button">刷新目录</button></div></div>
-  <div class="research-scroll"><table><thead><tr><th>合约</th><th>类别</th><th>实盘目录</th><th>模拟盘</th><th>观察列表</th></tr></thead><tbody id="pool-rows"></tbody></table></div>
+  <div class="research-scroll" id="pool-scroll"><table><thead><tr><th>合约</th><th>类别</th><th>实盘目录</th><th>模拟盘</th><th>观察列表</th></tr></thead><tbody id="pool-rows"></tbody></table></div>
   <nav id="pool-pages" class="pagination" aria-label="候选池分页" hidden></nav>
 </div>
 <div class="market-research" aria-labelledby="opportunity-title">
@@ -364,8 +377,10 @@ function addAssetCheckbox(asset, checked) {
   choice.className = 'asset-choice';
   const label = document.createElement('label');
   const checkbox = Object.assign(document.createElement('input'), {type:'checkbox', name:'asset', value:asset, checked, disabled:true});
-  label.append(checkbox, ' '+name(asset));
-  const remove = document.createElement('button');
+  const assetName = orderElement('span', '', name(asset));
+  assetName.title = name(asset);
+  label.append(checkbox, assetName);
+  const remove = orderElement('button', 'watch-remove');
   Object.assign(remove, {type:'button', textContent:'移出', disabled:true});
   remove.setAttribute('aria-label', '移出 ' + name(asset));
   remove.addEventListener('click', () => setAssetWatch(asset, false));
@@ -438,6 +453,7 @@ function orderElement(tag, className, text) {
   return Object.assign(document.createElement(tag), {className, textContent:text || ''});
 }
 const pageSize = 9;
+el('pool-scroll').style.setProperty('--pool-page-size', pageSize);
 function pageItems(items, navigationId, render) {
   const navigation = el(navigationId);
   const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
@@ -482,7 +498,7 @@ function renderPagination(navigationId, page, pageCount, selectPage) {
     }
     navigation.replaceChildren(...buttons);
     navigation.dataset.pages = pagesKey;
-    if (focused) navigation.querySelector('button[data-page="' + page + '"]')?.focus();
+    if (focused) navigation.querySelector('button[data-page="' + page + '"]')?.focus({preventScroll:true});
   }
   const current = navigation.querySelector('button[data-page="' + page + '"]');
   const previous = navigation.querySelector('[aria-current]');
@@ -1150,6 +1166,7 @@ function renderPool() {
     const builtIn = defaultAssets.includes(market.asset);
     const watched = !removedAssets.has(market.asset) && (builtIn || poolWatch.has(market.asset));
     const button = orderElement('button', 'compact-button', watched ? '移出列表' : '加入列表');
+    button.classList.toggle('watch-remove', watched);
     button.type = 'button';
     button.disabled = watched && (!strategyState || (strategyState.running && strategyState.assets.includes(market.asset)));
     button.addEventListener('click', () => setAssetWatch(market.asset, !watched));
