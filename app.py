@@ -8,6 +8,7 @@ from datetime import datetime
 from collections import Counter
 import threading
 import sys
+import ssl
 import subprocess
 import sqlite3
 from contextlib import closing, contextmanager
@@ -1660,6 +1661,10 @@ def backtest_feed(params):
     return BACKTEST_FEEDS[source]
 
 
+class BacktestCertificateError(ValueError):
+    pass
+
+
 def backtest_request(venue, endpoint, **params):
     for attempt in range(2):
         while True:
@@ -1686,6 +1691,18 @@ def backtest_request(venue, endpoint, **params):
                 backtest_next_request[venue] = max(backtest_next_request[venue], time.monotonic()+retry_after)
             if attempt or retry_after > 30:
                 raise ValueError(f'{venue} 行情接口限流（429），请稍后重试或缩短回测跨度') from None
+
+        except ValueError as error:
+            cause = error.__cause__
+            if not (isinstance(cause, URLError) and isinstance(cause.reason, ssl.SSLCertVerificationError)):
+                raise
+            batch = ', '.join(f'{key}={params[key]}' for key in
+                              ('symbol', 'interval', 'startTime', 'endTime', 'limit') if key in params)
+            detail = f'{error} · {batch} · TLS 校验第 {attempt+1}/2 次失败'
+            print(detail, file=sys.stderr, flush=True)
+            if attempt:
+                raise BacktestCertificateError(detail) from error
+            time.sleep(1)
 
 
 class MinuteBars:
@@ -1729,7 +1746,7 @@ def historical_bars(venue, symbol, interval, start, end, *, mark=False, compact=
                 batch = backtest_request(venue, path, symbol=symbol, interval=interval,
                                          startTime=cursor, endTime=batch_end-1, limit=batch_size)
                 break
-            except HTTPError:
+            except (HTTPError, BacktestCertificateError):
                 raise
             except (OSError, ValueError):
                 if attempt:
