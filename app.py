@@ -730,6 +730,9 @@ STRATEGY_MAX_ATR = {'fast': Decimal('.008'), 'intraday': Decimal('.012'), 'swing
                     'us_open': Decimal('.015')}
 ENTRY_EQUITY_RISK = {'fast': Decimal('.005'), 'intraday': Decimal('.0065'), 'swing': Decimal('.0075'),
                      'us_open': Decimal('.004')}
+SHORT_COST_CAP = Decimal('.30')
+SHORT_RISK_MULTIPLIER = Decimal('.5')
+SHORT_REENTRY_COOLDOWN_BARS = 3
 
 
 def entry_stop_fraction(asset, mode, volatility):
@@ -931,12 +934,13 @@ BACKTEST_MAX_POSITIONS = 5
 FAST_CORRELATED_ASSETS = {'BTC', 'ETH', 'SOL'}
 
 
-BACKTEST_RULES = {'baseline': '当前规则', 'confirmation': '严格确认', 'retest': '严格确认＋回踩'}
+BACKTEST_RULES = {'baseline': '原版', 'confirmation': '严格确认', 'retest': '严格确认＋回踩',
+                  'cost_control': '成本与风险控制'}
 
 
 def backtest_entry_signal(symbol, mode, now, read, rules):
     candle, score, volatility, reason, context = evaluate_entry_signal(symbol, mode, now, read)
-    if rules == 'baseline' or score is None:
+    if rules in {'baseline', 'cost_control'} or score is None:
         return candle, score, volatility, reason, context
     if rules == 'retest' and mode != 'swing' and reason in {'突破做多', '跌破做空'}:
         return candle, None, volatility, '等待回踩或反抽', {}
@@ -982,6 +986,10 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
     event_skips = capacity_skips = peak_positions = 0
     curve = [dict(time=start, equity=float(initial))]
     interval = STRATEGY_INTERVALS[mode]
+    cost_control = rules == 'cost_control' and mode != 'swing'
+    cost_cap = SHORT_COST_CAP if cost_control else Decimal('.75')
+    equity_risk = ENTRY_EQUITY_RISK[mode] * (SHORT_RISK_MULTIPLIER if cost_control else 1)
+    reentry_at = {}
     max_hours = {'intraday': 4, 'swing': 48, 'us_open': 1.5}.get(mode)
     assets = sorted(asset for asset in markets if mode != 'us_open' or asset in US_EQUITY_ASSETS)
 
@@ -989,7 +997,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
         if stamp % interval == 0 and equity > 0:
             candidates = []
             for asset in assets:
-                if asset in positions:
+                if asset in positions or stamp < reentry_at.get(asset, 0):
                     continue
                 _, score, volatility, reason, context = backtest_entry_signal(
                     asset+'USDT', mode, stamp, lambda frame, cutoff, required: read(asset, frame, cutoff, required), rules)
@@ -1021,12 +1029,12 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                     except ValueError:
                         continue
                 cost = 2*(fee+slippage)
-                if cost > stop*Decimal('.75'):
+                if cost > stop*cost_cap:
                     continue
                 leverage = 5 if mode == 'fast' else min(5 if mode == 'swing' else 3, max(1, int(Decimal('.05')/stop)))
                 margin_budget = free_margin*Decimal('.95')/(BACKTEST_MAX_POSITIONS-len(positions))
                 notional = min(equity*(3 if mode == 'swing' else 1), leverage*margin_budget,
-                               equity*ENTRY_EQUITY_RISK[mode]/(stop+cost))
+                               equity*equity_risk/(stop+cost))
                 if notional <= 0:
                     continue
                 margin = notional/leverage
@@ -1071,6 +1079,8 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 balance += net
                 trades.append(dict(symbol=asset+'USDT', opened=position['opened'], closed=stamp, entry=float(entry), exit=float(price),
                                    direction=direction, net=float(net), reason=reason, signal=position['signal']))
+                if cost_control:
+                    reentry_at[asset] = stamp + SHORT_REENTRY_COOLDOWN_BARS * interval
                 del positions[asset]
             else:
                 close = Decimal(str(mark_close))
@@ -1087,7 +1097,8 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
         drawdown = max(drawdown, (high_water-equity)/high_water)
         if stamp % HOUR == 0 or stamp+60000 >= end:
             curve.append(dict(time=stamp+60000, equity=float(equity)))
-    name = STRATEGY_NAMES[mode] if rules == 'baseline' else f'{STRATEGY_NAMES[mode]} · {BACKTEST_RULES[rules]}'
+    label = 'baseline' if rules == 'cost_control' and mode == 'swing' else rules
+    name = STRATEGY_NAMES[mode] if label == 'baseline' else f'{STRATEGY_NAMES[mode]} · {BACKTEST_RULES[label]}'
     net = balance-initial
     return dict(mode=mode, name=name, initial=float(initial), net=float(net),
                 gross=float(net+fees_paid+estimated_slippage-funding_net), fees=float(fees_paid),
@@ -1186,8 +1197,8 @@ def run_backtest(params):
     return dict(assets=assets, venue=venue, start=start, end=end,
                 funding_samples=sum(len(funding) for _, _, funding in markets.values()),
                 results=[replay_portfolio(key, markets, start, end, fee, slippage, event_at, rules=rules)
-                         for key in modes for rules in variants if not (key == 'swing' and rules == 'retest'
-                                                                      and variant == 'compare')])
+                         for key in modes for rules in variants if not (
+                             key == 'swing' and rules in {'retest', 'cost_control'} and variant == 'compare')])
 
 
 def restore_strategy_positions(positions, assets, mode):
@@ -1306,6 +1317,7 @@ class DemoStrategy:
         self.wake = threading.Event()
         self.status = '未启动'
         self.mode = 'swing'
+        self.cost_control = False
         self.fixed_notional = None
         self.assets = []
         self.checks = {}
@@ -1339,8 +1351,12 @@ class DemoStrategy:
             finally:
                 self.draining = False
 
-    def run(self, assets, mode, fixed_notional=None):
+    def run(self, assets, mode, fixed_notional=None, *, cost_control=False):
         short_term = mode != 'swing'
+        cost_cap = SHORT_COST_CAP if cost_control else Decimal('.75')
+        equity_risk = ENTRY_EQUITY_RISK[mode] * (SHORT_RISK_MULTIPLIER if cost_control else 1)
+        cooldown_ms = SHORT_REENTRY_COOLDOWN_BARS * STRATEGY_INTERVALS[mode]
+        reentry_at = {}
         max_positions = self.FAST_MAX_POSITIONS if mode == 'fast' else self.MAX_POSITIONS
         max_hold_hours = {'intraday': 4, 'swing': 48, 'us_open': 1.5}.get(mode)
         holdings = {}
@@ -1357,7 +1373,8 @@ class DemoStrategy:
         last_scan_log = None
         next_entry_scan = 0
         try:
-            record_runtime('收到启动请求', mode=mode, detail='、'.join(sorted(assets)))
+            entry_rules = BACKTEST_RULES['cost_control' if cost_control else 'baseline']
+            record_runtime('收到启动请求', mode=mode, detail=f'{entry_rules} · {"、".join(sorted(assets))}')
             while not self.stop.is_set():
                 self.wake.clear()
                 if recovering:
@@ -1387,6 +1404,8 @@ class DemoStrategy:
                 closed_symbols = holdings.keys() - positions.keys()
                 for symbol in closed_symbols:
                     amount, opened, leverage, _, opening_id = holdings.pop(symbol)
+                    if cost_control:
+                        reentry_at[symbol] = demo_now_ms() + cooldown_ms
                     peaks.pop(symbol, None)
                     ticks.pop(symbol, None)
                     protection_errors.pop(symbol, None)
@@ -1503,6 +1522,8 @@ class DemoStrategy:
                             self.checks = {**self.checks, symbol[:-4]: f'平仓委托待核对 · {order["status"]}'}
                             continue
                         del holdings[symbol]
+                        if cost_control:
+                            reentry_at[symbol] = demo_now_ms() + cooldown_ms
                         del peaks[symbol]
                         ticks.pop(symbol, None)
                         protection_errors.pop(symbol, None)
@@ -1554,6 +1575,7 @@ class DemoStrategy:
                             prepare_at_start = False
                             self.status = '正在检查行情与入场信号'
                         jobs = {}
+                        scan_at = demo_now_ms()
                         for asset in sorted(assets):
                             symbol = asset + 'USDT'
                             item = listed.get(symbol)
@@ -1567,6 +1589,9 @@ class DemoStrategy:
                                                      else f'委托待核对 · {pending_symbols[symbol]}')
                             elif symbol in holdings:
                                 checks[asset] = self.checks.get(asset, '持仓监控中')
+                            elif scan_at < reentry_at.get(symbol, 0):
+                                remaining = (reentry_at[symbol] - scan_at + 999) // 1000
+                                checks[asset] = f'平仓后冷却 · 剩余 {remaining} 秒'
                             elif not item:
                                 checks[asset] = '模拟盘目录未匹配'
                             elif (item['status'] != 'TRADING' or item['contractType'] not in
@@ -1645,9 +1670,9 @@ class DemoStrategy:
                                 checks[symbol[:-4]] = f'跳过 · {error}'
                                 self.checks = checks.copy()
                                 continue
-                        if cost > stop_loss * Decimal('.75'):
+                        if cost > stop_loss * cost_cap:
                             checks[symbol[:-4]] = (f'跳过 · 点差与交易成本过高：预估 {cost:.3%}'
-                                                   f' · 上限 {stop_loss * Decimal(".75"):.3%}')
+                                                   f' · 上限 {stop_loss * cost_cap:.3%}')
                             self.checks = checks.copy()
                             continue
                         leverage_cap = 3 if short_term else 5
@@ -1655,7 +1680,7 @@ class DemoStrategy:
                                            else min(leverage_cap, max(1, int(Decimal('.05') / stop_loss))))
                         margin_budget = free_margin * Decimal('.95') / (max_positions - len(occupied))
                         budget = max(Decimal(0), min((equity if short_term else 3 * equity), leverage_target * margin_budget))
-                        risk_budget = equity * ENTRY_EQUITY_RISK[mode] / (stop_loss + cost)
+                        risk_budget = equity * equity_risk / (stop_loss + cost)
                         budget = min(budget, risk_budget)
                         if fixed_notional is not None:
                             budget = min(budget, fixed_notional)
@@ -2106,6 +2131,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if mode == 'us_open':
                 assets &= US_EQUITY_ASSETS
+            cost_control = mode != 'swing' and params.get('entry_rules', ['baseline'])[0] == 'cost_control'
             with strategy.control:
                 if not assets or strategy.draining or strategy.switch_blocked or not strategy.lock.acquire(blocking=False):
                     self.send(409, 'application/json', '{"error":"请选择标的，并等当前策略停止且币安确认空仓、无挂单"}'.encode())
@@ -2114,13 +2140,15 @@ class Handler(BaseHTTPRequestHandler):
                 strategy.entries_paused.clear()
                 strategy.wake.clear()
                 strategy.mode = mode
+                strategy.cost_control = cost_control
                 strategy.fixed_notional = fixed_notional
                 strategy.assets = sorted(assets)
                 strategy.checks = {}
                 strategy.checked_at = None
                 strategy.scan_ms = None
                 strategy.status = '正在核对模拟账户'
-                threading.Thread(target=strategy.run, args=(assets, mode, fixed_notional), daemon=True).start()
+                threading.Thread(target=strategy.run, args=(assets, mode, fixed_notional),
+                                 kwargs={'cost_control': cost_control}, daemon=True).start()
         else:
             self.send(404, 'text/plain', b'Not found')
             return
@@ -2170,6 +2198,7 @@ class Handler(BaseHTTPRequestHandler):
                                                                     running=self.server.strategy.lock.locked() or self.server.strategy.draining,
                                                                     draining=self.server.strategy.draining, assets=self.server.strategy.assets,
                                                                     entries_paused=self.server.strategy.entries_paused.is_set(),
+                                                                    cost_control=self.server.strategy.cost_control,
                                                                     fixed_notional=(str(self.server.strategy.fixed_notional)
                                                                                     if self.server.strategy.fixed_notional is not None else None),
                                                                     switch_blocked=self.server.strategy.switch_blocked,
