@@ -905,6 +905,7 @@ let lastProgressAt = Date.now();
 let progressKey = '';
 let strategyState = null;
 let strategyAction = null;
+let strategyStartError = '';
 let strategyStatusFailed = false;
 let marketCatalog = null;
 let marketByAsset = new Map();
@@ -1096,8 +1097,9 @@ async function refreshStrategyStatus() {
       }
       renderMarketRows();
     }
+    if (state.running) strategyStartError = '';
     el('strategy-status').textContent = state.running
-      ? strategyNames[state.mode] + ' · ' + state.status : state.status;
+      ? strategyNames[state.mode] + ' · ' + state.status : strategyStartError || state.status;
   } catch (error) {
     strategyStatusFailed = true;
     el('strategy-status').textContent = '无法读取策略状态：' + error.message;
@@ -1122,14 +1124,19 @@ for (const control of ['start','stop','entries']) {
         params.set('notional', strategyNotional.value);
       }
     }
+    strategyStartError = '';
     strategyAction = action;
     renderStrategyControls();
     let actionError;
     try {
       const response = await fetch('./strategy/' + action + '?' + params, {
-        method:'POST', headers:{'X-Quant-Demo':'strategy'}, signal:AbortSignal.timeout(6000)
+        method:'POST', headers:{'X-Quant-Demo':'strategy'},
+        signal:AbortSignal.timeout(action === 'start' ? 30000 : 6000)
       });
-      if (!response.ok) throw Error((await response.json()).error);
+      if (!response.ok) {
+        const detail = await response.json().catch(() => null);
+        throw Error(detail?.error || 'HTTP ' + response.status);
+      }
     } catch (error) {
       actionError = error.message;
     } finally {
@@ -1137,7 +1144,12 @@ for (const control of ['start','stop','entries']) {
       await strategyStatus();
       strategyAction = null;
       renderStrategyControls();
-      if (actionError) el('strategy-status').textContent = actionError;
+      if (actionError && action === 'start' && !strategyState?.running) {
+        strategyStartError = '启动失败 · ' + actionError;
+        el('strategy-status').textContent = strategyStartError;
+      } else if (actionError && action !== 'start') {
+        el('strategy-status').textContent = actionError;
+      }
     }
   };
 }
