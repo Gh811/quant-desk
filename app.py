@@ -312,11 +312,13 @@ def protection_price(entry, change, tick, *, direction, kind):
     return (entry*(1+direction*change)/tick).to_integral_value(rounding=rounding)*tick
 
 
-def set_initial_protection(symbol, entry, stop_loss, tick, context, *, direction=1, take_multiple=2):
+def set_initial_protection(symbol, entry, stop_loss, tick, context, *, direction=1, take_multiple=2,
+                           target_return=None):
     if entry <= 0 or tick <= 0:
         raise ValueError('成交均价或价格步长无效')
     with protection_lock:
-        for kind, change in (('stop', -stop_loss), ('take', take_multiple*stop_loss)):
+        take_return = take_multiple*stop_loss if target_return is None else target_return
+        for kind, change in (('stop', -stop_loss), ('take', take_return)):
             price = protection_price(entry, change, tick, direction=direction, kind=kind)
             place_protection(symbol, kind, price, context, direction=direction)
 
@@ -900,8 +902,15 @@ def evaluate_entry_signal(symbol, mode, now, read):
     close = bars[-1][4]
     structure = bars[-2:] if reason in {'回踩做多', '反抽做空'} else bars[-1:]
     extreme = min(bar[3] for bar in structure) if direction > 0 else max(bar[2] for bar in structure)
+    obstacles = []
+    if mode == 'fast':
+        column = 2 if direction > 0 else 3
+        for series in (confirmation, background):
+            prices = [direction * bar[column] for bar in series]
+            obstacles.extend(Decimal(str(direction * middle)) for left, middle, right
+                             in zip(prices, prices[1:], prices[2:]) if middle > max(left, right))
     return candle, score, volatility, reason, dict(
-        stressed=stressed, extreme=Decimal(str(extreme)),
+        stressed=stressed, extreme=Decimal(str(extreme)), obstacles=obstacles,
         priority=int(aligned) + min(relative_volume, 2.0) / 2 + side_flow
                  + min(abs(score) / float(volatility), 0.75),
         close=Decimal(str(close)), boundary=Decimal(str(retest if retest is not None else close / (1 + score))),
@@ -973,6 +982,21 @@ def fast_position_levels(risk, price_return, peak, weakened):
 
 def fast_entry_setup(context, volatility):
     return dict(boundary=str(context['boundary']), extreme=str(context['extreme']), atr=str(volatility))
+
+
+def fast_take_target(entry, direction, risk, volatility, cost, obstacles):
+    target = min(FAST_TREND_TARGET * risk, max(risk, Decimal('2.5') * volatility))
+    buffer = volatility * Decimal('.15')
+    ahead = [direction * (level / entry - 1) for level in obstacles]
+    nearest = min((distance for distance in ahead if distance > 0), default=None)
+    if nearest is not None and nearest - buffer < target:
+        target = nearest - buffer
+        source = '附近阻力前' if direction > 0 else '附近支撑前'
+    else:
+        source = '近期波动范围'
+    if target < max(risk * Decimal('.75'), 2 * cost):
+        raise ValueError(f'{source}止盈空间仅 {target:.3%}，低于风险与交易成本要求')
+    return target, source
 
 
 def fast_signal_family(reason):
@@ -1258,6 +1282,13 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 cost = 2*(fee+slippage)
                 if cost > stop*cost_cap:
                     continue
+                target_return = take_multiple*stop
+                if fast_trend:
+                    try:
+                        target_return, _ = fast_take_target(entry, direction, stop, volatility, cost,
+                                                            context.get('obstacles', ()))
+                    except ValueError:
+                        continue
                 leverage = 5 if mode == 'fast' else min(5 if mode == 'swing' else 3, max(1, int(Decimal('.05')/stop)))
                 margin_budget = free_margin*Decimal('.95')/(BACKTEST_MAX_POSITIONS-len(positions))
                 risk_scale = Decimal(str(evidence['risk_scale'])) if evidence else 1
@@ -1269,7 +1300,8 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 free_margin -= margin
                 positions[asset] = dict(opened=stamp, entry=entry, direction=direction, amount=notional/entry,
                                         risk=stop, trail=entry*(1-direction*stop), margin=margin,
-                                        take=entry*(1+direction*take_multiple*stop),
+                                        take=entry*(1+direction*target_return),
+                                        initial_take=entry*(1+direction*target_return),
                                         setup=fast_entry_setup(context, volatility) if fast_trend else None,
                                         entry_slippage=abs(entry-opening)*notional/entry,
                                         peak=Decimal(0), funding=Decimal(0), signal=reason, evidence=evidence)
@@ -1318,7 +1350,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                     reason = '移动止损' if trail != entry*(1-direction*stop) else '止损'
                     price = (min if direction > 0 else max)(trail, Decimal(str(trade_open)))
                 elif direction*(favorable-take) >= 0:
-                    reason, price = '动态止盈' if take != entry*(1+direction*take_multiple*stop) else '止盈', take
+                    reason, price = '动态止盈' if take != position['initial_take'] else '止盈', take
                 elif max_hours is not None and stamp-position['opened'] >= max_hours*HOUR:
                     reason, price = '持仓到期', Decimal(str(trade_open))
                 elif stamp+60000 >= end:
@@ -1747,7 +1779,9 @@ class DemoStrategy:
                     price_return = pnl / entry_value if entry_value > 0 else Decimal(0)
                     peak = max(peaks.get(symbol, price_return), price_return)
                     peaks[symbol] = peak
-                    fixed_exit = price_return <= -stop_loss or price_return >= take_multiple * stop_loss
+                    setup = fast_setups.get(symbol, {})
+                    target_return = Decimal(setup.get('target_return', take_multiple * stop_loss))
+                    fixed_exit = price_return <= -stop_loss or price_return >= target_return
                     entry_price = entry_value/abs(amount)
                     mark = notional/abs(amount)
                     tick = ticks[symbol]
@@ -1790,7 +1824,7 @@ class DemoStrategy:
                             if price_return <= proposed_stop:
                                 dynamic_exit = fast_exit_decisions[symbol] = (
                                     '行情走弱触及收紧保护线', detail)
-                            if proposed_take is not None and take_reviewed.get(symbol) != window:
+                            if proposed_take is not None and proposed_take < target_return and take_reviewed.get(symbol) != window:
                                 closer = protection_price(entry_price, proposed_take, tick, direction=direction, kind='take')
                                 if direction*(closer-mark) >= 2*tick:
                                     take = (min if direction > 0 else max)(take, closer) if take is not None else closer
@@ -1831,7 +1865,7 @@ class DemoStrategy:
                             actual_stop, actual_take = align_strategy_protection(symbol, entry_price, mark, stop_loss, stop, tick,
                                                       dict(opening_id=opening_id, opened=int(opened*1000),
                                                            leverage=leverage, strategy=mode), direction=direction,
-                                                      take=take, take_multiple=take_multiple, review=review_note)
+                                                      take=take, take_multiple=target_return / stop_loss, review=review_note)
                             if fast_trend:
                                 fast_takes[symbol] = actual_take
                                 stop = actual_stop
@@ -1866,8 +1900,8 @@ class DemoStrategy:
                             reason, threshold = '达到最长持仓时间', f'{max_hold_hours:g} 小时'
                         elif price_return <= -stop_loss:
                             reason, threshold = '达到止损线', f'{-stop_loss:.3%}'
-                        elif price_return >= take_multiple*stop_loss:
-                            reason, threshold = '达到止盈线', f'{take_multiple*stop_loss:.3%}'
+                        elif price_return >= target_return:
+                            reason, threshold = '达到止盈线', f'{target_return:.3%}'
                         elif trailing:
                             reason, threshold = '触发移动止损', f'移动止损价 {stop:f}'
                         elif dynamic_take_hit:
@@ -2086,6 +2120,15 @@ class DemoStrategy:
                             checks[symbol[:-4]] = '跳过 · 数量或名义金额不符合合约要求'
                             self.checks = checks.copy()
                             continue
+                        target_return = None
+                        if fast_trend:
+                            try:
+                                target_return, target_source = fast_take_target(
+                                    price, direction, stop_loss, volatility, cost, signal_context.get('obstacles', ()))
+                            except ValueError as error:
+                                checks[symbol[:-4]] = f'跳过 · 止盈空间不足：{error}'
+                                self.checks = checks.copy()
+                                continue
                         try:
                             if open_protection(symbol):
                                 checks[symbol[:-4]] = '跳过 · 该合约仍有条件单'
@@ -2138,7 +2181,10 @@ class DemoStrategy:
                                         detail=detail, signal_at=signal_at)
                         if fast_trend:
                             decision['setup'] = fast_entry_setup(signal_context, volatility)
+                            decision['setup']['target_return'] = str(target_return)
                             decision['evidence'] = evidence
+                            planned_take = protection_price(price, target_return, tick, direction=direction, kind='take')
+                            decision['detail'] += f' · 计划止盈 {planned_take:f}（{target_source} · {target_return:.3%}）'
                             decision['detail'] += ' · ' + fast_evidence_label(evidence)
                             if time_in_force == 'IOC' and (budget / price // step) * step > amount:
                                 decision['detail'] += ' · 按一档可成交深度缩量'
@@ -2180,7 +2226,7 @@ class DemoStrategy:
                             set_initial_protection(symbol, entry, stop_loss, tick,
                                                    dict(opening_id=order.get('orderId'), opened=order.get('updateTime'),
                                                         leverage=leverage_target, strategy=mode), direction=direction,
-                                                   take_multiple=take_multiple)
+                                                   take_multiple=take_multiple, target_return=target_return)
                             checks[symbol[:-4]] = '开仓已成交 · 止盈止损已挂'
                         except (ValueError, OSError, KeyError, ArithmeticError, sqlite3.Error) as error:
                             protection_errors[symbol] = str(error)
