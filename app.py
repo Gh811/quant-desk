@@ -1895,8 +1895,10 @@ def cancel_backtests(job=None, *, before=None):
         params.append(before)
     with BACKTEST_SUBMIT_LOCK:
         with backtest_database() as database:
+            database.execute('BEGIN IMMEDIATE')
             ids = [row[0] for row in database.execute(
-                "UPDATE backtest_jobs SET state='cancelled', detail='已取消' WHERE " + condition + ' RETURNING id', params)]
+                'SELECT id FROM backtest_jobs WHERE ' + condition, params)]
+            database.execute("UPDATE backtest_jobs SET state='cancelled', detail='已取消' WHERE " + condition, params)
         for job_id in ids:
             process = backtest_processes.get(job_id)
             if process is not None and process.poll() is None:
@@ -3145,7 +3147,10 @@ class Handler(BaseHTTPRequestHandler):
         strategy = self.server.strategy
         if parsed.path == '/backtest/cancel':
             try:
-                job = parse_qs(parsed.query).get('id', [None])[0]
+                job = parse_qs(parsed.query, keep_blank_values=True).get('id', [None])[0]
+                if job is not None and (len(job) != 32 or any(char not in '0123456789abcdef' for char in job)):
+                    self.send(400, 'application/json', json.dumps({'error': '回测任务 ID 无效'}).encode())
+                    return
                 result = cancel_backtests(job)
             except (OSError, sqlite3.Error) as error:
                 self.send(500, 'application/json', json.dumps({'error': str(error)}).encode())
