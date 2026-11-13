@@ -1021,7 +1021,7 @@ def replay_strategy(asset, mode, data, marks, funding, start, end, fee, slippage
 def run_backtest(params):
     asset = params.get('asset', ['BTC'])[0]
     mode = params.get('strategy', ['all'])[0]
-    venue = DEMO_VENUE if params.get('source', ['demo'])[0] == 'demo' else 'Binance'
+    venue = 'Binance'
     if asset not in ASSETS or mode not in {*STRATEGY_NAMES, 'all'}:
         raise ValueError('标的或策略无效')
     if mode == 'us_open' and asset not in US_EQUITY_ASSETS:
