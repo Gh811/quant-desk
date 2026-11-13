@@ -392,6 +392,12 @@ def replace_protection(symbol, kind, raw_price):
             raise ValueError(f'触发价须为 {tick} 的整数倍')
         if old and Decimal(old[0]['triggerPrice']) == price:
             return
+        mark = Decimal(request(DEMO_VENUE, '/fapi/v1/premiumIndex', symbol=symbol)['markPrice'])
+        if not mark.is_finite() or mark <= 0:
+            raise ValueError('币安标记价不可用')
+        valid_side = direction*(mark-price) if kind == 'stop' else direction*(price-mark)
+        if valid_side <= 0:
+            raise ValueError(f'触发价 {price:f} 已越过当前标记价 {mark:f}，会立即触发')
         contexts = pending_protection()
         linked = next((contexts[order['clientAlgoId']].get('context')
                        for order in orders
@@ -921,62 +927,96 @@ def historical_bars(venue, symbol, interval, start, end, *, mark=False):
     return rows
 
 
-def replay_strategy(asset, mode, data, marks, funding, start, end, fee, slippage, event_at=None):
-    starts = {interval: series[0][0][0] for interval, series in data.items()}
+BACKTEST_MAX_POSITIONS = 5
+FAST_CORRELATED_ASSETS = {'BTC', 'ETH', 'SOL'}
 
-    def read(interval, cutoff, required):
-        duration = TIMEFRAME_MINUTES[interval] * 60000
-        end_index = (cutoff - starts[interval]) // duration
+
+def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None):
+    starts = {asset: {frame: series[0][0][0] for frame, series in data.items()}
+              for asset, (data, _, _) in markets.items()}
+    funding = {asset: {stamp: (rate, price) for stamp, rate, price in rows}
+               for asset, (_, _, rows) in markets.items()}
+
+    def read(asset, frame, cutoff, required):
+        duration = TIMEFRAME_MINUTES[frame] * 60000
+        end_index = (cutoff - starts[asset][frame]) // duration
         if end_index < required:
             raise ValueError('回测预热数据不足')
-        return tuple(zip(*data[interval][end_index-required:end_index]))
+        return tuple(zip(*markets[asset][0][frame][end_index-required:end_index]))
+
+    def value(position, price):
+        direction, amount, entry = (position[key] for key in ('direction', 'amount', 'entry'))
+        return amount*(direction*(price-entry)-fee*(price+entry)) + position['funding']
 
     initial = Decimal(10000)
-    balance = high_water = initial
+    balance = high_water = equity = initial
     drawdown = Decimal(0)
-    position = None
+    positions = {}
     trades = []
-    event_skips = 0
+    event_skips = capacity_skips = peak_positions = 0
     curve = [dict(time=start, equity=float(initial))]
-    funding_by_minute = {stamp: (rate, price) for stamp, rate, price in funding}
     interval = STRATEGY_INTERVALS[mode]
     max_hours = {'intraday': 4, 'swing': 48, 'us_open': 1.5}.get(mode)
+    assets = sorted(asset for asset in markets if mode != 'us_open' or asset in US_EQUITY_ASSETS)
 
-    for (mark, _), (trade, _) in zip(marks, data['1m']):
-        stamp, mark_open, mark_high, mark_low, mark_close = mark
-        if stamp < start:
-            continue
-        _, trade_open, _, _, trade_close = trade
-        if position is None and stamp % interval == 0 and balance > 0:
-            _, score, volatility, reason, context = evaluate_entry_signal(
-                asset+'USDT', mode, stamp, read)
-            if score is not None and event_at is not None and abs(stamp-event_at) <= 15*60000:
-                event_skips += 1
-                score = None
-            if score is not None:
+    for index, stamp in enumerate(range(start, end, 60000)):
+        if stamp % interval == 0 and equity > 0:
+            candidates = []
+            for asset in assets:
+                if asset in positions:
+                    continue
+                _, score, volatility, reason, context = evaluate_entry_signal(
+                    asset+'USDT', mode, stamp, lambda frame, cutoff, required: read(asset, frame, cutoff, required))
+                if score is not None:
+                    if event_at is not None and abs(stamp-event_at) <= 15*60000:
+                        event_skips += 1
+                    else:
+                        candidates.append((context['priority'], asset, score, volatility, reason, context))
+
+            free_margin = max(Decimal(0), equity - sum(p['margin'] for p in positions.values()))
+            for _, asset, score, volatility, reason, context in sorted(candidates, key=lambda row: (-row[0], row[1])):
+                if len(positions) == BACKTEST_MAX_POSITIONS:
+                    capacity_skips += 1
+                    continue
                 direction = 1 if score > 0 else -1
-                opening = Decimal(str(trade_open))
+                if (mode == 'fast' and asset in FAST_CORRELATED_ASSETS and
+                        any(other in FAST_CORRELATED_ASSETS and p['direction'] == direction for other, p in positions.items())):
+                    continue
+                opening = Decimal(str(markets[asset][0]['1m'][index][0][1]))
                 entry = opening * (1 + direction*slippage)
-                if (direction*(opening/context['close']-1) <= volatility/2
-                        and direction*(opening/context['boundary']-1) >=
-                        (0 if context['stressed'] else -volatility/4)):
-                    stop = entry_stop_fraction(asset, mode, volatility)
+                if (direction*(opening/context['close']-1) > volatility/2 or
+                        direction*(opening/context['boundary']-1) < (0 if context['stressed'] else -volatility/4)):
+                    continue
+                stop = entry_stop_fraction(asset, mode, volatility)
+                if mode == 'fast':
                     try:
-                        if mode == 'fast':
-                            stop = fast_structure_stop(entry, direction, context['extreme'], volatility, stop,
-                                                       'PERPETUAL' if asset in {'BTC', 'ETH', 'SOL'} else 'TRADIFI_PERPETUAL')
+                        stop = fast_structure_stop(entry, direction, context['extreme'], volatility, stop,
+                                                   'PERPETUAL' if asset in FAST_CORRELATED_ASSETS else 'TRADIFI_PERPETUAL')
                     except ValueError:
-                        stop = None
-                    cost = 2*(fee+slippage)
-                    if stop and cost <= stop*Decimal('.75'):
-                        amount = min(balance, balance*ENTRY_EQUITY_RISK[mode]/(stop+cost))/entry
-                        position = dict(opened=stamp, entry=entry, direction=direction, amount=amount,
-                                        risk=stop, trail=entry*(1-direction*stop),
+                        continue
+                cost = 2*(fee+slippage)
+                if cost > stop*Decimal('.75'):
+                    continue
+                leverage = 5 if mode == 'fast' else min(5 if mode == 'swing' else 3, max(1, int(Decimal('.05')/stop)))
+                margin_budget = free_margin*Decimal('.95')/(BACKTEST_MAX_POSITIONS-len(positions))
+                notional = min(equity*(3 if mode == 'swing' else 1), leverage*margin_budget,
+                               equity*ENTRY_EQUITY_RISK[mode]/(stop+cost))
+                if notional <= 0:
+                    continue
+                margin = notional/leverage
+                free_margin -= margin
+                positions[asset] = dict(opened=stamp, entry=entry, direction=direction, amount=notional/entry,
+                                        risk=stop, trail=entry*(1-direction*stop), margin=margin,
                                         peak=Decimal(0), funding=Decimal(0), signal=reason)
-        if position:
+                peak_positions = max(peak_positions, len(positions))
+
+        for asset, position in list(positions.items()):
+            data, marks, _ = markets[asset]
+            _, _, mark_high, mark_low, mark_close = marks[index][0]
+            _, trade_open, _, _, trade_close = data['1m'][index][0]
             entry, direction, amount, stop = (position[k] for k in ('entry','direction','amount','risk'))
-            if stamp in funding_by_minute and stamp > position['opened']:
-                rate, price = funding_by_minute[stamp]
+            if stamp in funding[asset] and stamp > position['opened']:
+                rate, price = funding[asset][stamp]
                 position['funding'] -= direction*amount*rate*price
             adverse = Decimal(str(mark_low if direction > 0 else mark_high))
             favorable = Decimal(str(mark_high if direction > 0 else mark_low))
@@ -993,15 +1033,14 @@ def replay_strategy(asset, mode, data, marks, funding, start, end, fee, slippage
                 reason, price = '持仓到期', Decimal(str(trade_open))
             elif stamp+60000 >= end:
                 reason, price = '回测结束结算', Decimal(str(trade_close))
-
             if reason:
                 price *= 1-direction*slippage
                 fees = fee*amount*(entry+price)
                 net = direction*amount*(price-entry)-fees+position['funding']
                 balance += net
-                trades.append(dict(opened=position['opened'], closed=stamp, entry=float(entry), exit=float(price),
+                trades.append(dict(symbol=asset+'USDT', opened=position['opened'], closed=stamp, entry=float(entry), exit=float(price),
                                    direction=direction, net=float(net), reason=reason, signal=position['signal']))
-                position = None
+                del positions[asset]
             else:
                 close = Decimal(str(mark_close))
                 peak = max(position['peak'], direction*(close/entry-1))
@@ -1011,11 +1050,8 @@ def replay_strategy(asset, mode, data, marks, funding, start, end, fee, slippage
                     candidate = (max if direction > 0 else min)(entry*(1+direction*(peak-stop)), breakeven)
                     if direction*(close-candidate) > 0 and direction*(candidate-trail) > 0:
                         position['trail'] = candidate
-        equity = balance
-        if position:
-            close = Decimal(str(trade_close))
-            equity += (position['direction']*position['amount']*(close-position['entry'])
-                       - fee*position['amount']*(close+position['entry']) + position['funding'])
+        equity = balance + sum(value(p, Decimal(str(markets[asset][0]['1m'][index][0][4])))
+                               for asset, p in positions.items())
         high_water = max(high_water, equity)
         drawdown = max(drawdown, (high_water-equity)/high_water)
         if stamp % HOUR == 0 or stamp+60000 >= end:
@@ -1023,17 +1059,18 @@ def replay_strategy(asset, mode, data, marks, funding, start, end, fee, slippage
     return dict(mode=mode, name=STRATEGY_NAMES[mode], initial=float(initial), net=float(balance-initial),
                 roi=float(balance/initial-1), drawdown=float(drawdown), count=len(trades),
                 win_rate=sum(t['net'] > 0 for t in trades)/len(trades) if trades else None,
-                curve=curve, trades=list(reversed(trades)), event_skips=event_skips)
+                curve=curve, trades=list(reversed(trades)), event_skips=event_skips,
+                capacity_skips=capacity_skips, peak_positions=peak_positions, assets=assets)
 
 
 def backtest_range(params):
-    asset = params.get('asset', ['BTC'])[0]
+    assets = sorted(set(params.get('asset', ['BTC'])))
     mode = params.get('strategy', ['all'])[0]
-    if asset not in ASSETS or mode not in {*STRATEGY_NAMES, 'all'}:
+    if not assets or not set(assets) <= set(ASSETS) or mode not in {*STRATEGY_NAMES, 'all'}:
         raise ValueError('标的或策略无效')
-    if mode == 'us_open' and asset not in US_EQUITY_ASSETS:
+    if mode == 'us_open' and not set(assets) <= US_EQUITY_ASSETS:
         raise ValueError('美股双向策略仅用于美股类标的')
-    modes = ([key for key in STRATEGY_NAMES if key != 'us_open' or asset in US_EQUITY_ASSETS]
+    modes = ([key for key in STRATEGY_NAMES if key != 'us_open' or set(assets) & US_EQUITY_ASSETS]
              if mode == 'all' else [mode])
     intervals = sorted({frame for key in modes for frame in SIGNAL_TIMEFRAMES[key]})
     now = time.time_ns() // 1_000_000 // 60000 * 60000
@@ -1049,16 +1086,16 @@ def backtest_range(params):
         start = end-days*24*HOUR
     if start < 0 or end > now or not 0 < end-start <= 60*24*HOUR or start % 60000 or end % 60000:
         raise ValueError('回测跨度须在 1 分钟至 60 天之间，终点不能晚于最新收盘')
-    return asset, modes, intervals, start, end
+    return assets, modes, intervals, start, end
 
 
 def backtest_coverage(params):
-    asset, modes, intervals, requested_start, requested_end = backtest_range(params)
+    assets, modes, intervals, requested_start, requested_end = backtest_range(params)
     feeds = [(interval, '/fapi/v1/klines', 50) for interval in intervals]
     feeds += [('1m', '/fapi/v1/klines', 0), ('1m', '/fapi/v1/markPriceKlines', 0)]
 
     def first_usable(feed):
-        interval, endpoint, warmup = feed
+        asset, interval, endpoint, warmup = feed
         step = TIMEFRAME_MINUTES.get(interval, 1) * 60000
         desired = requested_start // step * step - warmup*step
         rows = request('Binance', endpoint, symbol=asset+'USDT', interval=interval,
@@ -1069,41 +1106,47 @@ def backtest_coverage(params):
         return requested_start if first == desired else first + warmup*step
 
     with ThreadPoolExecutor(max_workers=4) as pool:
-        start = max(requested_start, *pool.map(first_usable, feeds))
+        starts = list(pool.map(first_usable, [(asset, *feed) for asset in assets for feed in feeds]))
+    start = max(requested_start, *starts)
     if start >= requested_end:
         raise ValueError('该标的历史不足以完成所选策略的预热，无法回测')
-    return dict(start=start, end=requested_end, requested_start=requested_start,
+    return dict(assets=assets, start=start, end=requested_end, requested_start=requested_start,
                 strategies=[STRATEGY_NAMES[key] for key in modes])
 
 
 def run_backtest(params):
-    asset, modes, intervals, start, end = backtest_range(params)
+    assets, modes, intervals, start, end = backtest_range(params)
     venue = 'Binance'
     event_value = params.get('event_at', [''])[0]
     event_at = int(datetime.fromisoformat(event_value+'+08:00').timestamp()*1000) if event_value else None
     if event_at is not None and not start <= event_at < end:
         raise ValueError('事件时间须在回测区间内')
-    symbol = asset+'USDT'
-    data = {frame:historical_bars(venue, symbol, frame, start-50*TIMEFRAME_MINUTES[frame]*60000, end)
-            for frame in sorted(intervals)}
-    data['1m'] = historical_bars(venue, symbol, '1m', start, end)
-    marks = historical_bars(venue, symbol, '1m', start, end, mark=True)
-    rows = []
-    cursor = start
-    while cursor < end:
-        batch = request(venue, '/fapi/v1/fundingRate', symbol=symbol, startTime=cursor, endTime=end-1, limit=1000)
-        rows.extend(batch)
-        if len(batch) < 1000:
-            break
-        next_cursor = int(batch[-1]['fundingTime']) + 1
-        if next_cursor <= cursor:
-            raise ValueError('资金费分页时间无效')
-        cursor = next_cursor
-    funding = [(int(row['fundingTime'])//60000*60000, Decimal(row['fundingRate']), Decimal(row['markPrice']))
-               for row in rows]
+    def load(asset):
+        symbol = asset+'USDT'
+        data = {frame:historical_bars(venue, symbol, frame, start-50*TIMEFRAME_MINUTES[frame]*60000, end)
+                for frame in sorted(intervals)}
+        data['1m'] = [(bar, None) for bar, _ in historical_bars(venue, symbol, '1m', start, end)]
+        marks = [(bar, None) for bar, _ in historical_bars(venue, symbol, '1m', start, end, mark=True)]
+        rows = []
+        cursor = start
+        while cursor < end:
+            batch = request(venue, '/fapi/v1/fundingRate', symbol=symbol, startTime=cursor, endTime=end-1, limit=1000)
+            rows.extend(batch)
+            if len(batch) < 1000:
+                break
+            next_cursor = int(batch[-1]['fundingTime']) + 1
+            if next_cursor <= cursor:
+                raise ValueError('资金费分页时间无效')
+            cursor = next_cursor
+        funding = [(int(row['fundingTime'])//60000*60000, Decimal(row['fundingRate']), Decimal(row['markPrice']))
+                   for row in rows]
+        return data, marks, funding
+
+    markets = {asset: load(asset) for asset in assets}
     fee, slippage = Decimal('.0005'), Decimal('.0003')
-    return dict(asset=asset, venue=venue, start=start, end=end, funding_samples=len(funding),
-                results=[replay_strategy(asset, key, data, marks, funding, start, end, fee, slippage, event_at)
+    return dict(assets=assets, venue=venue, start=start, end=end,
+                funding_samples=sum(len(funding) for _, _, funding in markets.values()),
+                results=[replay_portfolio(key, markets, start, end, fee, slippage, event_at)
                          for key in modes])
 
 
