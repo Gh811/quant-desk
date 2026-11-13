@@ -67,10 +67,6 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
 <p id="strategy-status" role="status">正在读取后台策略状态…</p>
 <label for="strategy-mode">策略</label>
 <select id="strategy-mode" disabled><option value="swing">1 小时双向</option><option value="intraday">15 分钟双向</option><option value="fast">5 分钟双向</option><option value="us_open">美股双向测试</option></select>
-<div id="strategy-entry-field" class="desk-sizing" hidden>
-  <label for="strategy-entry-rules">入场规则</label>
-  <select id="strategy-entry-rules" disabled><option value="baseline">原版</option><option value="cost_control">成本与风险控制</option><option value="fast_trend" hidden disabled>5 分钟趋势延续</option></select>
-</div>
 <div class="desk-sizing">
   <label for="strategy-sizing">单笔仓位</label>
   <select id="strategy-sizing" disabled><option value="capital">按账户本金计算</option><option value="fixed">固定 USDT 名义仓位</option></select>
@@ -353,11 +349,8 @@ function writeSaved(key, value) {
 const config = el('config');
 const preferences = readSaved('config');
 const strategyMode = el('strategy-mode');
-const strategyEntryRules = el('strategy-entry-rules');
 const strategySizing = el('strategy-sizing');
 const strategyNotional = el('strategy-notional');
-strategyEntryRules.value = ['cost_control','fast_trend'].includes(preferences?.entryRules) ? preferences.entryRules : 'baseline';
-strategyEntryRules.addEventListener('change', savePreferences);
 strategySizing.value = preferences?.sizing === 'fixed' ? 'fixed' : 'capital';
 strategyNotional.value = preferences?.notional ?? '';
 const strategyNames = Object.fromEntries([...strategyMode.options].map(option => [option.value, option.textContent]));
@@ -369,7 +362,7 @@ if (Array.isArray(preferences?.assets)) {
 }
 function savePreferences() {
   writeSaved('config', {assets:new FormData(config).getAll('asset'), strategy:strategyMode.value,
-    sizing:strategySizing.value, notional:strategyNotional.value, entryRules:strategyEntryRules.value});
+    sizing:strategySizing.value, notional:strategyNotional.value});
 }
 const usStrategyAssets = new Set('SNDK SOXL KORU MU NVDA QQQ GOOGL SPCX META TSLA AMZN'.split(' '));
 if (strategyMode.value === 'us_open') {
@@ -847,11 +840,6 @@ function renderStrategyControls() {
   const blocked = Boolean(strategyState?.switch_blocked);
   const locked = !strategyState || running || stopping || blocked || strategyAction !== null;
   strategyMode.disabled = locked;
-  el('strategy-entry-field').hidden = strategyMode.value === 'swing';
-  strategyEntryRules.disabled = locked || strategyMode.value === 'swing';
-  const fastTrendOption = strategyEntryRules.querySelector('[value=fast_trend]');
-  fastTrendOption.hidden = fastTrendOption.disabled = strategyMode.value !== 'fast';
-  if (fastTrendOption.disabled && strategyEntryRules.value === 'fast_trend') strategyEntryRules.value = 'baseline';
   strategySizing.disabled = locked;
   el('strategy-notional-field').hidden = strategySizing.value !== 'fixed';
   strategyNotional.disabled = locked || strategySizing.value !== 'fixed';
@@ -951,7 +939,6 @@ async function refreshStrategyStatus() {
         : '';
     if (state.running || state.switch_blocked) {
       strategyMode.value = state.mode;
-      if (state.mode !== 'swing') strategyEntryRules.value = state.entry_rules || (state.cost_control ? 'cost_control' : 'baseline');
       strategySizing.value = state.fixed_notional == null ? 'capital' : 'fixed';
       if (state.fixed_notional != null) strategyNotional.value = state.fixed_notional;
     }
@@ -982,7 +969,6 @@ for (const control of ['start','stop','entries']) {
     const params = new URLSearchParams(new FormData(config));
     params.set('strategy', strategyMode.value);
     if (action === 'start') {
-      params.set('entry_rules', strategyEntryRules.value);
       params.set('sizing', strategySizing.value);
       if (strategySizing.value === 'fixed') {
         if (!strategyNotional.value || !strategyNotional.checkValidity()) {
@@ -1221,7 +1207,7 @@ summary{cursor:pointer;font-weight:600}details .scroll{margin-top:10px}
   <fieldset class="backtest-assets"><legend>标的</legend><button type="button" id="select-assets">全选</button><div id="asset"></div></fieldset>
   <label>策略<select name="strategy"><option value="all">比较适用策略</option><option value="fast">5 分钟双向</option><option value="intraday">15 分钟双向</option><option value="swing">1 小时双向</option><option value="us_open">美股双向</option></select></label>
   <label>行情来源<select name="source"><option value="live">币安实盘</option><option value="demo">币安模拟盘</option></select></label>
-  <label>策略规则<select name="rules"><option value="baseline">原版策略</option><option value="cost_control">低成本、半风险</option><option value="fast_trend">5 分钟趋势延续</option><option value="confirmation">严格确认</option><option value="retest">严格确认＋回踩</option><option value="compare">对照全部规则</option></select></label>
+  <label>策略规则<select name="rules"><option value="current">当前策略</option><option value="confirmation">严格确认</option><option value="retest">严格确认＋回踩</option><option value="compare">对照全部规则</option></select></label>
   <label>回测跨度<select name="days"><option value="1">最近 1 天</option><option value="7" selected>最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option><option value="60">最近 60 天</option></select></label>
   <label>事件时间（可选，北京时间）<input type="datetime-local" name="event_at"></label>
   <button type="submit">检查区间</button>
@@ -1239,21 +1225,13 @@ summary{cursor:pointer;font-weight:600}details .scroll{margin-top:10px}
   <p>5 分钟策略用 5 分钟找信号、15 分钟确认、1 小时过滤逆势。15 分钟和美股双向用 15 分钟、1 小时、4 小时。1 小时策略用 1 小时、4 小时、日线。信号还用成交量、主动成交占比和波动。</p>
   <p>可用起点取成交 K 线和标记价共同覆盖，并为所选策略预留指标预热时间。区间内出现数据缺口会报错。</p>
   <p>严格确认要求最大周期同向，确认周期趋势效率至少 0.30，且主动成交至少 52% 同向。加回踩的版本在 5 分钟、15 分钟和美股双向中跳过直接突破；1 小时仍保留突破。</p>
-  <p>原版策略的成本上限为初始止损幅度的 75%。「低成本、半风险」适用于 5 分钟、15 分钟和美股双向，使用同样的信号与止盈止损规则，将成本上限降至 30%、单笔风险预算减半，并在同一标的平仓后等待 3 个信号周期再开仓。</p>
-  <p>5 分钟趋势延续沿用 5 分钟、15 分钟和 1 小时的入场判断，并使用低成本、半风险的仓位规则。初始止盈距离为初始止损距离的 3 倍，浮盈达初始止损距离的 1.5 倍后启动移动止损。</p>
+  <p>5 分钟持仓按已收盘的 5 分钟、15 分钟和 1 小时 K 线复评。入场结构失效时退出，行情走弱时收紧止盈止损。</p>
   <p>信号只看已收盘 K 线。下一分钟开盘价加估算滑点入场，止盈止损用 1 分钟标记价判断，同一根同时碰到两条线时按止损计算。按单边手续费 0.05%、单边滑点 0.03% 和可取得的历史资金费计账。</p>
-  <p>移动止损按 1 分钟收盘近似更新。填写已知事件时间后，前后 15 分钟跳过新的入场信号，已有仓位继续管理。历史盘口排队、动态止盈、组合仓位限制与自动新闻数据尚未接入。结果用于比较规则在相同假设下的表现。</p>
+  <p>5 分钟策略在每分钟开盘复评保护价，其他策略按 1 分钟收盘近似更新移动止损。填写已知事件时间后，前后 15 分钟跳过新的入场信号，已有仓位继续管理。回测简化盘口排队与成交过程，未接入自动新闻数据。结果用于比较规则在相同假设下的表现。</p>
 </details>
 </main>
 <script>
 const form = document.getElementById('backtest');
-const trendRule = form.elements.rules.querySelector('[value=fast_trend]');
-function syncBacktestRules() {
-  trendRule.hidden = trendRule.disabled = form.elements.strategy.value !== 'fast';
-  if (trendRule.disabled && form.elements.rules.value === 'fast_trend') form.elements.rules.value = 'baseline';
-}
-form.elements.strategy.addEventListener('change', syncBacktestRules);
-syncBacktestRules();
 const status = document.getElementById('status');
 const results = document.getElementById('results');
 const color = index => 'hsl(' + ((index * 137 + 211) % 360) + ' 58% 36%)';
