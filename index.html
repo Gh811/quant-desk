@@ -1522,13 +1522,14 @@ button{background:#1756a9;color:#fff;cursor:pointer}button:disabled{opacity:.6;c
 .scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;white-space:nowrap}
 th,td{text-align:left;padding:8px 10px;border-bottom:1px solid #e2e9f0}th{background:#f0f4f9}
 .gain{color:#08754a}.loss{color:#bb3246}small{color:#52647a}
-canvas{display:block;width:100%;height:240px}.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px}
+canvas{display:block;width:100%;height:clamp(310px,52vh,540px)}.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:8px}
 summary{cursor:pointer;font-weight:600}details .scroll{margin-top:10px}
 #asset{max-height:190px;overflow:auto}#asset [hidden]{display:none}#history{margin:12px 0}#history-asset{max-width:240px}#custom-range:not([hidden]){display:flex;gap:8px}
 </style>
 <main>
-<a href="./">← 返回交易仪表盘</a>
-<h1>历史回测</h1>
+<a id="backtest-return" href="./">← 返回交易仪表盘</a>
+<h1 id="backtest-title">历史回测</h1>
+<div id="backtest-list">
 <form id="backtest">
   <label>行情来源<select name="source"><option value="live">币安实盘</option><option value="demo">币安模拟盘</option></select></label>
   <label>区间<select name="days"><option value="1">最近 1 天</option><option value="7" selected>最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option><option value="60">最近 60 天</option><option value="custom">自定义日期</option></select></label>
@@ -1549,6 +1550,8 @@ summary{cursor:pointer;font-weight:600}details .scroll{margin-top:10px}
   <span id="history-page"></span>
   <button type="button" id="history-next">下一页</button>
 </div>
+</div>
+<p id="detail-status" role="status" hidden></p>
 <div id="results"></div>
 <details><summary>数据与成交假设</summary>
   <p>只运行当前 5 分钟双向策略。信号使用已收盘的 5 分钟、15 分钟和 1 小时 K 线，持仓复评及止盈止损使用分钟级行情。历史覆盖不足会缩短区间，结果页显示实际区间。区间内有数据缺口会单独标记该标的失败。</p>
@@ -1624,7 +1627,20 @@ function render(data) {
   chart=()=>draw(canvas,data.results,data.start,data.end);
   chart();
   for (const r of data.results) {
+    const review = element('div');
+    review.className = 'panel';
+    review.append(element('h2','交易分布'), table(['方向','笔数','净盈亏 USDT','胜率'],
+      [[1,'做多'],[-1,'做空']].map(([direction,label]) => {
+        const trades = r.trades.filter(trade => trade.direction === direction);
+        return [label,trades.length,trades.reduce((sum,trade) => sum + trade.net,0),
+          percent(trades.length ? trades.filter(trade => trade.net > 0).length/trades.length : null)];
+      }),2));
+    if (r.entry_checks) {
+      review.append(element('h2','入场检查'), table(['检查结果','次数'], Object.entries(r.entry_checks)));
+    }
+    results.append(review);
     const details=element('details');
+    details.open = true;
     details.append(element('summary',r.name+' · 成交明细（'+r.count+'）'));
     if (r.trades.length) {
       const headings = ['标的','入场','出场','方向','入场价','出场价','净盈亏 USDT','退出原因'];
@@ -1670,7 +1686,7 @@ async function fetchData(url, options = {}) {
   if (!response.ok) throw Error(data.error || 'HTTP '+response.status);
   return data;
 }
-fetchData('./market-universe').then(data => {
+if (!new URLSearchParams(location.search).has('id')) fetchData('./market-universe').then(data => {
   markets = data.markets;
   updateBacktestAssets();
 }).catch(() => {});
@@ -1691,7 +1707,9 @@ form.elements.days.onchange = () => {
 const history = document.getElementById('history');
 const previous = document.getElementById('history-prev');
 const next = document.getElementById('history-next');
-let page = 1, requestId = 0, historySnapshot = '', resultRequest = 0;
+const route = new URLSearchParams(location.search);
+const detailId = route.get('id');
+let page = Number(route.get('page')) || 1, requestId = 0, historySnapshot = '';
 async function refreshHistory() {
   const id = ++requestId;
   const params = new URLSearchParams({source:source(), page});
@@ -1709,17 +1727,10 @@ async function refreshHistory() {
       [job.asset, formatTime(job.start)+' 至 '+formatTime(job.end), labels[job.state], job.detail || '—', '—']));
     for (const [index, job] of report.jobs.entries()) {
       if (job.state !== 'done') continue;
-      const button = element('button','查看');
-      button.onclick = async () => {
-        const request = ++resultRequest;
-        try {
-          const data = await fetchData('./backtest/jobs?id='+job.id);
-          if (request === resultRequest) render(data);
-        } catch (error) {
-          if (request === resultRequest) status.textContent = error.message;
-        }
-      };
-      grid.querySelector('tbody').rows[index].cells[4].replaceChildren(button);
+      const link = element('a','查看');
+      const query = new URLSearchParams({id:job.id, source:source(), page, asset:historyAsset.value.trim()});
+      link.href = './backtest?' + query;
+      grid.querySelector('tbody').rows[index].cells[4].replaceChildren(link);
     }
     history.replaceChildren(report.jobs.length ? grid : element('p','暂无回测记录'));
     const pages = Math.max(1, Math.ceil(report.total/25));
@@ -1735,18 +1746,35 @@ async function refreshHistory() {
 }
 function resetHistory() { page = 1; refreshHistory(); }
 form.elements.source.onchange = () => {
-  resultRequest++;
-  results.replaceChildren();
-  chart = null;
   updateBacktestAssets();
   resetHistory();
 };
 historyAsset.oninput = resetHistory;
 previous.onclick = () => { page--; refreshHistory(); };
 next.onclick = () => { page++; refreshHistory(); };
-updateBacktestAssets();
-refreshHistory();
-setInterval(refreshHistory, 4000);
+if (['live','demo'].includes(route.get('source'))) form.elements.source.value = route.get('source');
+historyAsset.value = route.get('asset') || '';
+if (detailId) {
+  document.getElementById('backtest-list').hidden = true;
+  const back = document.getElementById('backtest-return');
+  const listRoute = new URLSearchParams(route);
+  listRoute.delete('id');
+  back.href = './backtest?' + listRoute + '#history';
+  back.textContent = '← 返回回测记录';
+  const detailStatus = document.getElementById('detail-status');
+  detailStatus.hidden = false;
+  detailStatus.textContent = '正在读取回测结果…';
+  fetchData('./backtest/jobs?' + new URLSearchParams({id:detailId})).then(data => {
+    document.getElementById('backtest-title').textContent = data.assets[0] + ' 回测详情';
+    document.title = data.assets[0] + ' 回测详情 · Quant Desk';
+    detailStatus.hidden = true;
+    render(data);
+  }).catch(error => { detailStatus.textContent = '结果读取失败 · ' + error.message; });
+} else {
+  updateBacktestAssets();
+  refreshHistory();
+  setInterval(refreshHistory, 4000);
+}
 window.addEventListener('resize',()=>chart?.());
 form.onsubmit = async event => {
   event.preventDefault();
