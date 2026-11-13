@@ -1002,7 +1002,10 @@ def evaluate_entry_signal(symbol, mode, now, read):
         return candle, None, volatility, f'{reason} · 成交或波动样本不足', {}
     relative_volume = quote_volume / baseline
     side_flow = (taker_buy if direction > 0 else quote_volume - taker_buy) / quote_volume
-    if relative_volume < (1.2 if reason in {'突破做多', '跌破做空'} else 0.8):
+    volume_floor = 1.2 if reason in {'突破做多', '跌破做空'} else 0.8
+    if mode == 'fast':
+        volume_floor = 1.0 if reason in {'突破做多', '跌破做空'} else 0.7
+    if relative_volume < volume_floor:
         return candle, None, volatility, f'{reason} · 相对成交量偏低（{relative_volume:.2f}×）', {}
     if side_flow < 0.45:
         return candle, None, volatility, f'{reason} · 同向主动成交偏弱（{side_flow:.0%}）', {}
