@@ -1359,6 +1359,7 @@ BACKTEST_JOB_LIMIT = 500
 BACKTEST_FEEDS = {'live': ('Binance', '币安实盘行情'), 'demo': (DEMO_VENUE, '币安模拟盘行情')}
 backtest_request_lock = threading.Lock()
 backtest_next_request = {}
+BACKTEST_REQUEST_SPACING = {'Binance': .15, DEMO_VENUE: .35}
 
 
 def backtest_feed(params):
@@ -1375,7 +1376,7 @@ def backtest_request(venue, endpoint, **params):
                 now = time.monotonic()
                 delay = backtest_next_request.get(venue, 0) - now
                 if delay <= 0:
-                    backtest_next_request[venue] = now + .10
+                    backtest_next_request[venue] = now + BACKTEST_REQUEST_SPACING[venue]
                     break
             if delay > 30:
                 raise ValueError(f'{venue} 行情接口限流（429），请稍后重试或缩短回测跨度')
@@ -1825,10 +1826,9 @@ def run_backtest(params, progress):
     asset, = coverage['assets']
     venue, start, end = (coverage[key] for key in ('venue', 'start', 'end'))
     symbol = asset + 'USDT'
-    try:
-        contract = futures_catalog(venue).get(symbol)
-    except (OSError, ValueError, KeyError):
-        contract = None
+    # Replay only needs optional metadata. Never wait on the trading catalogue lock.
+    cached = catalog_cache.get(venue)
+    contract = cached[1].get(symbol) if cached else None
     progress('读取历史 K 线与资金费')
 
     def load_funding():
@@ -3036,7 +3036,9 @@ class Handler(BaseHTTPRequestHandler):
                     demo = futures_catalog(DEMO_VENUE)
                     extra = assets - set(ASSETS)
                     if extra:
-                        pool = {row['asset'] for row in market_universe()['markets'] if row['pool']}
+                        live = futures_catalog('Binance')
+                        pool = {symbol[:-4] for symbol, item in live.items() if tradable_future(item)
+                                and equity_kind(symbol, item) in {'us', 'unclassified'}}
                         if not extra <= pool:
                             raise ValueError('有标的不在实盘候选池中，请刷新合约目录')
                     unavailable = sorted(asset for asset in assets if not tradable_future(demo.get(asset + 'USDT'))
