@@ -1724,8 +1724,8 @@ def backtest_range(params):
         days = int(params.get('days', ['7'])[0])
         end = now
         start = end-days*24*HOUR
-    if start < 0 or end > now or not 0 < end-start <= 60*24*HOUR or start % 60000 or end % 60000:
-        raise ValueError('回测跨度须在 1 分钟至 60 天之间，终点不能晚于最新收盘')
+    if start < 0 or end > now or end - start < 60000 or start % 60000 or end % 60000:
+        raise ValueError('回测区间至少为 1 分钟，终点不能晚于最新收盘')
     return assets, modes, intervals, start, end
 
 
