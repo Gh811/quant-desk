@@ -742,10 +742,9 @@ STRATEGY_INTERVALS = {mode: TIMEFRAME_MINUTES[frames[0]] * 60000 for mode, frame
 STRATEGY_LOOKBACK = {'fast': 12, 'intraday': 20, 'swing': 24, 'us_open': 20}
 STRATEGY_MAX_ATR = {'fast': Decimal('.008'), 'intraday': Decimal('.012'), 'swing': Decimal('.02'),
                     'us_open': Decimal('.015')}
-ENTRY_EQUITY_RISK = {'fast': Decimal('.005'), 'intraday': Decimal('.0065'), 'swing': Decimal('.0075'),
-                     'us_open': Decimal('.004')}
+ENTRY_EQUITY_RISK = {'fast': Decimal('.005'), 'intraday': Decimal('.00325'), 'swing': Decimal('.0075'),
+                     'us_open': Decimal('.002')}
 SHORT_COST_CAP = Decimal('.30')
-SHORT_RISK_MULTIPLIER = Decimal('.5')
 SHORT_REENTRY_COOLDOWN_BARS = 3
 FAST_TREND_TARGET = Decimal('3')
 FAST_TREND_TRAIL_START = Decimal('1.5')
@@ -761,6 +760,15 @@ def entry_stop_fraction(asset, mode, volatility):
         return min(Decimal('.02'), max(Decimal('.0065'), Decimal('2.5') * volatility))
     low, high = (Decimal('.005'), Decimal('.02')) if mode == 'swing' else (Decimal('.0035'), Decimal('.01'))
     return min(high, max(low, 2 * volatility))
+
+
+def entry_notional_budget(mode, equity, free_margin, leverage, slots, stop, cost, risk_scale=1):
+    capital_cap = equity * (3 if mode == 'swing' else 1)
+    margin_cap = leverage * free_margin * Decimal('.95')
+    if mode != 'fast':
+        margin_cap /= slots
+    risk_cap = equity * ENTRY_EQUITY_RISK[mode] * risk_scale / (stop + cost)
+    return max(Decimal(0), min(capital_cap, margin_cap, risk_cap))
 
 
 def closed_demo_bars(symbol, interval, cutoff, required, *, venue=DEMO_VENUE):
@@ -1233,7 +1241,6 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
     cost_control = mode != 'swing'
     take_multiple = FAST_TREND_TARGET if fast_trend else 2
     cost_cap = SHORT_COST_CAP if cost_control else Decimal('.75')
-    equity_risk = ENTRY_EQUITY_RISK[mode] * (SHORT_RISK_MULTIPLIER if cost_control else 1)
     reentry_at = {}
     max_hours = {'intraday': 4, 'swing': 48, 'us_open': 1.5}.get(mode)
     assets = sorted(asset for asset in markets if mode != 'us_open' or asset in US_EQUITY_ASSETS)
@@ -1290,10 +1297,9 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                     except ValueError:
                         continue
                 leverage = 5 if mode == 'fast' else min(5 if mode == 'swing' else 3, max(1, int(Decimal('.05')/stop)))
-                margin_budget = free_margin*Decimal('.95')/(BACKTEST_MAX_POSITIONS-len(positions))
                 risk_scale = Decimal(str(evidence['risk_scale'])) if evidence else 1
-                notional = min(equity*(3 if mode == 'swing' else 1), leverage*margin_budget,
-                               equity*equity_risk*risk_scale/(stop+cost))
+                notional = entry_notional_budget(mode, equity, free_margin, leverage,
+                                                 BACKTEST_MAX_POSITIONS-len(positions), stop, cost, risk_scale)
                 if notional <= 0:
                     continue
                 margin = notional/leverage
@@ -1661,7 +1667,6 @@ class DemoStrategy:
         cost_control = short_term
         take_multiple = FAST_TREND_TARGET if fast_trend else 2
         cost_cap = SHORT_COST_CAP if cost_control else Decimal('.75')
-        equity_risk = ENTRY_EQUITY_RISK[mode] * (SHORT_RISK_MULTIPLIER if cost_control else 1)
         cooldown_ms = SHORT_REENTRY_COOLDOWN_BARS * STRATEGY_INTERVALS[mode]
         reentry_at = {}
         max_positions = self.FAST_MAX_POSITIONS if mode == 'fast' else self.MAX_POSITIONS
@@ -2094,11 +2099,9 @@ class DemoStrategy:
                         leverage_cap = 3 if short_term else 5
                         leverage_target = (self.FAST_LEVERAGE if mode == 'fast'
                                            else min(leverage_cap, max(1, int(Decimal('.05') / stop_loss))))
-                        margin_budget = free_margin * Decimal('.95') / (max_positions - len(occupied))
-                        budget = max(Decimal(0), min((equity if short_term else 3 * equity), leverage_target * margin_budget))
                         risk_scale = Decimal(str(evidence['risk_scale'])) if evidence else 1
-                        risk_budget = equity * equity_risk * risk_scale / (stop_loss + cost)
-                        budget = min(budget, risk_budget)
+                        budget = entry_notional_budget(mode, equity, free_margin, leverage_target,
+                                                       max_positions-len(occupied), stop_loss, cost, risk_scale)
                         if fixed_notional is not None:
                             budget = min(budget, fixed_notional)
                         minimum = Decimal(filters.get('MIN_NOTIONAL', {}).get('notional', '0'))
@@ -2186,6 +2189,9 @@ class DemoStrategy:
                             planned_take = protection_price(price, target_return, tick, direction=direction, kind='take')
                             decision['detail'] += f' · 计划止盈 {planned_take:f}（{target_source} · {target_return:.3%}）'
                             decision['detail'] += ' · ' + fast_evidence_label(evidence)
+                            decision['detail'] += (f' · 名义仓位 {notional:.2f} USDT'
+                                                   f' · 计划风险 {notional * (stop_loss + cost):.2f} USDT'
+                                                   f'（上限 {equity * ENTRY_EQUITY_RISK[mode] * risk_scale:.2f} USDT）')
                             if time_in_force == 'IOC' and (budget / price // step) * step > amount:
                                 decision['detail'] += ' · 按一档可成交深度缩量'
                         entry_attempts[symbol] = (candle, direction, now, price, time_in_force, cost)
