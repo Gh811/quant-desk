@@ -19,6 +19,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from itertools import islice
+from array import array
 from functools import lru_cache
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -1640,7 +1641,7 @@ def settled_fast_samples(orders, now):
 
 
 
-BACKTEST_WORKERS = ThreadPoolExecutor(max_workers=4)
+BACKTEST_WORKERS = ThreadPoolExecutor(max_workers=2)
 BACKTEST_SUBMIT_LOCK = threading.Lock()
 BACKTEST_JOB_LIMIT = 500
 BACKTEST_FEEDS = {'live': ('Binance', '币安实盘行情'), 'demo': (DEMO_VENUE, '币安模拟盘行情')}
@@ -1684,7 +1685,27 @@ def backtest_request(venue, endpoint, **params):
                 raise ValueError(f'{venue} 行情接口限流（429），请稍后重试或缩短回测跨度') from None
 
 
-def historical_bars(venue, symbol, interval, start, end, *, mark=False):
+class MinuteBars:
+    """Store minute OHLC as four doubles per bar, with implicit timestamps."""
+
+    def __init__(self, start):
+        self.start = start
+        self.prices = array('d')
+
+    def __len__(self):
+        return len(self.prices) // 4
+
+    def append(self, bar):
+        self.prices.extend(bar[1:])
+
+    def __getitem__(self, index):
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        offset = index * 4
+        return (self.start + index * 60000, *self.prices[offset:offset+4]), None
+
+
+def historical_bars(venue, symbol, interval, start, end, *, mark=False, compact=False):
     step = (1 if interval == '1m' else TIMEFRAME_MINUTES[interval]) * 60000
     first = start // step * step
     path = '/fapi/v1/markPriceKlines' if mark else '/fapi/v1/klines'
@@ -1718,7 +1739,7 @@ def historical_bars(venue, symbol, interval, start, end, *, mark=False):
                                  (*key, zlib.compress(json.dumps(batch).encode(), 1)))
         return batch
 
-    rows = []
+    rows = MinuteBars(first) if compact else []
     with ThreadPoolExecutor(max_workers=4) as pool:
         cursors = iter(range(first // width * width, end-step+1, width))
         while (window := list(islice(cursors, 8))):
@@ -1735,7 +1756,10 @@ def historical_bars(venue, symbol, interval, start, end, *, mark=False):
                     bar = (stamp, *map(float, raw[1:5]))
                     if not all(math.isfinite(p) and p > 0 for p in bar[1:]):
                         raise ValueError(f'{symbol} {interval} K 线价格无效')
-                    rows.append((bar, raw))
+                    if compact:
+                        rows.append(bar)
+                    else:
+                        rows.append((bar, raw))
     if len(rows) != (end-first)//step:
         raise ValueError(f'{symbol} {interval} K 线覆盖不足，请缩短区间或选较晚日期')
     return rows
@@ -1940,13 +1964,13 @@ def run_backtest(params, progress, *, settings=None):
                 for row in rows]
 
     with ThreadPoolExecutor(max_workers=3) as pool:
-        trades = pool.submit(historical_bars, venue, symbol, '1m', start, end)
-        marks = pool.submit(historical_bars, venue, symbol, '1m', start, end, mark=True)
+        trades = pool.submit(historical_bars, venue, symbol, '1m', start, end, compact=True)
+        marks = pool.submit(historical_bars, venue, symbol, '1m', start, end, mark=True, compact=True)
         funding = pool.submit(load_funding)
         data = {frame:historical_bars(venue, symbol, frame, start-50*TIMEFRAME_MINUTES[frame]*60000, end)
                 for frame in SIGNAL_TIMEFRAMES['fast']}
-        data['1m'] = [(bar, None) for bar, _ in trades.result()]
-        mark_bars = [(bar, None) for bar, _ in marks.result()]
+        data['1m'] = trades.result()
+        mark_bars = marks.result()
         funding_rows = funding.result()
     progress('运行 5 分钟策略')
     if settings is None:
