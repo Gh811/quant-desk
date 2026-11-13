@@ -5,7 +5,7 @@ import math
 import os
 import time
 from datetime import datetime
-from collections import Counter, deque
+from collections import Counter
 import threading
 import sys
 import sqlite3
@@ -25,12 +25,39 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
+from backtest_replay import replay_portfolio
+from strategy_signals import (
+    ENTRY_EQUITY_RISK,
+    FAST_LEARNING_WINDOW,
+    FAST_REVIEW_RETRY_MS,
+    FAST_TREND_TARGET,
+    HOUR,
+    SHORT_COST_CAP,
+    SHORT_REENTRY_COOLDOWN_BARS,
+    SIGNAL_TIMEFRAMES,
+    STRATEGY_INTERVALS,
+    STRATEGY_NAMES,
+    TIMEFRAME_MINUTES,
+    entry_notional_budget,
+    entry_signal as candle_entry_signal,
+    entry_stop_fraction,
+    equity_kind,
+    evaluate_entry_signal,
+    fast_entry_evidence,
+    fast_entry_setup,
+    fast_position_assessment,
+    fast_position_levels,
+    fast_position_market,
+    fast_signal_family,
+    fast_structure_stop,
+    fast_take_target,
+)
+
+
 ASSETS = 'ETH BTC XAU SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN BNB ZEC INTC'.split()
-US_EQUITY_ASSETS = set('SNDK SOXL KORU MU NVDA QQQ GOOGL SPCX META TSLA AMZN INTC'.split())
 HOSTS = {'OKX': 'https://openapi.okx.com', 'Binance': 'https://fapi.binance.com'}
 DEMO_VENUE = 'Binance 模拟盘'
 HOSTS[DEMO_VENUE] = 'https://demo-fapi.binance.com'
-HOUR = 3600000
 DEMO_ORDER_ACTIVE = {'NEW', 'PARTIALLY_FILLED'}
 DEMO_ORDER_PENDING = {'待确认', '待核对'} | DEMO_ORDER_ACTIVE
 DEMO_ORDER_TERMINAL = {'FILLED', 'CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJECTED'}
@@ -50,10 +77,19 @@ opportunity_report_lock = threading.Lock()
 opportunity_report = {'candle_at': None, 'rows': [], 'status': 'waiting'}
 
 
+WEB_ASSETS = {
+    'index.css': 'text/css',
+    'backtest.css': 'text/css',
+    'index.js': 'application/javascript',
+    'backtest.js': 'application/javascript',
+}
+
+
 @lru_cache(maxsize=1)
 def deployed_commit_lookup(directory):
     files = {}
-    for name in ('app.py', 'index.html'):
+    for name in ('app.py', 'strategy_signals.py', 'backtest_replay.py',
+                 'index.html', 'backtest.html', *WEB_ASSETS):
         content = (directory / name).read_bytes()
         files[name] = hashlib.sha1(f'blob {len(content)}\0'.encode() + content).hexdigest()
 
@@ -119,22 +155,6 @@ def futures_catalog(venue):
 def tradable_future(item):
     return bool(item and item['status'] == 'TRADING'
                 and item['contractType'] in {'PERPETUAL', 'TRADIFI_PERPETUAL'})
-
-
-def equity_kind(symbol, item):
-    if symbol[:-4] in US_EQUITY_ASSETS:
-        return 'us'
-    if not item:
-        return None
-    tags = {str(tag).upper() for tag in [item.get('underlyingType'), *(item.get('underlyingSubType') or [])]}
-    if tags & {'COMMODITY', 'METAL', 'FOREX', 'FX', 'PRECIOUS_METAL', 'ENERGY'} or symbol[:-4] in {
-            'XAU', 'XAG', 'XPT', 'XPD', 'CL', 'BZ', 'WTI', 'BRENT', 'NG'}:
-        return None
-    if tags & {'HK', 'KOREA', 'JAPAN', 'KR', 'JP', 'NON_US_EQUITY'} or symbol[:-4] in {'SKHYNIX', 'SAMSUNG'}:
-        return 'other'
-    if tags & {'STOCK', 'STOCKS', 'EQUITY', 'EQUITIES', 'ETF', 'US_STOCK', 'US_EQUITY', 'US_STOCKS', 'US_EQUITIES'}:
-        return 'us'
-    return 'unclassified' if item['contractType'] == 'TRADIFI_PERPETUAL' else None
 
 
 def market_universe():
@@ -816,64 +836,6 @@ def scan(venue, selected):
         rows = list(pool.map(check, selected))
     return sorted(rows, key=lambda row: (row['status']=='入场候选', row.get('score',0)), reverse=True)
 
-def trend_metrics(bars, direction=1):
-    closes = [bar[4] for bar in bars]
-    fast = statistics.mean(closes[-12:])
-    slow = statistics.mean(closes[-48:])
-    true_ranges = [
-        max(high-low, abs(high-prev[4]), abs(low-prev[4]))
-        for prev, (_, _, high, low, _) in zip(bars[-15:-1], bars[-14:])
-    ]
-    atr_fraction = statistics.mean(true_ranges) / closes[-1]
-    return direction*closes[-1] > direction*fast > direction*slow, Decimal(str(atr_fraction))
-
-
-STRATEGY_NAMES = {
-    'swing': '中长线 · 1 小时双向突破与回踩',
-    'intraday': '短线 · 15 分钟双向突破与回踩',
-    'fast': '短线 · 5 分钟双向突破与回踩',
-    'us_open': '美股双向测试',
-}
-SIGNAL_TIMEFRAMES = {
-    'fast': ('5m', '15m', '1h'),
-    'intraday': ('15m', '1h', '4h'),
-    'swing': ('1h', '4h', '1d'),
-    'us_open': ('15m', '1h', '4h'),
-}
-TIMEFRAME_MINUTES = {'5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440}
-STRATEGY_INTERVALS = {mode: TIMEFRAME_MINUTES[frames[0]] * 60000 for mode, frames in SIGNAL_TIMEFRAMES.items()}
-STRATEGY_LOOKBACK = {'fast': 12, 'intraday': 20, 'swing': 24, 'us_open': 20}
-STRATEGY_MAX_ATR = {'fast': Decimal('.008'), 'intraday': Decimal('.012'), 'swing': Decimal('.02'),
-                    'us_open': Decimal('.015')}
-ENTRY_EQUITY_RISK = {'fast': Decimal('.005'), 'intraday': Decimal('.00325'), 'swing': Decimal('.0075'),
-                     'us_open': Decimal('.002')}
-SHORT_COST_CAP = Decimal('.30')
-SHORT_REENTRY_COOLDOWN_BARS = 3
-FAST_TREND_TARGET = Decimal('3')
-FAST_TREND_TRAIL_START = Decimal('1.5')
-FAST_REVIEW_RETRY_MS = 30000
-FAST_LEARNING_WINDOW = 60 * 24 * HOUR
-FAST_LEARNING_HALF_LIFE = 14 * 24 * HOUR
-
-
-def entry_stop_fraction(asset, mode, volatility, *, us_equity=False):
-    if mode == 'us_open':
-        return min(Decimal('.025'), max(Decimal('.008'), Decimal('2.5') * volatility))
-    if mode == 'fast' and (us_equity or asset in US_EQUITY_ASSETS):
-        return min(Decimal('.02'), max(Decimal('.0065'), Decimal('2.5') * volatility))
-    low, high = (Decimal('.005'), Decimal('.02')) if mode == 'swing' else (Decimal('.0035'), Decimal('.01'))
-    return min(high, max(low, 2 * volatility))
-
-
-def entry_notional_budget(mode, equity, free_margin, leverage, slots, stop, cost, risk_scale=1):
-    capital_cap = equity * (3 if mode == 'swing' else 1)
-    margin_cap = leverage * free_margin * Decimal('.95')
-    if mode != 'fast':
-        margin_cap /= slots
-    risk_cap = equity * ENTRY_EQUITY_RISK[mode] * risk_scale / (stop + cost)
-    return max(Decimal(0), min(capital_cap, margin_cap, risk_cap))
-
-
 def closed_demo_bars(symbol, interval, cutoff, required, *, venue=DEMO_VENUE, fetch=None):
     minutes = TIMEFRAME_MINUTES[interval]
     duration = minutes * 60000
@@ -890,71 +852,9 @@ def closed_demo_bars(symbol, interval, cutoff, required, *, venue=DEMO_VENUE, fe
 
 
 def entry_signal(symbol, strategy, bars=None):
-    lookback = STRATEGY_LOOKBACK[strategy]
     if bars is None:
         bars, _ = closed_demo_bars(symbol, SIGNAL_TIMEFRAMES[strategy][0], demo_now_ms(), 49)
-    close = bars[-1][4]
-    direction = 1
-    trend, volatility = trend_metrics(bars)
-    if not trend:
-        trend, _ = trend_metrics(bars, -1)
-        if trend:
-            direction = -1
-    recent = bars[-lookback-1:-1]
-    boundary = max(bar[2] for bar in recent) if direction > 0 else min(bar[3] for bar in recent)
-    breakout = direction*(close/boundary - 1)
-    score = None
-    if not trend:
-        reason = '均线趋势未确认'
-    elif volatility > STRATEGY_MAX_ATR[strategy]:
-        reason = f'ATR 超过 {STRATEGY_MAX_ATR[strategy]:.1%}'
-    elif breakout > 0:
-        reason = '突破做多' if direction > 0 else '跌破做空'
-        score = direction*breakout
-    else:
-        fast_average = statistics.mean(bar[4] for bar in bars[-12:])
-        previous_average = statistics.mean(bar[4] for bar in bars[-13:-1])
-        previous = bars[-2]
-        if direction > 0 and previous[3] <= previous_average and close > max(fast_average, previous[2]):
-            reason, score = '回踩做多', close / max(fast_average, previous[2]) - 1
-        elif direction < 0 and previous[2] >= previous_average and close < min(fast_average, previous[3]):
-            reason, score = '反抽做空', close / min(fast_average, previous[3]) - 1
-        else:
-            reason = '等待向上突破或回踩' if direction > 0 else '等待向下跌破或反抽'
-            reason += f' · 距前 {lookback} 根极值 {-breakout:.2%}'
-    return bars[-1][0], score, volatility, reason
-
-
-def fast_volatility_setup(bars, direction, volatility):
-    ranges = [max(bar[2]-bar[3], abs(bar[2]-prev[4]), abs(bar[3]-prev[4])) / prev[4]
-              for prev, bar in zip(bars[-24:-1], bars[-23:])]
-    baseline = statistics.median(ranges[:-3])
-    _, opened, high, low, close = bars[-1]
-    wick = min(high-max(opened, close), min(opened, close)-low)
-    stressed = (baseline > 0 and max(ranges[-3:]) >= 2 * baseline
-                or high > low and wick >= .25 * (high-low))
-    if not stressed:
-        return False, None
-    tolerance = float(volatility) / 4
-    for offset in range(len(bars)-2, len(bars)-5, -1):
-        prior = bars[offset-STRATEGY_LOOKBACK['fast']:offset]
-        level = max(bar[2] for bar in prior) if direction > 0 else min(bar[3] for bar in prior)
-        touch = low if direction > 0 else high
-        if (direction * (bars[offset][4]/level - 1) > 0
-                and all(direction * (bar[4]/level - 1) >= 0 for bar in bars[offset+1:])
-                and abs(touch/level - 1) <= tolerance
-                and direction * (close/opened - 1) > 0):
-            return True, level
-    return True, None
-
-
-def fast_structure_stop(entry, direction, extreme, volatility, base_stop, contract_type):
-    invalidation = extreme * (1 - direction * volatility / 4)
-    distance = max(base_stop, direction * (1 - invalidation/entry))
-    maximum = Decimal('.025') if contract_type == 'TRADIFI_PERPETUAL' else Decimal('.015')
-    if distance > maximum:
-        raise ValueError(f'结构止损需 {distance:.2%}，超过 {maximum:.2%} 上限')
-    return distance
+    return candle_entry_signal(symbol, strategy, bars)
 
 
 def scan_entry_signal(symbol, mode, *, venue=DEMO_VENUE):
@@ -962,155 +862,6 @@ def scan_entry_signal(symbol, mode, *, venue=DEMO_VENUE):
     def read(interval, cutoff, required):
         return closed_demo_bars(symbol, interval, cutoff, required, venue=venue)
     return evaluate_entry_signal(symbol, mode, now, read)
-
-
-def evaluate_entry_signal(symbol, mode, now, read):
-    base, confirm, backdrop = SIGNAL_TIMEFRAMES[mode]
-    bars, raw = read(base, now, 49)
-    candle, score, volatility, reason = entry_signal(symbol, mode, bars)
-    stressed = False
-    retest = None
-    if mode == 'fast' and 0 < volatility <= STRATEGY_MAX_ATR[mode]:
-        direction = next((side for side in (1, -1) if trend_metrics(bars, side)[0]), None)
-        if direction is not None:
-            stressed, retest = fast_volatility_setup(bars, direction, volatility)
-            if stressed and retest is None:
-                return candle, None, volatility, '波动突增 · 等待突破后回踩确认', {}
-            if retest is not None:
-                score = bars[-1][4]/retest - 1
-                reason = '高波动回踩做多' if direction > 0 else '高波动反抽做空'
-    if score is None or score == 0:
-        return candle, None, volatility, reason, {}
-
-    signal_at = candle + STRATEGY_INTERVALS[mode]
-    direction = 1 if score > 0 else -1
-    confirmation, _ = read(confirm, signal_at, 48)
-    if not trend_metrics(confirmation, direction)[0]:
-        return candle, None, volatility, f'{reason} · {confirm} 趋势未确认', {}
-    background, _ = read(backdrop, signal_at, 48)
-    if trend_metrics(background, -direction)[0]:
-        return candle, None, volatility, f'{reason} · {backdrop} 趋势反向', {}
-    aligned = trend_metrics(background, direction)[0]
-
-    quote_volume = float(raw[-1][7])
-    taker_buy = float(raw[-1][10])
-    previous_volumes = [float(row[7]) for row in raw[-21:-1]]
-    if (not all(math.isfinite(volume) and volume >= 0 for volume in previous_volumes)
-            or not math.isfinite(quote_volume) or not 0 <= taker_buy <= quote_volume < math.inf):
-        raise ValueError(f'{base} 成交量或主动成交数据无效')
-    baseline = statistics.median(previous_volumes)
-    if baseline <= 0 or quote_volume <= 0 or volatility <= 0:
-        return candle, None, volatility, f'{reason} · 成交或波动样本不足', {}
-    relative_volume = quote_volume / baseline
-    side_flow = (taker_buy if direction > 0 else quote_volume - taker_buy) / quote_volume
-    volume_floor = 1.2 if reason in {'突破做多', '跌破做空'} else 0.8
-    if mode == 'fast':
-        volume_floor = 1.0 if reason in {'突破做多', '跌破做空'} else 0.7
-    if relative_volume < volume_floor:
-        return candle, None, volatility, f'{reason} · 相对成交量偏低（{relative_volume:.2f}×）', {}
-    if side_flow < 0.45:
-        return candle, None, volatility, f'{reason} · 同向主动成交偏弱（{side_flow:.0%}）', {}
-    if abs(score) > 1.5 * float(volatility):
-        return candle, None, volatility, f'{reason} · 触发幅度过大，避免追价', {}
-
-    close = bars[-1][4]
-    structure = bars[-2:] if reason in {'回踩做多', '反抽做空'} else bars[-1:]
-    extreme = min(bar[3] for bar in structure) if direction > 0 else max(bar[2] for bar in structure)
-    obstacles = []
-    if mode == 'fast':
-        column = 2 if direction > 0 else 3
-        for series in (confirmation, background):
-            prices = [direction * bar[column] for bar in series]
-            obstacles.extend(Decimal(str(direction * middle)) for left, middle, right
-                             in zip(prices, prices[1:], prices[2:]) if middle > max(left, right))
-    return candle, score, volatility, reason, dict(
-        stressed=stressed, extreme=Decimal(str(extreme)), obstacles=obstacles,
-        priority=int(aligned) + min(relative_volume, 2.0) / 2 + side_flow
-                 + min(abs(score) / float(volatility), 0.75),
-        close=Decimal(str(close)), boundary=Decimal(str(retest if retest is not None else close / (1 + score))),
-        detail=f'{confirm} 同向 · {backdrop}{" 同向" if aligned else " 中性"} · '
-               f'相对成交量 {relative_volume:.2f}× · 同向主动成交 {side_flow:.0%}')
-
-
-def fast_position_market(now, read):
-    bars, _ = read('5m', now, 50)
-    closed_at = bars[-1][0] + STRATEGY_INTERVALS['fast']
-    if closed_at != now // STRATEGY_INTERVALS['fast'] * STRATEGY_INTERVALS['fast']:
-        raise ValueError('最新 5 分钟 K 线尚未就绪')
-    higher_frames = []
-    for frame in ('15m', '1h'):
-        try:
-            higher, _ = read(frame, closed_at, 48)
-        except (OSError, ValueError, KeyError, IndexError, TypeError, ArithmeticError):
-            higher = None
-        higher_frames.append(higher)
-    closes = [bar[4] for bar in bars]
-    averages = (statistics.mean(closes[-13:-1]), statistics.mean(closes[-12:]))
-    return closed_at, closes[-2:], averages, *higher_frames
-
-
-def fast_position_assessment(market, opened, direction, setup):
-    if market is None or market[0] <= opened:
-        return None, ''
-    closed_at, closes, averages, confirmation, background = market
-    close = Decimal(str(closes[-1]))
-    post_entry_pair = closed_at - STRATEGY_INTERVALS['fast'] > opened
-    opposite = next((frame for frame, bars in (('1 小时', background), ('15 分钟', confirmation))
-                     if bars is not None and trend_metrics(bars, -direction)[0]), None)
-    below_average = direction * (closes[-1] - averages[-1]) < 0
-    weak_pair = post_entry_pair and all(direction * (price - mean) < 0
-                                        for price, mean in zip(closes, averages))
-    if setup:
-        boundary, extreme, atr = (Decimal(setup[key]) for key in ('boundary', 'extreme', 'atr'))
-        buffer = atr * Decimal('.15')
-        lost_boundary = direction * (close / boundary - 1) < -buffer
-        lost_structure = direction * (close / extreme - 1) < -buffer
-        failed_pair = lost_boundary and post_entry_pair and direction * (
-            Decimal(str(closes[0])) / boundary - 1) < -buffer
-        if lost_structure:
-            return 'exit', f'5 分钟收盘 {close:f} 穿过入场结构极值 {extreme:f}'
-        if lost_boundary and opposite:
-            return 'exit', f'5 分钟收盘 {close:f} 穿过入场触发位 {boundary:f}，{opposite}趋势反向'
-        if failed_pair and confirmation is not None and not trend_metrics(confirmation, direction)[0]:
-            return 'exit', f'连续两根 5 分钟 K 线收盘失守触发位 {boundary:f}，15 分钟同向趋势消失'
-        if lost_boundary:
-            return 'weak', f'5 分钟收盘 {close:f} 失守入场触发位 {boundary:f}'
-    if opposite and weak_pair:
-        return 'exit', f'{opposite}趋势反向，连续两根 5 分钟 K 线收在均线不利侧'
-    if weak_pair or (opposite and below_average):
-        return 'weak', f'{opposite}趋势反向，5 分钟收盘走弱' if opposite else '连续两根 5 分钟 K 线收盘走弱'
-    return None, ''
-
-
-def fast_position_levels(risk, price_return, peak, weakened):
-    stop = peak - risk if peak >= FAST_TREND_TRAIL_START * risk else None
-    take = None
-    if weakened:
-        stop = max(-Decimal('.55') * risk, stop if stop is not None else -risk)
-        if peak >= Decimal('.75') * risk:
-            stop = max(stop, peak - Decimal('.45') * risk)
-        if price_return >= Decimal('.5') * risk:
-            take = min(FAST_TREND_TARGET * risk, price_return + Decimal('.35') * risk)
-    return stop, take
-
-
-def fast_entry_setup(context, volatility):
-    return dict(boundary=str(context['boundary']), extreme=str(context['extreme']), atr=str(volatility))
-
-
-def fast_take_target(entry, direction, risk, volatility, cost, obstacles):
-    target = min(FAST_TREND_TARGET * risk, max(risk, Decimal('2.5') * volatility))
-    buffer = volatility * Decimal('.15')
-    ahead = [direction * (level / entry - 1) for level in obstacles]
-    nearest = min((distance for distance in ahead if distance > 0), default=None)
-    if nearest is not None and nearest - buffer < target:
-        target = nearest - buffer
-        source = '附近阻力前' if direction > 0 else '附近支撑前'
-    else:
-        source = '近期波动范围'
-    if target < max(risk * Decimal('.75'), 2 * cost):
-        raise ValueError(f'{source}止盈空间仅 {target:.3%}，低于风险与交易成本要求')
-    return target, source
 
 
 def scan_opportunities():
@@ -1257,43 +1008,6 @@ def watch_opportunities():
                 continue
             next_scan = report['candle_at'] + interval + 3000
             time.sleep(max(0, (next_scan - time.time_ns() // 1_000_000) / 1000))
-
-
-def fast_signal_family(reason):
-    if reason in {'突破做多', '跌破做空'}:
-        return 'breakout'
-    if reason in {'高波动回踩做多', '高波动反抽做空'}:
-        return 'volatile_retest'
-    if reason in {'回踩做多', '反抽做空'}:
-        return 'retest'
-    return None
-
-
-def fast_entry_evidence(samples, symbol, direction, reason, now):
-    family = fast_signal_family(reason)
-    weight_sum = wins = net_r = 0.0
-    count = 0
-    for closed, other_symbol, side, other_family, result_r in samples:
-        age = now - closed
-        if side != direction or not 0 <= age <= FAST_LEARNING_WINDOW:
-            continue
-        similarity = 1.0 if other_family == family else .35
-        if other_symbol != symbol:
-            similarity *= .65
-        weight = similarity * 2 ** (-age / FAST_LEARNING_HALF_LIFE)
-        weight_sum += weight
-        wins += weight * (result_r > 0)
-        net_r += weight * result_r
-        count += 1
-    # Eight neutral prior samples keep sparse history from driving the decision.
-    probability = (wins + 4) / (weight_sum + 8)
-    expectancy = net_r / (weight_sum + 8)
-    adjustment = max(-.30, min(.30, .5 * expectancy + .25 * (probability - .5)))
-    risk_scale = 1.0
-    if weight_sum >= 12 and expectancy < -.1:
-        risk_scale = max(.8, 1 + expectancy * .25)
-    return dict(samples=count, weight=weight_sum, probability=probability if count else None,
-                expectancy=expectancy if count else None, adjustment=adjustment, risk_scale=risk_scale)
 
 
 def fast_evidence_label(evidence):
@@ -1456,257 +1170,6 @@ def historical_bars(venue, symbol, interval, start, end, *, mark=False):
     if len(rows) != (end-first)//step:
         raise ValueError(f'{symbol} {interval} K 线覆盖不足，请缩短区间或选较晚日期')
     return rows
-
-
-BACKTEST_MAX_POSITIONS = 5
-FAST_CORRELATED_ASSETS = {'BTC', 'ETH', 'SOL'}
-FAST_CRYPTO_ASSETS = FAST_CORRELATED_ASSETS | {'BNB', 'ZEC'}
-
-
-BACKTEST_RULES = {'current': '当前策略', 'confirmation': '严格确认', 'retest': '严格确认＋回踩'}
-
-
-def backtest_entry_signal(symbol, mode, now, read, rules):
-    candle, score, volatility, reason, context = evaluate_entry_signal(symbol, mode, now, read)
-    if rules == 'current' or score is None:
-        return candle, score, volatility, reason, context
-    if rules == 'retest' and mode != 'swing' and reason in {'突破做多', '跌破做空'}:
-        return candle, None, volatility, '等待回踩或反抽', {}
-
-    direction = 1 if score > 0 else -1
-    base, confirm, backdrop = SIGNAL_TIMEFRAMES[mode]
-    cutoff = candle + STRATEGY_INTERVALS[mode]
-    background, _ = read(backdrop, cutoff, 48)
-    confirmation, _ = read(confirm, cutoff, 48)
-    _, raw = read(base, cutoff, 49)
-    closes = [bar[4] for bar in confirmation[-12:]]
-    path = sum(abs(b-a) for a, b in zip(closes, closes[1:]))
-    efficiency = direction*(closes[-1]-closes[0])/path if path else 0
-    buy_flow = float(raw[-1][10])/float(raw[-1][7])
-    side_flow = buy_flow if direction > 0 else 1-buy_flow
-    if not trend_metrics(background, direction)[0] or efficiency < .30 or side_flow < .52:
-        return candle, None, volatility, '大周期方向、趋势效率或主动成交未达标', {}
-    return candle, score, volatility, reason, context
-
-
-def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *, rules='current', contracts=None):
-    starts = {asset: {frame: series[0][0][0] for frame, series in data.items()}
-              for asset, (data, _, _) in markets.items()}
-    funding = {asset: {stamp: (rate, price) for stamp, rate, price in rows}
-               for asset, (_, _, rows) in markets.items()}
-
-    def read(asset, frame, cutoff, required):
-        duration = TIMEFRAME_MINUTES[frame] * 60000
-        end_index = (cutoff - starts[asset][frame]) // duration
-        if end_index < required:
-            raise ValueError('回测预热数据不足')
-        return tuple(zip(*markets[asset][0][frame][end_index-required:end_index]))
-
-    def value(position, price):
-        direction, amount, entry = (position[key] for key in ('direction', 'amount', 'entry'))
-        return amount*(direction*(price-entry)-fee*(price+entry)) + position['funding']
-
-    initial = Decimal(10000)
-    balance = high_water = equity = initial
-    drawdown = fees_paid = estimated_slippage = funding_net = Decimal(0)
-    positions = {}
-    trades = []
-    learning_samples = {side: deque(maxlen=500) for side in (1, -1)}
-    event_skips = capacity_skips = peak_positions = 0
-    entry_checks = Counter()
-    curve = [dict(time=start, equity=float(initial))]
-    interval = STRATEGY_INTERVALS[mode]
-    fast_trend = mode == 'fast'
-    cost_control = mode != 'swing'
-    take_multiple = FAST_TREND_TARGET if fast_trend else 2
-    cost_cap = SHORT_COST_CAP if cost_control else Decimal('.75')
-    reentry_at = {}
-    max_hours = {'intraday': 4, 'swing': 48, 'us_open': 1.5}.get(mode)
-    assets = sorted(asset for asset in markets if mode != 'us_open' or asset in US_EQUITY_ASSETS)
-
-    for index, stamp in enumerate(range(start, end, 60000)):
-        if stamp % interval == 0 and equity > 0:
-            candidates = []
-            for asset in assets:
-                if asset in positions:
-                    entry_checks['持仓中'] += 1
-                    continue
-                if stamp < reentry_at.get(asset, 0):
-                    entry_checks['平仓冷却'] += 1
-                    continue
-                _, score, volatility, reason, context = backtest_entry_signal(
-                    asset+'USDT', mode, stamp, lambda frame, cutoff, required: read(asset, frame, cutoff, required), rules)
-                if score is None:
-                    label = reason.split(' · ')[0] if ' · 距前 ' in reason else reason.split(' · ')[-1]
-                    label = label.split('（')[0]
-                    entry_checks[label or '无入场信号'] += 1
-                else:
-                    entry_checks['通过信号过滤'] += 1
-                    if event_at is not None and abs(stamp-event_at) <= 15*60000:
-                        event_skips += 1
-                    else:
-                        evidence = None
-                        if fast_trend:
-                            direction = 1 if score > 0 else -1
-                            evidence = fast_entry_evidence(learning_samples[direction], asset+'USDT', direction,
-                                                           reason, stamp)
-                        priority = context['priority'] + (evidence['adjustment'] if evidence else 0)
-                        candidates.append((priority, asset, score, volatility, reason, context, evidence))
-
-            free_margin = max(Decimal(0), equity - sum(p['margin'] for p in positions.values()))
-            for _, asset, score, volatility, reason, context, evidence in sorted(candidates, key=lambda row: (-row[0], row[1])):
-                if len(positions) == BACKTEST_MAX_POSITIONS:
-                    capacity_skips += 1
-                    continue
-                direction = 1 if score > 0 else -1
-                if (mode == 'fast' and asset in FAST_CORRELATED_ASSETS and
-                        any(other in FAST_CORRELATED_ASSETS and p['direction'] == direction for other, p in positions.items())):
-                    continue
-                opening = Decimal(str(markets[asset][0]['1m'][index][0][1]))
-                entry = opening * (1 + direction*slippage)
-                if (direction*(opening/context['close']-1) > volatility/2 or
-                        direction*(opening/context['boundary']-1) < (0 if context['stressed'] else -volatility/4)):
-                    entry_checks['开盘价偏离信号'] += 1
-                    continue
-                contract = (contracts or {}).get(asset)
-                stop = entry_stop_fraction(asset, mode, volatility, us_equity=equity_kind(asset+'USDT', contract) == 'us')
-                if mode == 'fast':
-                    try:
-                        stop = fast_structure_stop(entry, direction, context['extreme'], volatility, stop,
-                                                   contract['contractType'] if contract else
-                                                   ('PERPETUAL' if asset in FAST_CRYPTO_ASSETS else 'TRADIFI_PERPETUAL'))
-                    except ValueError:
-                        entry_checks['结构止损超限'] += 1
-                        continue
-                cost = 2*(fee+slippage)
-                if cost > stop*cost_cap:
-                    entry_checks['预估成本过高'] += 1
-                    continue
-                target_return = take_multiple*stop
-                if fast_trend:
-                    try:
-                        target_return, _ = fast_take_target(entry, direction, stop, volatility, cost,
-                                                            context.get('obstacles', ()))
-                    except ValueError:
-                        entry_checks['止盈空间不足'] += 1
-                        continue
-                leverage = 5 if mode == 'fast' else min(5 if mode == 'swing' else 3, max(1, int(Decimal('.05')/stop)))
-                risk_scale = Decimal(str(evidence['risk_scale'])) if evidence else 1
-                notional = entry_notional_budget(mode, equity, free_margin, leverage,
-                                                 BACKTEST_MAX_POSITIONS-len(positions), stop, cost, risk_scale)
-                if notional <= 0:
-                    entry_checks['风险预算不足'] += 1
-                    continue
-                entry_checks['模拟开仓'] += 1
-                margin = notional/leverage
-                free_margin -= margin
-                positions[asset] = dict(opened=stamp, entry=entry, direction=direction, amount=notional/entry,
-                                        risk=stop, trail=entry*(1-direction*stop), margin=margin,
-                                        take=entry*(1+direction*target_return),
-                                        initial_take=entry*(1+direction*target_return),
-                                        setup=fast_entry_setup(context, volatility) if fast_trend else None,
-                                        entry_slippage=abs(entry-opening)*notional/entry,
-                                        peak=Decimal(0), funding=Decimal(0), signal=reason, evidence=evidence)
-                peak_positions = max(peak_positions, len(positions))
-
-        for asset, position in list(positions.items()):
-            data, marks, _ = markets[asset]
-            _, mark_open, mark_high, mark_low, mark_close = marks[index][0]
-            _, trade_open, _, _, trade_close = data['1m'][index][0]
-            entry, direction, amount, stop = (position[k] for k in ('entry','direction','amount','risk'))
-            if stamp in funding[asset] and stamp > position['opened']:
-                rate, price = funding[asset][stamp]
-                position['funding'] -= direction*amount*rate*price
-            adverse = Decimal(str(mark_low if direction > 0 else mark_high))
-            favorable = Decimal(str(mark_high if direction > 0 else mark_low))
-            take = position['take']
-            trail = position['trail']
-            reason = None
-            price = None
-            if fast_trend and stamp % interval == 0 and stamp > position['opened']:
-                market = fast_position_market(stamp, lambda frame, cutoff, required: read(asset, frame, cutoff, required))
-                position['review'] = fast_position_assessment(market, position['opened'], direction, position['setup'])
-            if fast_trend:
-                review, detail = position.get('review', (None, ''))
-                mark = Decimal(str(mark_open))
-                current = direction*(mark/entry-1)
-                position['peak'] = max(position['peak'], current)
-                stop_return, take_return = fast_position_levels(stop, current, position['peak'], review == 'weak')
-                if review == 'exit':
-                    reason, price = f'入场条件失效 · {detail}', Decimal(str(trade_open))
-                elif review == 'weak' and current <= stop_return:
-                    reason, price = f'行情走弱触及收紧保护线 · {detail}', Decimal(str(trade_open))
-                if stop_return is not None and reason is None:
-                    candidate = entry*(1+direction*stop_return)
-                    breakeven = (entry*(1+direction*fee)-direction*position['funding']/amount)/(1-direction*fee)
-                    if direction*(mark-breakeven) > 0:
-                        candidate = (max if direction > 0 else min)(candidate, breakeven)
-                    if direction*(mark-candidate) > 0:
-                        trail = position['trail'] = (max if direction > 0 else min)(trail, candidate)
-                review_window = stamp // interval
-                if take_return is not None and reason is None and position.get('take_reviewed') != review_window:
-                    take = position['take'] = (min if direction > 0 else max)(take, entry*(1+direction*take_return))
-                    position['take_reviewed'] = review_window
-            if reason is None:
-                if direction*(adverse-trail) <= 0:
-                    reason = '移动止损' if trail != entry*(1-direction*stop) else '止损'
-                    price = (min if direction > 0 else max)(trail, Decimal(str(trade_open)))
-                elif direction*(favorable-take) >= 0:
-                    reason, price = '动态止盈' if take != position['initial_take'] else '止盈', take
-                elif max_hours is not None and stamp-position['opened'] >= max_hours*HOUR:
-                    reason, price = '持仓到期', Decimal(str(trade_open))
-                elif stamp+60000 >= end:
-                    reason, price = '回测结束结算', Decimal(str(trade_close))
-            if reason:
-                price_before_slippage = price
-                price *= 1-direction*slippage
-                fees = fee*amount*(entry+price)
-                fees_paid += fees
-                estimated_slippage += position['entry_slippage'] + amount*abs(price-price_before_slippage)
-                funding_net += position['funding']
-                net = direction*amount*(price-entry)-fees+position['funding']
-                balance += net
-                family = fast_signal_family(position['signal'])
-                if fast_trend and family and reason != '回测结束结算':
-                    result_r = net / (entry * amount * stop)
-                    learning_samples[direction].append((stamp + 60000, asset+'USDT', direction, family,
-                                                        float(max(Decimal(-3), min(Decimal(3), result_r)))))
-                trades.append(dict(symbol=asset+'USDT', opened=position['opened'], closed=stamp, entry=float(entry), exit=float(price),
-                                   direction=direction, net=float(net), reason=reason, signal=position['signal'],
-                                   evidence=position['evidence']))
-                if cost_control:
-                    reentry_at[asset] = stamp + SHORT_REENTRY_COOLDOWN_BARS * interval
-                del positions[asset]
-            else:
-                close = Decimal(str(mark_close))
-                peak = max(position['peak'], direction*(close/entry-1))
-                position['peak'] = peak
-                if not fast_trend and peak >= stop:
-                    breakeven = (entry*(1+direction*fee)-direction*position['funding']/amount)/(1-direction*fee)
-                    candidate = (max if direction > 0 else min)(entry*(1+direction*(peak-stop)), breakeven)
-                    if direction*(close-candidate) > 0 and direction*(candidate-trail) > 0:
-                        position['trail'] = candidate
-        equity = balance + sum(value(p, Decimal(str(markets[asset][0]['1m'][index][0][4])))
-                               for asset, p in positions.items())
-        high_water = max(high_water, equity)
-        drawdown = max(drawdown, (high_water-equity)/high_water)
-        if stamp % HOUR == 0 or stamp+60000 >= end:
-            curve.append(dict(time=stamp+60000, equity=float(equity)))
-    name = STRATEGY_NAMES[mode] if rules == 'current' else f'{STRATEGY_NAMES[mode]} · {BACKTEST_RULES[rules]}'
-    net = balance-initial
-    wins = [trade['net'] for trade in trades if trade['net'] > 0]
-    losses = [-trade['net'] for trade in trades if trade['net'] < 0]
-    return dict(mode=mode, name=name, initial=float(initial), net=float(net),
-                gross=float(net+fees_paid+estimated_slippage-funding_net), fees=float(fees_paid),
-                slippage=float(estimated_slippage), funding=float(funding_net),
-                roi=float(balance/initial-1), drawdown=float(drawdown), count=len(trades),
-                win_rate=len(wins)/len(trades) if trades else None,
-                payoff_ratio=statistics.mean(wins)/statistics.mean(losses) if wins and losses else None,
-                profit_factor=sum(wins)/sum(losses) if losses else None,
-                expectancy=float(net/len(trades)) if trades else None,
-                curve=curve, trades=list(reversed(trades)), event_skips=event_skips,
-                capacity_skips=capacity_skips, peak_positions=peak_positions, assets=assets,
-                entry_checks=dict(entry_checks.most_common()))
 
 
 def backtest_range(params):
@@ -3110,8 +2573,12 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         try:
             if parsed.path in {'/', '/backtest'}:
-                main, _, backtest = Path(__file__).with_name('index.html').read_bytes().partition(b'<!-- backtest-page -->')
-                self.send(200, 'text/html', backtest if parsed.path == '/backtest' else main)
+                page = 'backtest.html' if parsed.path == '/backtest' else 'index.html'
+                self.send(200, 'text/html', Path(__file__).with_name(page).read_bytes())
+                return
+            asset = parsed.path.removeprefix('/')
+            if asset in WEB_ASSETS:
+                self.send(200, WEB_ASSETS[asset], Path(__file__).with_name(asset).read_bytes())
                 return
             if parsed.path == '/version':
                 self.send(200, 'application/json', json.dumps(dict(commit=deployed_commit())).encode())

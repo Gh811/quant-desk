@@ -11,11 +11,17 @@ exec 9>/run/lock/quant-desk-update.lock
 flock -n 9 || exit 0
 stage=$(mktemp -d "$app/.update.XXXXXXXX")
 restore=0
+files="app.py strategy_signals.py backtest_replay.py index.html backtest.html index.css backtest.css index.js backtest.js"
 cleanup() {
     if [ "$restore" = 1 ]; then
         systemctl stop quant-desk || true
-        install -m 0644 "$stage/old-app.py" "$app/app.py"
-        install -m 0644 "$stage/old-index.html" "$app/index.html"
+        for file in $files; do
+            if [ -f "$stage/old/$file" ]; then
+                install -m 0644 "$stage/old/$file" "$app/$file"
+            else
+                rm -f -- "$app/$file"
+            fi
+        done
         systemctl start quant-desk
         echo '已恢复上一个版本。'
     fi
@@ -42,27 +48,33 @@ if command -v git >/dev/null 2>&1; then
 else
     revision=$remote
     mkdir "$stage/repo"
-    for file in app.py index.html; do
+    for file in $files; do
         curl -fsS --connect-timeout 10 --max-time 25 "$raw/$revision/$file" -o "$stage/repo/$file"
     done
 fi
-for file in app.py index.html; do
+for file in $files; do
     test -f "$stage/repo/$file" && test ! -L "$stage/repo/$file"
 done
-/usr/bin/python3.11 -m py_compile "$stage/repo/app.py"
+/usr/bin/python3.11 -m py_compile "$stage/repo/app.py" "$stage/repo/strategy_signals.py" "$stage/repo/backtest_replay.py"
 
-if ! cmp -s "$app/app.py" "$stage/repo/app.py" || ! cmp -s "$app/index.html" "$stage/repo/index.html"; then
+changed=0
+for file in $files; do
+    if ! cmp -s "$app/$file" "$stage/repo/$file"; then changed=1; fi
+done
+if [ "$changed" = 1 ]; then
     curl -fsS --max-time 5 "$status_url" > "$stage/status.json"
     if ! /usr/bin/python3.11 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(not (s["running"] is False and not s.get("draining") and not s.get("switch_blocked")))' < "$stage/status.json"; then
         echo '策略正在运行或处于切换状态，延后部署。'
         exit 0
     fi
 
-    cp "$app/app.py" "$stage/old-app.py"
-    cp "$app/index.html" "$stage/old-index.html"
+    mkdir "$stage/old"
+    for file in $files; do
+        if [ -f "$app/$file" ]; then cp "$app/$file" "$stage/old/$file"; fi
+    done
     restore=1
     systemctl stop quant-desk
-    install -m 0644 "$stage/repo/app.py" "$stage/repo/index.html" "$app/"
+    for file in $files; do install -m 0644 "$stage/repo/$file" "$app/"; done
     systemctl start quant-desk
     healthy=0
     for attempt in 1 2 3 4 5 6 7 8 9 10; do

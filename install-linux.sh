@@ -3,6 +3,7 @@ set -eu
 stage=$(cd -- "${1:-.}" && pwd)
 app_dir=/opt/quant-desk
 unit=/etc/systemd/system/quant-desk.service
+files="app.py strategy_signals.py backtest_replay.py index.html backtest.html index.css backtest.css index.js backtest.js"
 
 if [ -e "$app_dir" ] || [ -L "$app_dir" ] || [ -e "$unit" ] || [ -L "$unit" ] ||
    systemctl cat quant-desk.service >/dev/null 2>&1; then
@@ -11,19 +12,20 @@ if [ -e "$app_dir" ] || [ -L "$app_dir" ] || [ -e "$unit" ] || [ -L "$unit" ] ||
 fi
 
 /usr/bin/python3.11 -c "from http.server import ThreadingHTTPServer"
-/usr/bin/python3.11 -m py_compile "$stage/app.py"
+/usr/bin/python3.11 -m py_compile "$stage/app.py" "$stage/strategy_signals.py" "$stage/backtest_replay.py"
 mkdir -m 0755 "$app_dir"
 committed=0
 rollback() {
     if [ "$committed" = 0 ]; then
         systemctl disable --now quant-desk.service >/dev/null 2>&1 || true
-        rm -f -- "$unit" "$app_dir/app.py" "$app_dir/index.html"
+        rm -f -- "$unit"
+        for file in $files; do rm -f -- "$app_dir/$file"; done
         rmdir -- "$app_dir" 2>/dev/null || true
         systemctl daemon-reload || true
     fi
 }
 trap rollback EXIT
-install -m 0644 "$stage/app.py" "$stage/index.html" "$app_dir/"
+for file in $files; do install -m 0644 "$stage/$file" "$app_dir/"; done
 
 cat > "$stage/quant-desk.service" <<'UNIT'
 [Unit]

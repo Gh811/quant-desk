@@ -22,6 +22,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-scp "${ssh_options[@]}" "$source_dir/app.py" "$source_dir/index.html" "$source_dir/install-linux.sh" "$orbit_host:$remote_stage/"
+files=(app.py strategy_signals.py backtest_replay.py index.html backtest.html index.css backtest.css index.js backtest.js install-linux.sh)
+scp "${ssh_options[@]}" "${files[@]/#/$source_dir/}" "$orbit_host:$remote_stage/"
 
 ssh "${ssh_options[@]}" "$orbit_host" "sh '$remote_stage/install-linux.sh' '$remote_stage'"
