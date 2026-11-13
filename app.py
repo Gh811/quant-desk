@@ -1,4 +1,5 @@
 import hmac
+import hashlib
 import json
 import math
 import os
@@ -16,6 +17,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
+from functools import lru_cache
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlsplit
@@ -38,6 +40,42 @@ ENTRY_QUOTE_MAX_AGE_MS = 5_000
 ENTRY_RETRY_COOLDOWN_SECONDS = {'fast': 20, 'intraday': 30, 'swing': 60, 'us_open': 30}
 demo_clock_lock = threading.Lock()
 demo_clock_sample = None
+
+
+@lru_cache(maxsize=1)
+def deployed_commit_lookup(directory):
+    files = {}
+    for name in ('app.py', 'index.html'):
+        content = (directory / name).read_bytes()
+        files[name] = hashlib.sha1(f'blob {len(content)}\0'.encode() + content).hexdigest()
+
+    api = 'https://api.github.com/repos/Gh811/quant-desk'
+    with urlopen(api + '/commits?sha=main&per_page=8', timeout=3) as response:
+        commits = json.load(response)
+    for commit in commits:
+        tree_sha = commit['commit']['tree']['sha']
+        with urlopen(api + '/git/trees/' + tree_sha, timeout=3) as response:
+            tree = json.load(response)['tree']
+        if {item['path']: item['sha'] for item in tree if item['path'] in files} == files:
+            return commit['sha']
+    raise ValueError('未找到与部署文件匹配的提交')
+
+
+def deployed_commit():
+    directory = Path(__file__).resolve().parent
+    try:
+        revision = (directory / '.deployed-commit').read_text().strip()
+    except PermissionError:
+        # Existing updaters create the deployment record with a root-only umask.
+        try:
+            revision = deployed_commit_lookup(directory)
+        except (OSError, KeyError, ValueError, TypeError):
+            return None
+    except (OSError, ValueError):
+        return None
+    if revision and len(revision) == 40 and all(char in '0123456789abcdef' for char in revision):
+        return revision
+    return None
 
 def request(venue, path, **params):
     endpoint = HOSTS[venue] + path
@@ -2624,6 +2662,9 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path in {'/', '/backtest'}:
                 main, _, backtest = Path(__file__).with_name('index.html').read_bytes().partition(b'<!-- backtest-page -->')
                 self.send(200, 'text/html', backtest if parsed.path == '/backtest' else main)
+                return
+            if parsed.path == '/version':
+                self.send(200, 'application/json', json.dumps(dict(commit=deployed_commit())).encode())
                 return
             if parsed.path == '/backtest/coverage':
                 coverage = backtest_coverage(parse_qs(parsed.query))

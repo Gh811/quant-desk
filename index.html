@@ -40,6 +40,9 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
 .desk-brand{padding:0 0 16px;margin-bottom:16px;border-bottom:1px solid #ced9e6}
 .desk-brand strong{display:block;font-size:clamp(19px,2vw,24px);line-height:1.2;letter-spacing:-.035em;white-space:nowrap;color:#203450}
 .desk-brand small{display:block;margin-top:6px;color:#52647a;font-size:12px}
+.desk-brand .desk-version{font-size:11px}
+.desk-brand .desk-version[hidden]{display:none}
+.desk-version a{color:inherit;font-family:ui-monospace,monospace}
 .desk-heading{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:8px 16px;margin:0 0 20px;padding:0 0 16px;border-bottom:1px solid #d5dfeb}
 .desk-heading a{color:#174f91;border:1px solid #bacbe0;border-radius:6px;padding:7px 12px;text-decoration:none;background:#f8fafc}
 .desk-heading h1{margin:0;font-size:clamp(22px,2.7vw,32px);letter-spacing:-.035em;line-height:1.2}
@@ -63,7 +66,8 @@ body{background:#f0f3f6;color:#253248}main{grid-template-columns:215px minmax(0,
 .pnl-controls{display:flex;flex-wrap:wrap;align-items:center;gap:8px 12px;margin:8px 0}
 .pnl-controls select,.pnl-controls input{width:auto;margin:0}
 .pnl-controls label{margin:0}
-</style><main><aside><div class="desk-brand"><strong>Quant Desk</strong><small>币安合约模拟盘</small></div>
+</style><main><aside><div class="desk-brand"><strong>Quant Desk</strong><small>币安合约模拟盘</small>
+<small id="desk-version" class="desk-version" hidden>GitHub <a target="_blank" rel="noopener"></a></small></div>
 <p id="strategy-status" role="status">正在读取后台策略状态…</p>
 <label for="strategy-mode">策略</label>
 <select id="strategy-mode" disabled><option value="swing">1 小时双向</option><option value="intraday">15 分钟双向</option><option value="fast">5 分钟双向</option><option value="us_open">美股双向测试</option></select>
@@ -913,6 +917,23 @@ function strategyStatus() {
   }
   return statusRequest;
 }
+async function showDeployedVersion() {
+  try {
+    const response = await fetch('./version', {cache:'no-store', signal:AbortSignal.timeout(30000)});
+    if (!response.ok) return;
+    const {commit} = await response.json();
+    if (typeof commit !== 'string' || !/^[a-f0-9]{40}$/.test(commit)) return;
+    const version = el('desk-version');
+    const link = version.querySelector('a');
+    link.textContent = commit.slice(0, 7);
+    link.href = 'https://github.com/Gh811/quant-desk/commit/' + commit;
+    link.title = commit;
+    version.hidden = false;
+  } catch {
+    // The deployment label is optional on local or older servers.
+  }
+}
+showDeployedVersion();
 async function refreshStrategyStatus() {
   try {
     const response = await fetch('./strategy', {cache:'no-store', signal:AbortSignal.timeout(6000)});
