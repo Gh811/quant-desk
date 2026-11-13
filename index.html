@@ -1189,13 +1189,12 @@ summary{cursor:pointer;font-weight:600}details .scroll{margin-top:10px}
 <form id="backtest">
   <label>标的<select name="asset" id="asset"></select></label>
   <label>策略<select name="strategy"><option value="all">比较适用策略</option><option value="fast">5 分钟双向</option><option value="intraday">15 分钟双向</option><option value="swing">1 小时双向</option><option value="us_open">美股双向</option></select></label>
-  <label>历史行情<select name="source"><option value="demo">币安模拟盘</option><option value="live">币安实盘公开行情</option></select></label>
   <label>开始日期<input type="date" name="start" required></label>
   <label>结束日期<input type="date" name="end" required></label>
   <label>事件时间（可选，北京时间）<input type="datetime-local" name="event_at"></label>
   <button type="submit">运行回测</button>
 </form>
-<p id="status" role="status">日期按北京时间，最多 7 天。每个策略以 10,000 USDT 虚拟本金独立运行。</p>
+<p id="status" role="status">行情来源为币安实盘公开数据。日期按北京时间，最多 7 天。每个策略以 10,000 USDT 虚拟本金独立运行。</p>
 <div id="results"></div>
 <details><summary>数据与成交假设</summary>
   <p>5 分钟策略用 5 分钟找信号、15 分钟确认、1 小时过滤逆势。15 分钟和美股双向用 15 分钟、1 小时、4 小时。1 小时策略用 1 小时、4 小时、日线。信号还用成交量、主动成交占比和波动。</p>
@@ -1298,7 +1297,7 @@ form.onsubmit=async event=>{
     const data=await response.json();
     if (!response.ok) throw Error(data.error || 'HTTP '+response.status);
     render(data);
-    status.textContent=data.asset+'USDT · '+data.venue+' · '+formatTime(data.start)+' 至 '+formatTime(data.end)+
+    status.textContent=data.asset+'USDT · 币安实盘公开行情 · '+formatTime(data.start)+' 至 '+formatTime(data.end)+
       '（北京时间） · 资金费记录 '+data.funding_samples+' 条';
   } catch(error) {
     status.textContent='回测失败：'+error.message;
