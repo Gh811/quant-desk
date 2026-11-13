@@ -224,7 +224,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 <table><thead><tr><th>标的</th><th>核对代码</th><th>模拟盘状态</th><th>合约类型</th><th>最近策略判断</th></tr></thead><tbody id="market-rows"></tbody></table>
 </div>
 <div class="market-research" aria-labelledby="pool-title">
-  <div class="research-header"><div><h2 id="pool-title">实盘美股候选池</h2><p id="pool-status" role="status">正在核对币安合约目录…</p></div>
+  <div class="research-header"><div><h2 id="pool-title">合约候选池</h2><p id="pool-status" role="status">正在核对币安合约目录…</p></div>
   <div><input id="pool-search" type="search" aria-label="搜索实盘候选池" placeholder="搜索代码">
   <button id="pool-refresh" class="compact-button" type="button">刷新目录</button></div></div>
   <div class="research-scroll" id="pool-scroll"><table><thead><tr><th>合约</th><th>类别</th><th>实盘目录</th><th>模拟盘</th><th>观察列表</th></tr></thead><tbody id="pool-rows"></tbody></table></div>
@@ -1208,19 +1208,25 @@ async function loadMarketStatus() {
     renderPool();
     el('market-status').textContent = universe.demo_error ? '模拟盘目录核验失败 · ' + universe.demo_error : '币安模拟盘目录 · ' + date(Date.now());
     el('pool-status').textContent = universe.live_error ? '实盘目录暂不可用 · ' + universe.live_error
-      : marketCatalog.filter(market => market.pool).length + ' 个实盘候选 · 加入观察后可在左侧选择模拟盘支持的合约';
+      : marketCatalog.filter(isPoolMarket).length + ' 个候选 · 加入观察后可在左侧选择模拟盘支持的合约';
   } catch (error) {
     el('market-status').textContent += ' · 本次未能验证：' + error.message;
     el('pool-status').textContent = '候选池读取失败 · ' + error.message;
   }
 }
+const pinnedPoolAssets = new Set(['BNB', 'ZEC', 'ETH', 'BTC']);
+function isPoolMarket(market) {
+  return market.pool || pinnedPoolAssets.has(market.asset) || removedAssets.has(market.asset);
+}
 function renderPool() {
   const query = el('pool-search').value.trim().toUpperCase();
-  const rows = (marketCatalog || []).filter(market=>(market.pool || removedAssets.has(market.asset)) &&
+  const rows = (marketCatalog || []).filter(market=>isPoolMarket(market) &&
     (market.symbol.includes(query) || name(market.asset).toUpperCase().includes(query)));
+  rows.sort((a, b) => Number(pinnedPoolAssets.has(b.asset)) - Number(pinnedPoolAssets.has(a.asset)));
   el('pool-rows').replaceChildren();
   for (const market of pageItems(rows, 'pool-pages', renderPool)) {
-    const item = row('pool-rows', [market.symbol, market.equity === 'us' ? '美股 / ETF' : '传统资产 · 分类待确认',
+    const item = row('pool-rows', [market.symbol, pinnedPoolAssets.has(market.asset) ? '加密货币' :
+      market.equity === 'us' ? '美股 / ETF' : '传统资产 · 分类待确认',
       market.live_tradeable ? '可交易' : '未确认', market.demo_tradeable ? '可交易' : '不可选', '']);
     item.cells[0].className = 'asset-code';
     setMarketPill(item.cells[2], market.live_tradeable ? '可交易' : '未确认', market.live_tradeable ? 'live' : 'warn');
