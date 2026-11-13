@@ -175,9 +175,10 @@ const preferences = readSaved('config');
 const poolWatch = new Set(Array.isArray(preferences?.poolWatch)
   ? preferences.poolWatch.filter(asset => typeof asset === 'string' && /^[A-Z0-9]{1,24}$/.test(asset)) : []);
 const removedAssets = new Set(Array.isArray(preferences?.removedAssets) ? preferences.removedAssets : []);
-for (const asset of defaultAssets) {
-  if (!removedAssets.has(asset)) addAssetCheckbox(asset, !['SAMSUNG','XAU','BNB','ZEC','INTC'].includes(asset));
-}
+const watchedAssets = new Set([...defaultAssets, ...poolWatch].filter(asset => !removedAssets.has(asset)));
+const selectedAssets = new Set(Array.isArray(preferences?.assets) ? preferences.assets :
+  defaultAssets.filter(asset => !['SAMSUNG','XAU','BNB','ZEC','INTC'].includes(asset)));
+for (const asset of watchedAssets) addAssetCheckbox(asset, selectedAssets.has(asset));
 const strategyMode = el('strategy-mode');
 const strategySizing = el('strategy-sizing');
 const strategyNotional = el('strategy-notional');
@@ -185,31 +186,13 @@ strategySizing.value = preferences?.sizing === 'fixed' ? 'fixed' : 'capital';
 strategyNotional.value = preferences?.notional ?? '';
 const strategyNames = Object.fromEntries([...strategyMode.options].map(option => [option.value, option.textContent]));
 if (Object.hasOwn(strategyNames, preferences?.strategy)) strategyMode.value = preferences.strategy;
-if (Array.isArray(preferences?.assets)) {
-  for (const checkbox of config.querySelectorAll('[name=asset]')) {
-    checkbox.checked = preferences.assets.includes(checkbox.value);
-  }
-}
 function savePreferences() {
-  writeSaved('config', {assets:[...config.querySelectorAll('[name=asset]:checked')].map(input=>input.value),
+  writeSaved('config', {assets:[...selectedAssets],
     poolWatch:[...poolWatch], removedAssets:[...removedAssets], strategy:strategyMode.value,
     sizing:strategySizing.value, notional:strategyNotional.value});
 }
-const usStrategyAssets = new Set('SNDK SOXL KORU MU NVDA QQQ GOOGL SPCX META TSLA AMZN INTC'.split(' '));
-if (strategyMode.value === 'us_open') {
-  for (const checkbox of config.querySelectorAll('[name=asset]')) {
-    if (!usStrategyAssets.has(checkbox.value)) checkbox.checked = false;
-  }
-}
-config.addEventListener('change', savePreferences);
 strategyMode.addEventListener('change', () => {
-  if (strategyMode.value === 'us_open') {
-    for (const checkbox of config.querySelectorAll('[name=asset]')) {
-      checkbox.checked = marketByAsset.get(checkbox.value)?.demo_tradeable &&
-        marketByAsset.get(checkbox.value)?.equity === 'us';
-    }
-    renderMarketRows();
-  }
+  renderMarketRows();
   renderStrategyControls();
   savePreferences();
 });
@@ -839,7 +822,7 @@ async function refreshStrategyStatus() {
       let selectionChanged = false;
       const existing = new Set([...config.querySelectorAll('[name=asset]')].map(input=>input.value));
       for (const asset of state.assets) {
-        if (!existing.has(asset)) {
+        if (!existing.has(asset) && !removedAssets.has(asset)) {
           addAssetCheckbox(asset, true);
           selectionChanged = true;
         }
@@ -855,6 +838,7 @@ async function refreshStrategyStatus() {
     } else if (wasRunning) {
       for (const input of config.querySelectorAll('[name=asset]')) {
         if (removedAssets.has(input.value)) input.closest('.asset-choice').remove();
+        else input.checked = selectedAssets.has(input.value);
       }
       renderMarketRows();
     }
@@ -939,7 +923,12 @@ config.addEventListener('change', async event => {
   if (input.name === 'asset' && strategyState?.running) {
     const enabled = input.checked;
     input.checked = strategyState.assets.includes(input.value);
-    if (await changeRunningAsset(input.value, enabled)) input.checked = enabled;
+    if (!(await changeRunningAsset(input.value, enabled))) return;
+    input.checked = enabled;
+  }
+  if (input.name === 'asset') {
+    if (input.checked) selectedAssets.add(input.value);
+    else selectedAssets.delete(input.value);
     savePreferences();
   }
   renderMarketRows();
@@ -954,15 +943,8 @@ async function loadMarketStatus() {
     marketByAsset = new Map(marketCatalog.map(market => [market.asset, market]));
     const existing = new Set([...config.querySelectorAll('[name=asset]')].map(input=>input.value));
     for (const market of marketCatalog) {
-      if ((poolWatch.has(market.asset) || (strategyState?.running && strategyState.assets.includes(market.asset))) &&
-          !existing.has(market.asset))
-        addAssetCheckbox(market.asset, strategyState?.running ? strategyState.assets.includes(market.asset) :
-          (preferences?.assets?.includes(market.asset) || false));
-    }
-    for (const input of config.querySelectorAll('[name=asset]')) {
-      const market = marketByAsset.get(input.value);
-      if (!universe.demo_error && (!market?.demo_tradeable || (strategyMode.value === 'us_open' && market.equity !== 'us')))
-        input.checked = false;
+      if (poolWatch.has(market.asset) && !removedAssets.has(market.asset) && !existing.has(market.asset))
+        addAssetCheckbox(market.asset, selectedAssets.has(market.asset));
     }
     renderStrategyControls();
     renderMarketRows();
@@ -1009,7 +991,8 @@ async function setAssetWatch(asset, watched) {
     if (assetEditingLocked() || assetBusy(asset)) return;
     if (strategyState.running && strategyState.assets.includes(asset) && !(await changeRunningAsset(asset, false))) return;
     poolWatch.delete(asset);
-    if (defaultAssets.includes(asset)) removedAssets.add(asset);
+    removedAssets.add(asset);
+    selectedAssets.delete(asset);
     input?.closest('.asset-choice').remove();
   } else {
     removedAssets.delete(asset);
