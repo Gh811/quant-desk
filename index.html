@@ -1645,9 +1645,8 @@ function updateBacktestAssets() {
   assetGroup.replaceChildren(...list.filter(market => market.symbol.includes(query)).map(market => {
     const label = element('label');
     const input = element('input');
-    const enabled = market[feed+'_tradeable'];
-    Object.assign(input, {type:'checkbox', value:market.asset,
-      disabled:enabled === false, checked:enabled !== false && selected[feed].has(market.asset)});
+    Object.assign(input, {type:'checkbox', value:market.asset, checked:selected[feed].has(market.asset)});
+    if (market[feed+'_tradeable'] === false) label.title = '提交后检查该来源的历史行情';
     input.onchange = () => input.checked ? selected[feed].add(market.asset) : selected[feed].delete(market.asset);
     label.append(input, market.asset);
     return label;
@@ -1742,8 +1741,7 @@ form.onsubmit = async event => {
   const feed = source();
   submit.disabled = true;
   try {
-    const assets = [...selected[feed]].filter(asset =>
-      markets.find(market => market.asset === asset)?.[feed+'_tradeable'] !== false);
+    const assets = [...selected[feed]];
     if (!assets.length) throw Error('请选择至少一个标的');
     const params = new URLSearchParams({source:feed, days:form.elements.days.value});
     if (form.elements.days.value === 'custom') {
