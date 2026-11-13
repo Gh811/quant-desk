@@ -306,19 +306,19 @@ def protection_price(entry, change, tick, *, direction, kind):
     return (entry*(1+direction*change)/tick).to_integral_value(rounding=rounding)*tick
 
 
-def set_initial_protection(symbol, entry, stop_loss, tick, context, *, direction=1):
+def set_initial_protection(symbol, entry, stop_loss, tick, context, *, direction=1, take_multiple=2):
     if entry <= 0 or tick <= 0:
         raise ValueError('成交均价或价格步长无效')
     with protection_lock:
-        for kind, change in (('stop', -stop_loss), ('take', 2*stop_loss)):
+        for kind, change in (('stop', -stop_loss), ('take', take_multiple*stop_loss)):
             price = protection_price(entry, change, tick, direction=direction, kind=kind)
             place_protection(symbol, kind, price, context, direction=direction)
 
 
-def align_strategy_protection(symbol, entry, mark, stop_loss, stop, tick, context, *, direction=1, take=None):
+def align_strategy_protection(symbol, entry, mark, stop_loss, stop, tick, context, *, direction=1, take=None, take_multiple=2):
     if min(entry, mark, tick) <= 0:
         raise ValueError('保护单价格数据无效')
-    initial_take = protection_price(entry, 2*stop_loss, tick, direction=direction, kind='take')
+    initial_take = protection_price(entry, take_multiple*stop_loss, tick, direction=direction, kind='take')
     if take is None:
         take = initial_take
     if min(stop, take) <= 0 or not direction*stop < direction*mark < direction*take:
@@ -733,6 +733,9 @@ ENTRY_EQUITY_RISK = {'fast': Decimal('.005'), 'intraday': Decimal('.0065'), 'swi
 SHORT_COST_CAP = Decimal('.30')
 SHORT_RISK_MULTIPLIER = Decimal('.5')
 SHORT_REENTRY_COOLDOWN_BARS = 3
+FAST_TREND_RULE = 'fast_trend'
+FAST_TREND_TARGET = Decimal('3')
+FAST_TREND_TRAIL_START = Decimal('1.5')
 
 
 def entry_stop_fraction(asset, mode, volatility):
@@ -974,12 +977,12 @@ FAST_CORRELATED_ASSETS = {'BTC', 'ETH', 'SOL'}
 
 
 BACKTEST_RULES = {'baseline': '原版', 'confirmation': '严格确认', 'retest': '严格确认＋回踩',
-                  'cost_control': '成本与风险控制'}
+                  'cost_control': '成本与风险控制', FAST_TREND_RULE: '5 分钟趋势延续'}
 
 
 def backtest_entry_signal(symbol, mode, now, read, rules):
     candle, score, volatility, reason, context = evaluate_entry_signal(symbol, mode, now, read)
-    if rules in {'baseline', 'cost_control'} or score is None:
+    if rules in {'baseline', 'cost_control', FAST_TREND_RULE} or score is None:
         return candle, score, volatility, reason, context
     if rules == 'retest' and mode != 'swing' and reason in {'突破做多', '跌破做空'}:
         return candle, None, volatility, '等待回踩或反抽', {}
@@ -1025,7 +1028,10 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
     event_skips = capacity_skips = peak_positions = 0
     curve = [dict(time=start, equity=float(initial))]
     interval = STRATEGY_INTERVALS[mode]
-    cost_control = rules == 'cost_control' and mode != 'swing'
+    fast_trend = rules == FAST_TREND_RULE
+    cost_control = rules in {'cost_control', FAST_TREND_RULE} and mode != 'swing'
+    take_multiple = FAST_TREND_TARGET if fast_trend else 2
+    trail_start = FAST_TREND_TRAIL_START if fast_trend else 1
     cost_cap = SHORT_COST_CAP if cost_control else Decimal('.75')
     equity_risk = ENTRY_EQUITY_RISK[mode] * (SHORT_RISK_MULTIPLIER if cost_control else 1)
     reentry_at = {}
@@ -1094,7 +1100,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 position['funding'] -= direction*amount*rate*price
             adverse = Decimal(str(mark_low if direction > 0 else mark_high))
             favorable = Decimal(str(mark_high if direction > 0 else mark_low))
-            take = entry*(1+direction*2*stop)
+            take = entry*(1+direction*take_multiple*stop)
             trail = position['trail']
             reason = None
             price = None
@@ -1125,7 +1131,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 close = Decimal(str(mark_close))
                 peak = max(position['peak'], direction*(close/entry-1))
                 position['peak'] = peak
-                if peak >= stop:
+                if peak >= trail_start*stop:
                     breakeven = (entry*(1+direction*fee)-direction*position['funding']/amount)/(1-direction*fee)
                     candidate = (max if direction > 0 else min)(entry*(1+direction*(peak-stop)), breakeven)
                     if direction*(close-candidate) > 0 and direction*(candidate-trail) > 0:
@@ -1139,11 +1145,16 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
     label = 'baseline' if rules == 'cost_control' and mode == 'swing' else rules
     name = STRATEGY_NAMES[mode] if label == 'baseline' else f'{STRATEGY_NAMES[mode]} · {BACKTEST_RULES[label]}'
     net = balance-initial
+    wins = [trade['net'] for trade in trades if trade['net'] > 0]
+    losses = [-trade['net'] for trade in trades if trade['net'] < 0]
     return dict(mode=mode, name=name, initial=float(initial), net=float(net),
                 gross=float(net+fees_paid+estimated_slippage-funding_net), fees=float(fees_paid),
                 slippage=float(estimated_slippage), funding=float(funding_net),
                 roi=float(balance/initial-1), drawdown=float(drawdown), count=len(trades),
-                win_rate=sum(t['net'] > 0 for t in trades)/len(trades) if trades else None,
+                win_rate=len(wins)/len(trades) if trades else None,
+                payoff_ratio=statistics.mean(wins)/statistics.mean(losses) if wins and losses else None,
+                profit_factor=sum(wins)/sum(losses) if losses else None,
+                expectancy=float(net/len(trades)) if trades else None,
                 curve=curve, trades=list(reversed(trades)), event_skips=event_skips,
                 capacity_skips=capacity_skips, peak_positions=peak_positions, assets=assets)
 
@@ -1206,6 +1217,8 @@ def run_backtest(params):
     variant = params.get('rules', ['baseline'])[0]
     if variant not in {*BACKTEST_RULES, 'compare'}:
         raise ValueError('回测规则无效')
+    if variant == FAST_TREND_RULE and modes != ['fast']:
+        raise ValueError('趋势延续规则仅适用于 5 分钟策略')
     variants = list(BACKTEST_RULES) if variant == 'compare' else [variant]
     venue, source_label = backtest_feed(params)
     event_value = params.get('event_at', [''])[0]
@@ -1240,7 +1253,8 @@ def run_backtest(params):
                 funding_samples=sum(len(funding) for _, _, funding in markets.values()),
                 results=[replay_portfolio(key, markets, start, end, fee, slippage, event_at, rules=rules)
                          for key in modes for rules in variants if not (
-                             key == 'swing' and rules in {'retest', 'cost_control'} and variant == 'compare')])
+                             key == 'swing' and rules in {'retest', 'cost_control'} and variant == 'compare')
+                         and (rules != FAST_TREND_RULE or key == 'fast')])
 
 
 def restore_strategy_positions(positions, assets, mode):
@@ -1360,6 +1374,7 @@ class DemoStrategy:
         self.status = '未启动'
         self.mode = 'swing'
         self.cost_control = False
+        self.entry_rules = 'baseline'
         self.fixed_notional = None
         self.assets = []
         self.checks = {}
@@ -1393,8 +1408,12 @@ class DemoStrategy:
             finally:
                 self.draining = False
 
-    def run(self, assets, mode, fixed_notional=None, *, cost_control=False):
+    def run(self, assets, mode, fixed_notional=None, *, entry_rules='baseline'):
         short_term = mode != 'swing'
+        fast_trend = entry_rules == FAST_TREND_RULE
+        cost_control = entry_rules in {'cost_control', FAST_TREND_RULE}
+        take_multiple = FAST_TREND_TARGET if fast_trend else 2
+        trail_start = FAST_TREND_TRAIL_START if fast_trend else 1
         cost_cap = SHORT_COST_CAP if cost_control else Decimal('.75')
         equity_risk = ENTRY_EQUITY_RISK[mode] * (SHORT_RISK_MULTIPLIER if cost_control else 1)
         cooldown_ms = SHORT_REENTRY_COOLDOWN_BARS * STRATEGY_INTERVALS[mode]
@@ -1415,8 +1434,8 @@ class DemoStrategy:
         last_scan_log = None
         next_entry_scan = 0
         try:
-            entry_rules = BACKTEST_RULES['cost_control' if cost_control else 'baseline']
-            record_runtime('收到启动请求', mode=mode, detail=f'{entry_rules} · {"、".join(sorted(assets))}')
+            record_runtime('收到启动请求', mode=mode,
+                           detail=f'{BACKTEST_RULES[entry_rules]} · {"、".join(sorted(assets))}')
             while not self.stop.is_set():
                 self.wake.clear()
                 if recovering:
@@ -1485,13 +1504,13 @@ class DemoStrategy:
                     price_return = pnl / entry_value if entry_value > 0 else Decimal(0)
                     peak = max(peaks.get(symbol, price_return), price_return)
                     peaks[symbol] = peak
-                    fixed_exit = price_return <= -stop_loss or price_return >= 2 * stop_loss
+                    fixed_exit = price_return <= -stop_loss or price_return >= take_multiple * stop_loss
                     entry_price = entry_value/abs(amount)
                     mark = notional/abs(amount)
                     tick = ticks[symbol]
                     minimum_stop = protection_price(entry_price, -stop_loss, tick, direction=direction, kind='stop')
                     stop = trailing_stops.get(symbol, minimum_stop)
-                    if peak >= stop_loss and not (timed_out or fixed_exit):
+                    if peak >= trail_start*stop_loss and not (timed_out or fixed_exit):
                         candidate = protection_price(entry_price, peak-stop_loss, tick, direction=direction, kind='stop')
                         try:
                             costs = position_breakeven_costs(symbol, opening_id, amount, breakeven_costs)
@@ -1507,7 +1526,7 @@ class DemoStrategy:
                     if not (timed_out or fixed_exit or trailing):
                         take = None
                         reviewed_window = None
-                        if stop != minimum_stop and price_return >= stop_loss:
+                        if not fast_trend and stop != minimum_stop and price_return >= stop_loss:
                             window = demo_now_ms() // STRATEGY_INTERVALS[mode]
                             if take_reviewed.get(symbol) != window:
                                 try:
@@ -1525,7 +1544,8 @@ class DemoStrategy:
                         try:
                             align_strategy_protection(symbol, entry_price, mark, stop_loss, stop, tick,
                                                       dict(opening_id=opening_id, opened=int(opened*1000),
-                                                           leverage=leverage, strategy=mode), direction=direction, take=take)
+                                                           leverage=leverage, strategy=mode), direction=direction,
+                                                      take=take, take_multiple=take_multiple)
                             if reviewed_window is not None:
                                 take_reviewed[symbol] = reviewed_window
                             if stop != minimum_stop:
@@ -1552,8 +1572,8 @@ class DemoStrategy:
                             reason, threshold = '达到最长持仓时间', f'{max_hold_hours:g} 小时'
                         elif price_return <= -stop_loss:
                             reason, threshold = '达到止损线', f'{-stop_loss:.3%}'
-                        elif price_return >= 2*stop_loss:
-                            reason, threshold = '达到止盈线', f'{2*stop_loss:.3%}'
+                        elif price_return >= take_multiple*stop_loss:
+                            reason, threshold = '达到止盈线', f'{take_multiple*stop_loss:.3%}'
                         elif trailing:
                             reason, threshold = '触发移动止盈', f'移动止损价 {stop:f}'
                         else:
@@ -1826,7 +1846,8 @@ class DemoStrategy:
                                 entry = opening_fill_price(symbol, order, direction=direction)
                             set_initial_protection(symbol, entry, stop_loss, tick,
                                                    dict(opening_id=order.get('orderId'), opened=order.get('updateTime'),
-                                                        leverage=leverage_target, strategy=mode), direction=direction)
+                                                        leverage=leverage_target, strategy=mode), direction=direction,
+                                                   take_multiple=take_multiple)
                             checks[symbol[:-4]] = '开仓已成交 · 止盈止损已挂'
                         except (ValueError, OSError, KeyError, ArithmeticError, sqlite3.Error) as error:
                             protection_errors[symbol] = str(error)
@@ -2177,7 +2198,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if mode == 'us_open':
                 assets &= US_EQUITY_ASSETS
-            cost_control = mode != 'swing' and params.get('entry_rules', ['baseline'])[0] == 'cost_control'
+            entry_rules = params.get('entry_rules', ['baseline'])[0] if mode != 'swing' else 'baseline'
+            allowed_rules = {'baseline', 'cost_control'}
+            if mode == 'fast':
+                allowed_rules.add(FAST_TREND_RULE)
+            if entry_rules not in allowed_rules:
+                self.send(400, 'application/json', json.dumps({'error': '此策略不支持所选入场规则'}).encode())
+                return
             with strategy.control:
                 if not assets or strategy.draining or strategy.switch_blocked or not strategy.lock.acquire(blocking=False):
                     self.send(409, 'application/json', '{"error":"请选择标的，并等当前策略停止且币安确认空仓、无挂单"}'.encode())
@@ -2186,7 +2213,8 @@ class Handler(BaseHTTPRequestHandler):
                 strategy.entries_paused.clear()
                 strategy.wake.clear()
                 strategy.mode = mode
-                strategy.cost_control = cost_control
+                strategy.cost_control = entry_rules in {'cost_control', FAST_TREND_RULE}
+                strategy.entry_rules = entry_rules
                 strategy.fixed_notional = fixed_notional
                 strategy.assets = sorted(assets)
                 strategy.checks = {}
@@ -2194,7 +2222,7 @@ class Handler(BaseHTTPRequestHandler):
                 strategy.scan_ms = None
                 strategy.status = '正在核对模拟账户'
                 threading.Thread(target=strategy.run, args=(assets, mode, fixed_notional),
-                                 kwargs={'cost_control': cost_control}, daemon=True).start()
+                                 kwargs={'entry_rules': entry_rules}, daemon=True).start()
         else:
             self.send(404, 'text/plain', b'Not found')
             return
@@ -2245,6 +2273,7 @@ class Handler(BaseHTTPRequestHandler):
                                                                     draining=self.server.strategy.draining, assets=self.server.strategy.assets,
                                                                     entries_paused=self.server.strategy.entries_paused.is_set(),
                                                                     cost_control=self.server.strategy.cost_control,
+                                                                    entry_rules=self.server.strategy.entry_rules,
                                                                     fixed_notional=(str(self.server.strategy.fixed_notional)
                                                                                     if self.server.strategy.fixed_notional is not None else None),
                                                                     switch_blocked=self.server.strategy.switch_blocked,
