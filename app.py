@@ -266,7 +266,7 @@ def fast_position_market(now, read):
     return closed_at, closes[-2:], averages, *higher_frames
 
 
-def fast_position_assessment(market, opened, direction, setup):
+def fast_position_assessment(market, opened, direction, setup, *, us_equity=False):
     if market is None or market[0] <= opened:
         return None, ''
     closed_at, closes, averages, confirmation, background = market
@@ -285,11 +285,15 @@ def fast_position_assessment(market, opened, direction, setup):
         failed_pair = lost_boundary and post_entry_pair and direction * (
             Decimal(str(closes[0])) / boundary - 1) < -buffer
         if lost_structure:
-            return 'exit', f'5 分钟收盘 {close:f} 穿过入场结构极值 {extreme:f}'
+            structure_confirmed = post_entry_pair and direction * (Decimal(str(closes[0])) / extreme - 1) < -buffer
+            if not us_equity or opposite or structure_confirmed:
+                return 'exit', f'5 分钟收盘 {close:f} 穿过入场结构极值 {extreme:f}'
         if lost_boundary and opposite:
             return 'exit', f'5 分钟收盘 {close:f} 穿过入场触发位 {boundary:f}，{opposite}趋势反向'
         if failed_pair and confirmation is not None and not trend_metrics(confirmation, direction)[0]:
             return 'exit', f'连续两根 5 分钟 K 线收盘失守触发位 {boundary:f}，15 分钟同向趋势消失'
+        if lost_structure:
+            return 'weak', f'首次 5 分钟收盘穿过入场结构极值 {extreme:f}，等待再次确认'
         if lost_boundary:
             return 'weak', f'5 分钟收盘 {close:f} 失守入场触发位 {boundary:f}'
     if opposite and weak_pair:
@@ -554,7 +558,8 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
             price = None
             if fast_trend and stamp % interval == 0 and stamp > position['opened']:
                 market = fast_position_market(stamp, lambda frame, cutoff, required: read(asset, frame, cutoff, required))
-                position['review'] = fast_position_assessment(market, position['opened'], direction, position['setup'])
+                position['review'] = fast_position_assessment(
+                    market, position['opened'], direction, position['setup'], us_equity=asset in us_assets)
             maker_fill_bar = maker_fee is not None and stamp == position['opened']
             if fast_trend and not maker_fill_bar:
                 review, detail = position.get('review', (None, ''))
@@ -2420,8 +2425,11 @@ class DemoStrategy:
                             except (OSError, ValueError, KeyError, IndexError, TypeError, ArithmeticError):
                                 review_retry[symbol] = now + FAST_REVIEW_RETRY_MS
                             else:
-                                state, detail = fast_position_assessment(market, opened*1000, direction,
-                                                                         fast_setups.get(symbol))
+                                cached = catalog_cache.get(DEMO_VENUE)
+                                contract = cached[1].get(symbol) if cached else None
+                                state, detail = fast_position_assessment(
+                                    market, opened*1000, direction, fast_setups.get(symbol),
+                                    us_equity=equity_kind(symbol, contract) == 'us')
                                 if market[0] == window:
                                     fast_reviews[symbol] = (market[0], state, detail)
                                 if state == 'exit' and market[0] == window:
