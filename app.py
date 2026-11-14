@@ -3834,6 +3834,17 @@ def recent_orders(limit=50, *, query=''):
                                    'demo_order_http_error': '接口报错',
                                    'demo_order_unknown': '待核对',
                                }.get(kind, '待核对'))
+        opening_strategies = {
+            (order['symbol'], str(order['exchange_order_id'])): order['strategy']
+            for order in orders.values()
+            if not order.get('reduce_only') and order.get('strategy')
+            and order['exchange_order_id'] is not None
+        }
+        for order in orders.values():
+            if order.get('reduce_only') and not order.get('strategy') and order.get('opening_id') is not None:
+                strategy = opening_strategies.get((order['symbol'], str(order['opening_id'])))
+                if strategy:
+                    order['strategy'] = strategy
         return list(orders.values())[:limit]
 
 

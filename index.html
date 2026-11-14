@@ -100,8 +100,8 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 #pool-scroll th:nth-child(1){width:17%}
 #pool-scroll th:nth-child(2){width:31%}
 #pool-scroll th:nth-child(3),#pool-scroll th:nth-child(4){width:16%}
-#pool-pages{flex-wrap:nowrap;overflow-x:auto;padding:2px}
-#pool-pages>*{flex:none}
+#pool-pages,#market-pages{flex-wrap:nowrap;overflow-x:auto;padding:2px}
+#pool-pages>*,#market-pages>*{flex:none}
 </style><main><aside><div class="desk-brand"><strong>Quant Desk</strong><small>币安合约模拟盘</small>
 <small id="desk-version" class="desk-version" hidden>GitHub <a target="_blank" rel="noopener"></a></small></div>
 <p id="strategy-status" role="status">正在读取后台策略状态…</p>
@@ -225,7 +225,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <p id="market-status">正在读取币安模拟盘合约目录…</p>
   <p id="scan-status"></p>
 </div>
-<table><thead><tr><th>标的</th><th>核对代码</th><th>模拟盘状态</th><th>合约类型</th><th>最近策略判断</th></tr></thead><tbody id="market-rows"></tbody></table><nav id="market-pages" aria-label="标的状态分页"></nav>
+<table><thead><tr><th>标的</th><th>核对代码</th><th>模拟盘状态</th><th>合约类型</th><th>最近策略判断</th></tr></thead><tbody id="market-rows"></tbody></table><nav id="market-pages" class="pagination" aria-label="标的状态分页" hidden></nav>
 </div>
 <div class="market-research" aria-labelledby="pool-title">
   <div class="research-header"><div><h2 id="pool-title">合约候选池</h2><p id="pool-status" role="status">正在核对币安合约目录…</p></div>
@@ -475,16 +475,16 @@ function orderElement(tag, className, text) {
 }
 const pageSize = 9;
 el('pool-scroll').style.setProperty('--pool-page-size', pageSize);
-function pageItems(items, navigationId, render) {
+function pageItems(items, navigationId, render, size = pageSize) {
   const navigation = el(navigationId);
-  const pageCount = Math.max(1, Math.ceil(items.length / pageSize));
+  const pageCount = Math.max(1, Math.ceil(items.length / size));
   const page = Math.min(Number(navigation.dataset.page || 1), pageCount);
   renderPagination(navigationId, page, pageCount, number => {
     navigation.dataset.page = number;
     render();
   });
-  const start = (page - 1) * pageSize;
-  return items.slice(start, start + pageSize);
+  const start = (page - 1) * size;
+  return items.slice(start, start + size);
 }
 function renderPagination(navigationId, page, pageCount, selectPage) {
   const navigation = el(navigationId);
@@ -571,6 +571,9 @@ function holdingStatus() {
   badge.dataset.tone = 'live';
   return badge;
 }
+function orderStrategyLabel(strategy) {
+  return '策略 · ' + (Object.hasOwn(strategyNames, strategy) ? strategyNames[strategy] : strategy || '未记录');
+}
 function orderCard(order, position, snapshot) {
   const money = value => value == null || value === '' ? '—' : oneDecimal.format(value) + ' USDT';
   const card = orderElement('article', 'order-card');
@@ -610,14 +613,14 @@ function orderCard(order, position, snapshot) {
     const amount = orderElement('strong', '', pending ? '待核对' : money(order.pnl));
     colorPnL(amount, order.pnl);
     profit.append(orderElement('small', '', '净收益'), amount);
-    card.append(header, orderElement('p', 'order-strategy', strategyNames[order.strategy] || '—'), profit);
+    card.append(header, orderElement('p', 'order-strategy', orderStrategyLabel(order.strategy)), profit);
     add(metrics, '开仓均价', tradePrice(order.entry_price), null, order.entry_price);
     add(metrics, '平仓均价', tradePrice(order.exit_price), null, order.exit_price);
     add(metrics, '净收益率', order.roi == null ? '—' : oneDecimal.format(order.roi*100) + '%', order.roi);
     add(metrics, '手续费', money(order.fees));
     add(metrics, '资金费净额', money(order.funding));
   } else {
-    card.append(header, orderElement('p', 'order-strategy', strategyNames[order.strategy] || '—'));
+    card.append(header, orderElement('p', 'order-strategy', orderStrategyLabel(order.strategy)));
   }
   add(times, '开仓时间', date(order.opened));
   if (!position) add(times, '平仓时间', date(order.closed));
@@ -851,7 +854,7 @@ function renderDecisions(records) {
     const status = endedWithFill ? '部分成交 · 剩余委托已结束' : (orderLabels[order.status] || order.status);
     item.append(orderElement('strong', '', order.symbol + ' · ' + action + ' · ' + status),
       orderElement('p', '', decision?.reason || '旧订单未记录决策原因'),
-      orderElement('small', '', [strategyNames[order.strategy], date(decision?.signal_at || order.closed || order.opened || order.time),
+      orderElement('small', '', [orderStrategyLabel(order.strategy), date(decision?.signal_at || order.closed || order.opened || order.time),
         order.limit_price ? '限价 ' + order.limit_price : '', decision?.detail].filter(Boolean).join(' · ')));
     if (order.status_reason || (order.status === 'NEW' && order.entry_expires_at)) {
       item.append(orderElement('p', '', [order.status_reason, order.status === 'NEW' && order.entry_expires_at &&
@@ -1177,7 +1180,7 @@ function renderMarketRows() {
     {asset, symbol:asset + 'USDT', status:'目录未确认'});
   markets.sort((a, b) => Number(heldSymbols.has(b.symbol)) - Number(heldSymbols.has(a.symbol)));
   el('market-rows').replaceChildren();
-  for (const market of pageItems(markets, 'market-pages', renderMarketRows)) {
+  for (const market of pageItems(markets, 'market-pages', renderMarketRows, 15)) {
     const tradeable = market.demo_tradeable;
     const status = tradeable ? '可交易' : market.status ?? (market.live_tradeable ? '仅实盘目录可交易' : '模拟盘未匹配');
     const item = row('market-rows', [name(market.asset), market.symbol, status, market.contract_type ?? '—', strategyChecks[market.asset] || '—']);
@@ -1445,7 +1448,7 @@ function renderShadow() {
       ' · ' + pnlAmount.format(Number(t.net)) + ' USDT');
     colorPnL(net, t.net);
     item.append(net, orderElement('p', '', t.reason + ' · ' + t.entry + ' → ' + t.exit),
-      orderElement('small', '', date(t.closed) + ' · 手续费 ' + pnlAmount.format(Number(t.fees)) +
+      orderElement('small', '', orderStrategyLabel(t.mode) + ' · ' + date(t.closed) + ' · 手续费 ' + pnlAmount.format(Number(t.fees)) +
         ' · 资金费 ' + pnlAmount.format(Number(t.funding))));
     return item;
   });
