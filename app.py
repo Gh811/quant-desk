@@ -668,9 +668,9 @@ DEMO_ORDER_TERMINAL = {'FILLED', 'CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJ
 DEMO_CLOCK_TTL_NS = 60 * 1_000_000_000
 TRADIFI_QUOTE_MAX_AGE_MS = 30_000
 TRADIFI_QUOTE_MAX_DEVIATION = Decimal('.03')
-ENTRY_WAIT_SECONDS = {'scalp': 8, 'fast': 60, 'intraday': 90, 'swing': 120, 'us_open': 60}
+ENTRY_WAIT_SECONDS = {'scalp': 8, 'fast': 20, 'intraday': 90, 'swing': 120, 'us_open': 60}
 ENTRY_QUOTE_MAX_AGE_MS = 5_000
-ENTRY_RETRY_COOLDOWN_SECONDS = {'scalp': 8, 'fast': 20, 'intraday': 30, 'swing': 60, 'us_open': 30}
+ENTRY_RETRY_COOLDOWN_SECONDS = {'scalp': 8, 'fast': 8, 'intraday': 30, 'swing': 60, 'us_open': 30}
 demo_clock_lock = threading.Lock()
 demo_clock_sample = None
 catalog_locks = {venue: threading.Lock() for venue in ('Binance', DEMO_VENUE)}
@@ -2346,7 +2346,7 @@ class DemoStrategy:
         cost_control = short_term
         take_multiple = FAST_TREND_TARGET if fast_trend else 2
         cost_cap = SHORT_COST_CAP if cost_control else Decimal('.75')
-        scan_interval = {'scalp': 5, 'fast': 10}.get(mode, 30)
+        scan_interval = {'scalp': 5, 'fast': 3}.get(mode, 30)
         cooldown_bars = 1 if mode == 'scalp' else SHORT_REENTRY_COOLDOWN_BARS
         cooldown_ms = cooldown_bars * STRATEGY_INTERVALS[mode]
         reentry_at = {}
@@ -2915,6 +2915,8 @@ class DemoStrategy:
                                 self.checks = checks.copy()
                                 continue
                             detail += f' · 下单前模拟盘标记价 {mark:f} · 计划止损触发价 {planned_stop:f}'
+                        if fast_trend:
+                            detail += f' · 收盘至准备发单 {(now - signal_at) / 1000:.1f} 秒'
                         decision = dict(reason=reason, detail=detail, signal_at=signal_at)
                         if fast_trend:
                             decision['setup'] = fast_entry_setup(signal_context, volatility)
@@ -3360,6 +3362,9 @@ class Handler(BaseHTTPRequestHandler):
             params = parse_qs(parsed.query)
             assets = set(params.get('asset', ()))
             mode = params.get('strategy', ['swing'])[0]
+            if mode == 'scalp':
+                self.send(400, 'application/json', json.dumps({'error': '1 分钟策略已下线，请选择 5 分钟双向策略'}).encode())
+                return
             if mode not in STRATEGY_NAMES:
                 self.send(400, 'application/json', '{"error":"未知策略"}'.encode())
                 return
