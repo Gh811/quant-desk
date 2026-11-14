@@ -225,7 +225,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <p id="market-status">正在读取币安模拟盘合约目录…</p>
   <p id="scan-status"></p>
 </div>
-<table><thead><tr><th>标的</th><th>核对代码</th><th>模拟盘状态</th><th>合约类型</th><th>最近策略判断</th></tr></thead><tbody id="market-rows"></tbody></table>
+<table><thead><tr><th>标的</th><th>核对代码</th><th>模拟盘状态</th><th>合约类型</th><th>最近策略判断</th></tr></thead><tbody id="market-rows"></tbody></table><nav id="market-pages" aria-label="标的状态分页"></nav>
 </div>
 <div class="market-research" aria-labelledby="pool-title">
   <div class="research-header"><div><h2 id="pool-title">合约候选池</h2><p id="pool-status" role="status">正在核对币安合约目录…</p></div>
@@ -387,7 +387,6 @@ demoSync.onclick = async () => {
   }
 };
 const name = asset => ({XAU:'黄金', SKHYNIX:'SK 海力士', SAMSUNG:'三星电子', GOOGL:'Google（GOOGL）', INTC:'英特尔（INTC）'})[asset] || asset;
-const leadershipAssets = new Set('AMZN GOOGL KORU META MU NVDA SAMSUNG SKHYNIX SOXL SPCX TSLA'.split(' '));
 const defaultAssets = 'ETH BTC XAU SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN BNB ZEC INTC'.split(' ');
 function addAssetCheckbox(asset, checked) {
   const choice = document.createElement('div');
@@ -432,7 +431,7 @@ const selectionByMode = new Map();
 function validAsset(value) { return typeof value === 'string' && /^[A-Z0-9]{1,24}$/.test(value); }
 for (const key of Object.keys(strategyNames)) {
   const saved = preferences?.assetsByStrategy?.[key];
-  if (Array.isArray(saved)) selectionByMode.set(key, new Set(saved.filter(validAsset)));
+  if (Array.isArray(saved)) selectionByMode.set(key, new Set(saved.filter(asset => validAsset(asset) && !removedAssets.has(asset))));
 }
 if (!preferences?.assetsByStrategy) {
   const legacy = Array.isArray(preferences?.assets) ? preferences.assets.filter(validAsset) :
@@ -446,11 +445,7 @@ function selectionFor(mode) {
 function syncAssetCheckboxes(active = selectionFor(strategyMode.value)) {
   el('strategy-asset-note').hidden = strategyMode.value !== 'swing';
   const visible = new Set([...defaultAssets, ...poolWatch].filter(asset => !removedAssets.has(asset)));
-  for (const asset of active) visible.add(asset);
-  if (strategyMode.value === 'mu_relative_strength') {
-    visible.clear();
-    for (const asset of leadershipAssets) visible.add(asset);
-  }
+  for (const asset of active) if (!removedAssets.has(asset)) visible.add(asset);
   for (const input of config.querySelectorAll('[name=asset]')) {
     if (!visible.delete(input.value)) input.closest('.asset-choice').remove();
     else input.checked = active.has(input.value);
@@ -983,8 +978,7 @@ function renderStrategyControls() {
   strategyNotional.disabled = locked || strategySizing.value !== 'fixed';
   start.disabled = locked || !marketCatalog || ![...config.querySelectorAll('[name=asset]:checked')]
     .some(input=>marketByAsset.get(input.value)?.demo_tradeable &&
-      (strategyMode.value !== 'us_open' || marketByAsset.get(input.value)?.equity === 'us') &&
-      (strategyMode.value !== 'mu_relative_strength' || leadershipAssets.has(input.value)));
+      (strategyMode.value !== 'us_open' || marketByAsset.get(input.value)?.equity === 'us'));
   start.dataset.running = String(running && !stopping);
   if (stopping) start.textContent = '正在停止策略…';
   else if (running) start.textContent = '✓ 策略运行中';
@@ -999,7 +993,7 @@ function renderStrategyControls() {
   entries.textContent = strategyState?.entries_paused ? '恢复开新仓' : '停止开新仓';
   for (const checkbox of config.querySelectorAll('[name=asset]')) {
     const market = marketByAsset.get(checkbox.value);
-    checkbox.disabled = assetEditingLocked() || (checkbox.checked && assetBusy(checkbox.value)) || !market?.demo_tradeable || (strategyMode.value === 'us_open' && market.equity !== 'us') || (strategyMode.value === 'mu_relative_strength' && !leadershipAssets.has(checkbox.value));
+    checkbox.disabled = assetEditingLocked() || (checkbox.checked && assetBusy(checkbox.value)) || !market?.demo_tradeable || (strategyMode.value === 'us_open' && market.equity !== 'us');
     checkbox.parentElement.dataset.unavailable = String(!market?.demo_tradeable);
     checkbox.parentElement.title = market?.demo_tradeable ? '' : '模拟盘未确认可交易';
   }
@@ -1175,17 +1169,15 @@ for (const control of ['start','stop','entries']) {
   };
 }
 function renderMarketRows() {
-  if (!marketCatalog) return;
-  const selected = new Set([...config.querySelectorAll('[name=asset]:checked')].map(checkbox => checkbox.value));
-  for (const asset of poolWatch) selected.add(asset);
-  for (const asset of ['BNB','ZEC','INTC']) if (!removedAssets.has(asset)) selected.add(asset);
+  const visible = new Set([...config.querySelectorAll('[name=asset]')].map(checkbox => checkbox.value));
   const heldSymbols = new Set((accountSnapshot?.holdings || [])
     .filter(position => Number(position.quantity) !== 0)
     .map(position => position.symbol));
-  const markets = marketCatalog.filter(market => selected.has(market.asset));
+  const markets = [...visible].map(asset => marketByAsset.get(asset) ||
+    {asset, symbol:asset + 'USDT', status:'目录未确认'});
   markets.sort((a, b) => Number(heldSymbols.has(b.symbol)) - Number(heldSymbols.has(a.symbol)));
   el('market-rows').replaceChildren();
-  for (const market of markets) {
+  for (const market of pageItems(markets, 'market-pages', renderMarketRows)) {
     const tradeable = market.demo_tradeable;
     const status = tradeable ? '可交易' : market.status ?? (market.live_tradeable ? '仅实盘目录可交易' : '模拟盘未匹配');
     const item = row('market-rows', [name(market.asset), market.symbol, status, market.contract_type ?? '—', strategyChecks[market.asset] || '—']);
@@ -1257,7 +1249,13 @@ function renderPool() {
   }
   if (!rows.length) row('pool-rows', ['暂无匹配合约', '—', '—', '—', '—']);
 }
-function setAssetWatch(asset, watched) {
+async function setAssetWatch(asset, watched) {
+  if (!watched) {
+    if (assetEditingLocked() || assetBusy(asset)) return;
+    if (strategyState?.running && strategyState.assets.includes(asset) &&
+        !(await changeRunningAsset(asset, false))) return;
+    for (const selection of selectionByMode.values()) selection.delete(asset);
+  }
   if (watched) {
     removedAssets.delete(asset);
     poolWatch.add(asset);
@@ -1916,7 +1914,7 @@ button[aria-pressed=true],button:hover,.link:hover{background:#234264;border-col
 </section>
 <section class="research"><h2>42 天共享账户对照</h2><p>2026/09/20 08:00 至 11/01 08:00（北京时间）。17 个标的共享 10,000 USDT。零滑点，双边各 5 bp 手续费，计入资金费。动量回撤与布林带区间回归为离线研究。</p><div class="scroller"><table><thead><tr><th>策略</th><th>成交笔数</th><th>胜率</th><th>平均盈亏比</th><th>净盈亏 USDT</th><th>最大回撤</th></tr></thead><tbody><tr><td>多周期动量回撤</td><td>1248</td><td>33.8%</td><td>1.04</td><td>−4,175.37</td><td>41.90%</td></tr><tr><td>5 分钟双向</td><td>850</td><td>31.5%</td><td>1.10</td><td>−3,784.54</td><td>38.93%</td></tr><tr><td>1 小时双向</td><td>234</td><td>49.1%</td><td>0.97</td><td>−270.49</td><td>13.08%</td></tr></tbody></table></div></section>
 <section class="research" id="mu-relative-strength-results"><h2>领航回撤 · 模拟盘与回测</h2>
-<p>模拟盘可勾选 AMZN、GOOGL、KORU、META、MU、NVDA、SAMSUNG、SKHYNIX、SOXL、SPCX、TSLA。QQQ 用作强弱基准。策略用 5× 杠杆，同时最多 5 个仓位，组合初始风险预算 2%，开仓名义额度按账户权益限制。</p>
+<p>模拟盘可勾选列表中已确认可交易的合约，包括 BTC 和 ETH。QQQ 用作强弱基准。策略用 5× 杠杆，同时最多 5 个仓位，组合初始风险预算 2%，开仓名义额度按账户权益限制。</p>
 <div class="scroller"><table><thead><tr><th>组合与开仓方式</th><th>区间（UTC）</th><th>平仓笔数</th><th>胜率</th><th>扣费后净收益</th><th>最大回撤</th></tr></thead><tbody>
 <tr><td>MU＋NVDA · 一次开仓</td><td>2026 年 5–10 月</td><td>342</td><td>50.00%</td><td>+1.36%</td><td>4.85%</td></tr>
 <tr><td>MU＋NVDA · 试仓、补仓再减仓</td><td>2026 年 5–10 月</td><td>295</td><td>58.31%</td><td>+0.01%</td><td>1.76%</td></tr>

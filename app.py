@@ -67,8 +67,6 @@ def trend_metrics(bars, direction=1, *, fast_period=12, slow_period=48):
     return direction*closes[-1] > direction*fast > direction*slow, Decimal(str(atr_fraction))
 
 
-LEADERSHIP_ASSETS = frozenset({'AMZN', 'GOOGL', 'KORU', 'META', 'MU', 'NVDA',
-                               'SAMSUNG', 'SKHYNIX', 'SOXL', 'SPCX', 'TSLA'})
 STRATEGY_NAMES = {
     'mu_relative_strength': '领航回撤 · 15 分钟',
     'swing': '中长线 · 1 小时双向突破与回踩',
@@ -2392,8 +2390,6 @@ class DemoStrategy:
                 return
             symbol = asset + 'USDT'
             if enabled:
-                if self.mode == 'mu_relative_strength' and asset not in LEADERSHIP_ASSETS:
-                    raise ValueError('领航回撤不支持该标的')
                 demo = futures_catalog(DEMO_VENUE).get(symbol)
                 if not tradable_future(demo) or (self.mode == 'us_open' and equity_kind(symbol, demo) != 'us'):
                     raise ValueError('模拟盘或当前策略不支持：' + asset)
@@ -3491,9 +3487,6 @@ class Handler(BaseHTTPRequestHandler):
             mode = params.get('strategy', ['swing'])[0]
             if mode == 'scalp':
                 self.send(400, 'application/json', json.dumps({'error': '1 分钟策略已下线，请选择 5 分钟双向策略'}).encode())
-                return
-            if mode == 'mu_relative_strength' and not assets <= LEADERSHIP_ASSETS:
-                self.send(400, 'application/json', json.dumps({'error': '请选择领航回撤支持的标的'}).encode())
                 return
             if mode not in STRATEGY_NAMES:
                 self.send(400, 'application/json', '{"error":"未知策略"}'.encode())
