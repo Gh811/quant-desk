@@ -68,6 +68,7 @@ def trend_metrics(bars, direction=1, *, fast_period=12, slow_period=48):
 
 
 STRATEGY_NAMES = {
+    'mu_relative_strength': 'MU · 15 分钟相对强弱回撤',
     'swing': '中长线 · 1 小时双向突破与回踩',
     'intraday': '短线 · 15 分钟双向突破与回踩',
     'scalp': '1 分钟双向 · 高频测试',
@@ -75,6 +76,7 @@ STRATEGY_NAMES = {
     'us_open': '美股双向测试',
 }
 SIGNAL_TIMEFRAMES = {
+    'mu_relative_strength': ('15m', '1h'),
     'scalp': ('1m', '5m', '15m'),
     'fast': ('5m', '15m', '1h'),
     'intraday': ('15m', '1h', '4h'),
@@ -83,10 +85,10 @@ SIGNAL_TIMEFRAMES = {
 }
 TIMEFRAME_MINUTES = {'1m': 1, '5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440}
 STRATEGY_INTERVALS = {mode: TIMEFRAME_MINUTES[frames[0]] * 60000 for mode, frames in SIGNAL_TIMEFRAMES.items()}
-STRATEGY_LOOKBACK = {'scalp': 6, 'fast': 12, 'intraday': 20, 'swing': 24, 'us_open': 20}
-STRATEGY_MAX_ATR = {'scalp': Decimal('.008'), 'fast': Decimal('.008'), 'intraday': Decimal('.012'), 'swing': Decimal('.02'),
+STRATEGY_LOOKBACK = {'mu_relative_strength': 20, 'scalp': 6, 'fast': 12, 'intraday': 20, 'swing': 24, 'us_open': 20}
+STRATEGY_MAX_ATR = {'mu_relative_strength': Decimal('.012'), 'scalp': Decimal('.008'), 'fast': Decimal('.008'), 'intraday': Decimal('.012'), 'swing': Decimal('.02'),
                     'us_open': Decimal('.015')}
-ENTRY_EQUITY_RISK = {'fast': Decimal('.005'), 'intraday': Decimal('.00325'), 'swing': Decimal('.0075'),
+ENTRY_EQUITY_RISK = {'mu_relative_strength': Decimal('.00325'), 'fast': Decimal('.005'), 'intraday': Decimal('.00325'), 'swing': Decimal('.0075'),
                      'us_open': Decimal('.002')}
 SHORT_COST_CAP = Decimal('.30')
 SHORT_REENTRY_COOLDOWN_BARS = 3
@@ -678,9 +680,9 @@ DEMO_ORDER_TERMINAL = {'FILLED', 'CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJ
 DEMO_CLOCK_TTL_NS = 60 * 1_000_000_000
 TRADIFI_QUOTE_MAX_AGE_MS = 30_000
 TRADIFI_QUOTE_MAX_DEVIATION = Decimal('.03')
-ENTRY_WAIT_SECONDS = {'scalp': 8, 'fast': 60, 'intraday': 90, 'swing': 120, 'us_open': 60}
+ENTRY_WAIT_SECONDS = {'mu_relative_strength': 90, 'scalp': 8, 'fast': 60, 'intraday': 90, 'swing': 120, 'us_open': 60}
 ENTRY_QUOTE_MAX_AGE_MS = 5_000
-ENTRY_RETRY_COOLDOWN_SECONDS = {'scalp': 8, 'fast': 20, 'intraday': 30, 'swing': 60, 'us_open': 30}
+ENTRY_RETRY_COOLDOWN_SECONDS = {'mu_relative_strength': 30, 'scalp': 8, 'fast': 20, 'intraday': 30, 'swing': 60, 'us_open': 30}
 demo_clock_lock = threading.Lock()
 demo_clock_sample = None
 catalog_locks = {venue: threading.Lock() for venue in ('Binance', DEMO_VENUE)}
@@ -1108,6 +1110,45 @@ def replace_conflicting_strategy_stop(symbol, old, target, context, *, amount):
         raise ValueError(f'{error} · 原止损仍有效或已恢复 {previous:f}') from error
 
 
+def replace_conflicting_strategy_take(symbol, old, target, context, *, amount):
+    direction = 1 if amount > 0 else -1
+    previous = Decimal(old['triggerPrice'])
+
+    def can_replace(trigger):
+        account = demo_signed('/fapi/v3/account')
+        positions = [p for p in account['positions'] if p['symbol'] == symbol
+                     and Decimal(p['positionAmt'])]
+        if (len(positions) != 1 or positions[0].get('positionSide', 'BOTH') != 'BOTH'
+                or Decimal(positions[0]['positionAmt']) != amount):
+            raise ValueError(f'{symbol} 替换止盈期间仓位已变化')
+        mark = Decimal(request(DEMO_VENUE, '/fapi/v1/premiumIndex', symbol=symbol)['markPrice'])
+        if not mark.is_finite() or mark <= 0 or direction*(trigger-mark) <= 0:
+            raise ValueError(f'{symbol} 标记价不可用或已触及新止盈')
+
+    def is_open(trigger):
+        return any(owned_protection(order) and order['orderType'] == PROTECTION_TYPES['take']
+                   and order['side'] == exit_side(direction) and order['algoStatus'] == 'NEW'
+                   and Decimal(order['triggerPrice']) == trigger for order in open_protection(symbol))
+
+    can_replace(target)
+    try:
+        cancel_protection(old)
+        can_replace(target)
+        place_protection(symbol, 'take', target, context, direction=direction)
+    except (OSError, ValueError, KeyError, ArithmeticError, sqlite3.Error) as error:
+        try:
+            if is_open(target):
+                return
+            if not is_open(previous):
+                can_replace(previous)
+                previous_intent = pending_protection().get(old['clientAlgoId'], {})
+                restored = previous_intent.get('context') or dict(context, moved=False)
+                place_protection(symbol, 'take', previous, restored, direction=direction)
+        except (OSError, ValueError, KeyError, ArithmeticError, sqlite3.Error) as restore_error:
+            raise ValueError(f'{error} · 原止盈恢复未确认：{restore_error}') from restore_error
+        raise ValueError(f'{error} · 原止盈仍有效或已恢复 {previous:f}') from error
+
+
 def align_strategy_protection(symbol, entry, mark, stop_loss, stop, tick, context, *, direction=1, take=None,
                               take_multiple=2, review='', replace_amount=None):
     if min(entry, mark, tick) <= 0:
@@ -1151,14 +1192,16 @@ def align_strategy_protection(symbol, entry, mark, stop_loss, stop, tick, contex
                         place_protection(symbol, kind, target, protection_context, direction=direction)
                     except HTTPError as conflict:
                         if (str(getattr(conflict, 'exchange_code', None)) != '-4130'
-                                or kind != 'stop' or len(matching) != 1 or not replace_amount):
+                                or len(matching) != 1 or not replace_amount):
                             raise
                         old = matching[0]
                         if (old.get('positionSide', 'BOTH') != 'BOTH'
-                                or direction * (target - Decimal(old['triggerPrice'])) <= 0):
+                                or (1 if kind == 'stop' else -1) * direction
+                                   * (target - Decimal(old['triggerPrice'])) <= 0):
                             raise
-                        replace_conflicting_strategy_stop(symbol, old, target, protection_context,
-                                                          amount=replace_amount)
+                        replace = (replace_conflicting_strategy_stop if kind == 'stop'
+                                   else replace_conflicting_strategy_take)
+                        replace(symbol, old, target, protection_context, amount=replace_amount)
                         matching = []
                 except (OSError, ValueError, KeyError, ArithmeticError, sqlite3.Error) as error:
                     if movement:
@@ -1541,6 +1584,30 @@ def scan_entry_signal(symbol, mode, *, venue=DEMO_VENUE, us_equity=False):
     now = demo_now_ms() if venue == DEMO_VENUE else time.time_ns() // 1_000_000
     def read(interval, cutoff, required):
         return closed_demo_bars(symbol, interval, cutoff, required, venue=venue)
+    if mode == 'mu_relative_strength':
+        bars, _ = read('15m', now, 49)
+        candle, opened, _, low, close = bars[-1]
+        a, b, c = (bar[4] for bar in bars[-4:-1])
+        changes = (b-a, c-b)
+        path = sum(map(abs, changes))
+        rsi = 100 * sum(max(0, v) for v in changes) / path if path else 50
+        if rsi > 20 or close <= max(c, opened):
+            return candle, None, Decimal(0), '等待 15 分钟回撤修复', {}
+        cutoff = candle + STRATEGY_INTERVALS[mode]
+        hourly, _ = read('1h', cutoff, 50)
+        last = hourly[-1][4]
+        mean = statistics.mean(bar[4] for bar in hourly[-49:-1])
+        _, volatility = trend_metrics(hourly)
+        if not (last > mean > statistics.mean(bar[4] for bar in hourly[-50:-2])
+                and 0 < volatility <= STRATEGY_MAX_ATR[mode]):
+            return candle, None, volatility, '小时趋势或波动未确认', {}
+        benchmark, _ = closed_demo_bars('QQQUSDT', '1h', cutoff, 25, venue=venue)
+        strength = last/hourly[-25][4] - benchmark[-1][4]/benchmark[0][4]
+        if strength <= 0:
+            return candle, None, volatility, 'MU 过去 24 小时未跑赢 QQQ', {}
+        return candle, 1, volatility, '15 分钟 RSI 回撤修复', dict(
+            close=Decimal(str(close)), boundary=Decimal(str(low)), stressed=False,
+            priority=strength, detail=f'RSI {rsi:.1f} · 24 小时领先 QQQ {strength:.2%}')
     return evaluate_entry_signal(symbol, mode, now, read, us_equity=us_equity)
 
 
@@ -2323,6 +2390,8 @@ class DemoStrategy:
                 return
             symbol = asset + 'USDT'
             if enabled:
+                if self.mode == 'mu_relative_strength' and asset != 'MU':
+                    raise ValueError('相对强弱回撤策略只交易 MU')
                 demo = futures_catalog(DEMO_VENUE).get(symbol)
                 if not tradable_future(demo) or (self.mode == 'us_open' and equity_kind(symbol, demo) != 'us'):
                     raise ValueError('模拟盘或当前策略不支持：' + asset)
@@ -2379,15 +2448,15 @@ class DemoStrategy:
         short_term = mode != 'swing'
         fast_trend = mode == 'fast'
         cost_control = short_term
-        take_multiple = FAST_TREND_TARGET if fast_trend else 2
+        take_multiple = Decimal('1.25') if mode == 'mu_relative_strength' else (FAST_TREND_TARGET if fast_trend else 2)
         cost_cap = SHORT_COST_CAP if cost_control else Decimal('.75')
         scan_interval = {'scalp': 5, 'fast': 3}.get(mode, 30)
         cooldown_bars = 1 if mode == 'scalp' else SHORT_REENTRY_COOLDOWN_BARS
         cooldown_ms = cooldown_bars * STRATEGY_INTERVALS[mode]
         reentry_at = {}
-        fixed_leverage = mode in {'fast', 'scalp'}
+        fixed_leverage = mode in {'fast', 'scalp', 'mu_relative_strength'}
         max_positions = self.FAST_MAX_POSITIONS if fixed_leverage else self.MAX_POSITIONS
-        max_hold_hours = {'scalp': .5, 'intraday': 4, 'swing': 48, 'us_open': 1.5}.get(mode)
+        max_hold_hours = {'mu_relative_strength': 24, 'scalp': .5, 'intraday': 4, 'swing': 48, 'us_open': 1.5}.get(mode)
         holdings = {}
         entry_attempts = {}
         peaks = {}
@@ -2581,11 +2650,12 @@ class DemoStrategy:
                             if early_breakeven and candidate == breakeven and not review_note:
                                 review_note = f'最大浮盈 {peak/stop_loss:.2f}R · 按已核对费用移至净保本价'
                     trailing = stop != minimum_stop and direction*(mark-stop) <= 0
-                    dynamic_take_hit = fast_trend and take is not None and direction*(take-mark) <= 0
+                    dynamic_take_hit = (fast_trend or mode == 'mu_relative_strength') and take is not None and direction*(take-mark) <= 0
                     missing_stop = False
                     if not (timed_out or fixed_exit or trailing or dynamic_exit or dynamic_take_hit):
                         reviewed_window = None
-                        if not fast_trend and stop != minimum_stop and price_return >= stop_loss:
+                        if not fast_trend and stop != minimum_stop and price_return >= (
+                                stop_loss * Decimal('.75') if mode == 'mu_relative_strength' else stop_loss):
                             window = demo_now_ms() // STRATEGY_INTERVALS[mode]
                             if take_reviewed.get(symbol) != window:
                                 try:
@@ -2596,7 +2666,7 @@ class DemoStrategy:
                                 else:
                                     weakened = assessment == '均线趋势未确认' or (signal is not None and signal*direction < 0)
                                     target = price_return + stop_loss/4
-                                    if weakened and candle + STRATEGY_INTERVALS[mode] > opened*1000 and target < 2*stop_loss:
+                                    if weakened and candle + STRATEGY_INTERVALS[mode] > opened*1000 and target < target_return:
                                         closer = protection_price(entry_price, target, tick, direction=direction, kind='take')
                                         if direction*(closer-mark) > 0:
                                             take = closer
@@ -2606,7 +2676,7 @@ class DemoStrategy:
                                                            leverage=leverage, strategy=mode), direction=direction,
                                                       take=take, take_multiple=target_return / stop_loss, review=review_note,
                                                       replace_amount=amount if symbol not in pending_entries else None)
-                            if fast_trend:
+                            if fast_trend or mode == 'mu_relative_strength':
                                 fast_takes[symbol] = actual_take
                                 stop = actual_stop
                                 if proposed_take is not None and review_note:
@@ -2941,7 +3011,7 @@ class DemoStrategy:
                         if time_in_force == 'GTX':
                             maker_reason = '吃单成本偏高' if cost > stop_loss / 2 else '对手盘一档数量不足'
                             detail += f' · {maker_reason}，改为限价挂单'
-                        if fast_trend or mode == 'scalp':
+                        if fixed_leverage:
                             try:
                                 mark, planned_stop = entry_stop_preflight(
                                     symbol, reference, now, price, stop_loss, tick, direction)
@@ -3399,6 +3469,9 @@ class Handler(BaseHTTPRequestHandler):
             mode = params.get('strategy', ['swing'])[0]
             if mode == 'scalp':
                 self.send(400, 'application/json', json.dumps({'error': '1 分钟策略已下线，请选择 5 分钟双向策略'}).encode())
+                return
+            if mode == 'mu_relative_strength' and assets != {'MU'}:
+                self.send(400, 'application/json', json.dumps({'error': '请仅勾选 MU'}).encode())
                 return
             if mode not in STRATEGY_NAMES:
                 self.send(400, 'application/json', '{"error":"未知策略"}'.encode())
