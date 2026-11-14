@@ -1909,6 +1909,15 @@ button[aria-pressed=true],button:hover,.link:hover{background:#234264;border-col
 <p>回放按已收盘的 K 线生成信号，以分钟级行情模拟执行。成交模型、手续费和滑点可分别配置。<br><a href="https://www.freqtrade.io/en/latest/lookahead-analysis/">Freqtrade · 未来数据检查</a> · <a href="https://www.quantconnect.com/docs/v2/writing-algorithms/live-trading/trading-and-orders">QuantConnect LEAN · 成交与成本模型</a></p>
 </section>
 <section class="research"><h2>42 天共享账户对照</h2><p>2026/09/20 08:00 至 11/01 08:00（北京时间）。17 个标的共享 10,000 USDT。零滑点，双边各 5 bp 手续费，计入资金费。动量回撤与布林带区间回归为离线研究。</p><div class="scroller"><table><thead><tr><th>策略</th><th>成交笔数</th><th>胜率</th><th>平均盈亏比</th><th>净盈亏 USDT</th><th>最大回撤</th></tr></thead><tbody><tr><td>多周期动量回撤</td><td>1248</td><td>33.8%</td><td>1.04</td><td>−4,175.37</td><td>41.90%</td></tr><tr><td>5 分钟双向</td><td>850</td><td>31.5%</td><td>1.10</td><td>−3,784.54</td><td>38.93%</td></tr><tr><td>1 小时双向</td><td>234</td><td>49.1%</td><td>0.97</td><td>−270.49</td><td>13.08%</td></tr></tbody></table></div></section>
+<section class="research" id="mu-relative-strength-results"><h2>MU · 相对强弱回撤</h2>
+<p>2026 年 5–10 月（UTC），初始权益 10,000 USDT，计入双边各 5 bp 手续费和资金费。8–10 月已用于先前研究。</p>
+<div class="scroller"><table><thead><tr><th>区间</th><th>滑点（每边）</th><th>成交笔数</th><th>胜率</th><th>净收益率</th></tr></thead><tbody>
+<tr><td>半年</td><td>0 bp</td><td>187</td><td>57.22%</td><td>+7.07%</td></tr>
+<tr><td>半年</td><td>1 bp</td><td>180</td><td>53.33%</td><td>+5.51%</td></tr>
+<tr><td>8–10 月</td><td>0 bp</td><td>113</td><td>56.64%</td><td>+2.73%</td></tr>
+<tr><td>8–10 月</td><td>1 bp</td><td>107</td><td>51.40%</td><td>+1.49%</td></tr>
+<tr><td>8–10 月</td><td>2 bp</td><td>104</td><td>50.00%</td><td>+0.08%</td></tr>
+</tbody></table></div></section>
 <section class="research" id="return-ranked"><h2>半年回测 · 按扣费后净收益排序</h2><p>2026 年 5–10 月（UTC），初始权益 10,000 USDT。每组最多两个标的，共享资金，计入双边各 5 bp 手续费及资金费，滑点为零。各组按 5–7 月净收益选参数和标的，8–10 月独立重放。该验证期已用于先前研究。</p><div class="scroller"><table><thead><tr><th>策略</th><th>标的</th><th>止盈目标</th><th>半年笔数</th><th>半年净收益率</th><th>半年胜率</th><th>最大回撤</th><th>8–10 月净收益率</th></tr></thead><tbody><tr><td>RSI 回撤修复（阈值 20）</td><td>MU</td><td>1.25R</td><td>140</td><td>+7.29%</td><td>53.57%</td><td>10.56%</td><td>+1.48%</td></tr><tr><td>RSI 回撤修复（阈值 35）</td><td>MU</td><td>1.25R</td><td>154</td><td>+6.02%</td><td>53.25%</td><td>10.53%</td><td>-0.01%</td></tr><tr><td>24 小时通道突破</td><td>MU、ETH</td><td>1.25R</td><td>395</td><td>+5.76%</td><td>50.38%</td><td>9.53%</td><td>-0.76%</td></tr><tr><td>多日趋势内短线恢复</td><td>ETH</td><td>3R</td><td>92</td><td>-1.03%</td><td>46.74%</td><td>5.72%</td><td>-2.28%</td></tr><tr><td>布林带＋主动买量（仅做多）</td><td>NVDA</td><td>0.5R</td><td>40</td><td>-2.34%</td><td>67.50%</td><td>5.36%</td><td>-3.97%</td></tr><tr><td>48 小时通道突破</td><td>MU</td><td>1.25R</td><td>160</td><td>-3.51%</td><td>48.13%</td><td>9.71%</td><td>-3.98%</td></tr><tr><td>15 分钟趋势内均值回归</td><td>ETH</td><td>1.5R</td><td>266</td><td>-6.66%</td><td>44.36%</td><td>9.63%</td><td>-8.42%</td></tr></tbody></table></div></section>
 <section class="research" id="snapshot">
 <h2>历史回放 · 17 个标的</h2>
@@ -1922,6 +1931,7 @@ button[aria-pressed=true],button:hover,.link:hover{background:#234264;border-col
 </main>
 <script>
 const studyStrategies = {
+  "mu_relative_strength": ["MU · 相对强弱回撤","15m / 1h",["相对 QQQ 强弱","只做 MU 多头。要求 MU 最近 24 小时收益率高于 QQQ，两者用同一时刻已收盘的小时线计算。"],["1 小时趋势","MU 收盘高于上行的 48 根小时均线。"],["15 分钟入场","前两次收盘变动的简单 RSI ≤ 20，最新一根收阳且高于上一根收盘。"],["止损与退出","按小时 ATR 控制止损距离，目标为初始止损的 1.25 倍，最长持仓 24 小时。"]],
   "rsi20": [
     "RSI 回撤修复（阈值 20）",
     "1h",
