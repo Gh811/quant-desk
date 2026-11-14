@@ -81,7 +81,8 @@ with TemporaryDirectory() as tmp:
     ]
     def signed(path, **k):
         if path.endswith('income'):
-            return [dict(asset='USDT', income='-.22', time=2500)]
+            return [dict(asset='USDT', income='-.22', time=2500),
+                    dict(asset='USDT', income='.11', time=1500)]
         if 'orderId' in k and path.endswith('order'):
             return dict(status='FILLED', executedQty='1.7')
         return [f for f in fills if 'orderId' not in k or str(f['orderId']) == str(k['orderId'])]
@@ -93,7 +94,7 @@ with TemporaryDirectory() as tmp:
     closes = {o['exchange_order_id']:o for o in g['recent_orders']() if o.get('pnl') is not None}
     assert len(closes) == 2 and closes[12]['decision']['stage'] == 'trim'
     assert sum(D(o['fees']) for o in closes.values()) == D('.22')
-    assert sum(D(o['funding']) for o in closes.values()) == D('-.22')
+    assert sum(D(o['funding']) for o in closes.values()) == D('-.11')
     assert setup()['trimmed'] == D('.5')
     assert g['sync_external_demo_close'](order, {(symbol,str(key)):o for key,o in closes.items()}, 6000, [add_order])
     assert len([o for o in g['recent_orders']() if o.get('pnl') is not None]) == 2

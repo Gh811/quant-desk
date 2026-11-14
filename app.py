@@ -4319,6 +4319,37 @@ def find_demo_position_fills(order, now, additions=(), *, include_partial=False)
     return (opening, exits) if include_partial and exits else None
 
 
+def allocate_position_funding(opening, exits, funding_rows, *, complete):
+    funded_exits = {}
+    for row in funding_rows:
+        at = int(row['time'])
+        affected = [fill for fill in exits if int(fill['time']) > at]
+        exposed = (sum(Decimal(fill['qty']) for fill in opening if int(fill['time']) < at)
+                   - sum(Decimal(fill['qty']) for fill in exits if int(fill['time']) <= at))
+        if exposed <= 0:
+            raise ValueError('资金费时点仓位待核对')
+        later_adds = sorted((fill for fill in opening if int(fill['time']) >= at),
+                            key=lambda fill: (int(fill['time']), int(fill['id'])))
+        adds = iter(later_adds)
+        addition = next(adds, None)
+        remaining = Decimal(row['income'])
+        for fill in sorted(affected, key=lambda fill: (int(fill['time']), int(fill['id']))):
+            key = (int(fill['time']), int(fill['id']))
+            while addition and (int(addition['time']), int(addition['id'])) < key:
+                exposed += Decimal(addition['qty'])
+                addition = next(adds, None)
+            quantity = Decimal(fill['qty'])
+            if quantity > exposed:
+                raise ValueError('资金费分摊时仓位不足')
+            portion = remaining if quantity == exposed else remaining * quantity / exposed
+            funded_exits.setdefault(str(fill['orderId']), []).append((at, portion))
+            remaining -= portion
+            exposed -= quantity
+        if complete and (exposed or addition):
+            raise ValueError('资金费分摊时仓位未结清')
+    return funded_exits
+
+
 def sync_external_demo_close(order, known, now, additions=()):
     staged = bool((order.get('decision') or {}).get('staged'))
     fills = find_demo_position_fills(order, now, additions, include_partial=staged)
@@ -4353,20 +4384,7 @@ def sync_external_demo_close(order, known, now, additions=()):
     if len(funding_rows) >= 1000 or any(row['asset'] != 'USDT' or not start < int(row['time']) < end
                                        for row in funding_rows):
         raise ValueError('外部平仓资金费明细待核对')
-    funded_exits = {}
-    for row in funding_rows:
-        at = int(row['time'])
-        eligible = [fill for fill in exits if int(fill['time']) > at]
-        exposed = (sum(Decimal(fill['qty']) for fill in opening if int(fill['time']) < at)
-                   - sum(Decimal(fill['qty']) for fill in exits if int(fill['time']) <= at))
-        eligible_qty = sum(Decimal(fill['qty']) for fill in eligible)
-        if not exposed or (not staged and exposed != eligible_qty) or eligible_qty > exposed:
-            if staged and not eligible:
-                continue
-            raise ValueError('资金费时点仓位待核对')
-        for fill in eligible:
-            funded_exits.setdefault(str(fill['orderId']), []).append(
-                (at, Decimal(row['income']) * Decimal(fill['qty']) / exposed))
+    funded_exits = allocate_position_funding(opening, exits, funding_rows, complete=not staged)
 
     opening_qty = sum(Decimal(fill['qty']) for fill in opening)
     opening_value = sum(trade_quote(fill) for fill in opening)
@@ -4490,15 +4508,9 @@ def position_breakeven_costs(symbol, opening_id, amount, cache, *, staged=False)
             if len(trades) >= 1000 or sum(Decimal(fill['qty']) for fill in trades) != Decimal(order['executed_qty']):
                 raise ValueError('减仓成交数量待核对')
             reductions.extend(trades)
-        funding = Decimal(0)
-        for row in rows:
-            at = int(row['time'])
-            exposed = (sum(Decimal(fill['qty']) for fill in fills if int(fill['time']) < at)
-                       - sum(Decimal(fill['qty']) for fill in reductions if int(fill['time']) <= at))
-            if exposed <= 0:
-                raise ValueError('资金费时点仓位待核对')
-            share = min(abs(amount), exposed) / exposed
-            funding += Decimal(row['income']) * share
+        allocated = allocate_position_funding(fills, reductions, rows, complete=False)
+        funding = sum((Decimal(row['income']) for row in rows), Decimal(0)) - sum(
+            (value for group in allocated.values() for _, value in group), Decimal(0))
     else:
         funding = sum((Decimal(row['income']) for row in rows), Decimal(0))
     if not open_fee.is_finite() or not funding.is_finite():
