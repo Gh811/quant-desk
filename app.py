@@ -2286,10 +2286,17 @@ def staged_position_setup(root, orders, tick, amount):
     direction = 1 if amount > 0 else -1
     added = sum((Decimal(o.get('executed_qty') or 0) for o in orders if not o.get('reduce_only')), Decimal(0))
     trimmed = sum((Decimal(o.get('executed_qty') or 0) for o in orders if o.get('reduce_only')), Decimal(0))
-    if first_qty + added - trimmed != abs(amount) or not 0 <= trimmed <= added:
+    trim_target = added
+    if added and plan.get('trim_total_third'):
+        step = Decimal(plan['step'])
+        trim_target = ((first_qty + added) / 3 // step) * step
+    if first_qty + added - trimmed != abs(amount) or not 0 <= trimmed <= trim_target:
         raise ValueError('分批仓位数量待核对')
+    trim_remaining = trim_target - trimmed
+    if trim_remaining < Decimal(plan['min_qty']):
+        trim_remaining = Decimal(0)
     hard_stop = protection_price(first_entry, -Decimal(root['stop_loss']), tick, direction=direction, kind='stop')
-    return dict(plan, first_qty=first_qty, first_entry=first_entry, added=added, trimmed=trimmed,
+    return dict(plan, first_qty=first_qty, first_entry=first_entry, trim_remaining=trim_remaining,
                 hard_stop=hard_stop, add_attempted=any(not o.get('reduce_only') for o in orders))
 
 
@@ -2298,7 +2305,7 @@ def manage_staged_position(symbol, amount, opened, opening_id, tick, mark, entry
     first_entry = setup['first_entry']
     stop = setup['hard_stop']
     add_line = first_entry * (1 - direction * Decimal(setup['base_stop']) / 3)
-    trim = setup['added'] - setup['trimmed']
+    trim = setup['trim_remaining']
     adding = allow_add and not setup['add_attempted'] and direction * (mark - add_line) <= 0
     if not adding and (not trim or direction * (mark-entry) <= 0):
         return False
@@ -2338,7 +2345,8 @@ def manage_staged_position(symbol, amount, opened, opening_id, tick, mark, entry
             # Reserve conservatively for every other open position.
             reserved = (committed - abs(amount)*entry)*Decimal('.025')
             remaining_risk = min(equity * ENTRY_EQUITY_RISK[mode], equity*Decimal('.02')-reserved) - risk
-            remaining_notional = min(Decimal(setup['budget']) - abs(amount)*entry, equity-committed,
+            remaining_notional = min(Decimal(setup.get('combined_budget', setup['budget'])) - abs(amount)*entry,
+                                     equity-committed,
                                      5*Decimal(fresh['availableBalance'])*Decimal('.95'))
             quantity = min(2 * setup['first_qty'], remaining_notional/price, Decimal(setup['max_qty']),
                            remaining_risk/(abs(price-stop)+price*cost),
@@ -2353,7 +2361,8 @@ def manage_staged_position(symbol, amount, opened, opening_id, tick, mark, entry
             if direction * ((bid if direction > 0 else ask)-price) < 0:
                 return False
             quantity = trim
-            reason = '覆盖成本后减掉补仓数量'
+            reason = ('回到净保本价 · 减去补仓后总仓位的 1/3' if setup.get('trim_total_third')
+                      else '覆盖成本后减掉补仓数量')
         # Verify exchange custody again after fee and quote requests, immediately before placing the IOC.
         current = demo_signed('/fapi/v3/account')
         active = [p for p in current['positions'] if p['symbol'] == symbol and Decimal(p['positionAmt'])]
@@ -2791,7 +2800,7 @@ class DemoStrategy:
                                 if direction*(closer-mark) >= 2*tick:
                                     take = (min if direction > 0 else max)(take, closer) if take is not None else closer
                     early_breakeven = fast_trend and peak >= stop_loss and price_return > 0
-                    if staged and setup['added'] != setup['trimmed']:
+                    if staged and setup['trim_remaining']:
                         proposed_stop = None
                     if (proposed_stop is not None or early_breakeven) and not (timed_out or fixed_exit or dynamic_exit):
                         candidate = (protection_price(entry_price, proposed_stop, tick, direction=direction, kind='stop')
@@ -2867,7 +2876,7 @@ class DemoStrategy:
                             label = ('止损未确认 · 等待开仓余单核对' if missing_stop
                                      else '止损有效 · 保护单待核对')
                             self.checks = {**self.checks, symbol[:-4]: label}
-                    if (staged and (not self.entries_paused.is_set() or setup['added'] > setup['trimmed'])
+                    if (staged and (not self.entries_paused.is_set() or setup['trim_remaining'])
                             and not pending_symbols
                             and not (timed_out or fixed_exit or trailing or dynamic_exit or dynamic_take_hit or missing_stop)
                             and now >= staged_retry.get(symbol, 0)):
@@ -3142,7 +3151,7 @@ class DemoStrategy:
                         aggressive_price = ask if direction > 0 else bid
                         minimum_quantity = max(Decimal(lot['minQty']), minimum / aggressive_price)
                         price, amount, time_in_force = select_demo_entry(
-                            direction, book, bid, ask, budget/3 if staged_entry else budget, step, stop_loss, cost,
+                            direction, book, bid, ask, budget/2 if staged_entry else budget, step, stop_loss, cost,
                             minimum_quantity=minimum_quantity if fast_trend else None)
                         attempt = (candle, direction, demo_now_ms(), price, time_in_force, cost)
                         retry_block = entry_retry_block(
@@ -3228,6 +3237,8 @@ class DemoStrategy:
                         decision = dict(reason=reason, detail=detail, signal_at=signal_at)
                         if staged_entry:
                             decision['staged'] = dict(base_stop=str(base_stop), budget=str(budget), step=str(step),
+                                                      combined_budget=str(budget * Decimal('1.5')),
+                                                      trim_total_third=True,
                                                       min_qty=lot['minQty'], max_qty=lot['maxQty'],
                                                       min_notional=str(minimum), contract_type=item['contractType'],
                                                       funding_cost=str(funding_cost))

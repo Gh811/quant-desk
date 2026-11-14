@@ -52,7 +52,7 @@ with TemporaryDirectory() as tmp:
     response(add, 11, '1.2', 'EXPIRED', '119.4', 2000)
     p.update(positionAmt='2.2', entryPrice='99.72727273')
     expanded = setup()
-    assert expanded['added'] == D('1.2') and expanded['hard_stop'] == first['hard_stop']
+    assert expanded['trim_remaining'] == D('1.2') and expanded['hard_stop'] == first['hard_stop']
     assert not execute(expanded, '99.50')
     g['demo_entry_book'] = lambda *a: (dict(time=6000, askQty='2', bidQty='2'), D('100.49'), D('100.50'))
     g['request'] = lambda *a, **k: dict(symbol=symbol, time=6000, markPrice='100.50')
@@ -65,10 +65,41 @@ with TemporaryDirectory() as tmp:
     response(trim, 12, '.5', 'EXPIRED', '50.245', 3000)
     p.update(positionAmt='1.7')
     partial = setup()
-    assert partial['trimmed'] == D('.5')
+    assert partial['trim_remaining'] == D('.7')
     execute(partial, '100.50')
     args, _ = submit.call_args
     assert D(args[2]) == D('.7')
+
+    new_plan = dict(root['decision']['staged'], budget='200', combined_budget='300', trim_total_third=True)
+    new_root = dict(root, decision=dict(staged=new_plan), filled='100', executed_qty='1')
+    new_add = dict(add, executed_qty='1.2')
+    new_trim = dict(trim, executed_qty='.5')
+    new_setup = g['staged_position_setup']
+    p.update(positionAmt='1', entryPrice='100')
+    g['demo_entry_book'] = lambda *a: (dict(time=6000, askQty='2', bidQty='2'), D('99.49'), D('99.50'))
+    g['request'] = lambda *a, **k: dict(symbol=symbol, time=6000, markPrice='99.50')
+    assert execute(new_setup(new_root, [], D('.01'), D(1)), '99.50')
+    args, _ = submit.call_args
+    assert D(args[2]) == 2  # The add can exceed the unused half of the nominal plan.
+    account['availableBalance'] = '20'
+    assert execute(new_setup(new_root, [], D('.01'), D(1)), '99.50')
+    args, _ = submit.call_args
+    assert D(args[2]) == D('.95')  # Available margin still caps the add.
+    account['availableBalance'] = '9000'
+
+    p.update(positionAmt='2.2', entryPrice='99.72727273')
+    g['demo_entry_book'] = lambda *a: (dict(time=6000, askQty='2', bidQty='2'), D('100.49'), D('100.50'))
+    g['request'] = lambda *a, **k: dict(symbol=symbol, time=6000, markPrice='100.50')
+    assert execute(new_setup(new_root, [new_add], D('.01'), D('2.2')), '100.50', False)
+    args, k = submit.call_args
+    assert D(args[2]) == D('.73') and k['reduce_only']
+    assert new_setup(new_root, [new_add, new_trim], D('.01'), D('1.7'))['trim_remaining'] == D('.23')
+    assert new_setup(new_root, [new_add, dict(new_trim, executed_qty='.73')], D('.01'),
+                     D('1.47'))['trim_remaining'] == 0
+    assert new_setup(new_root, [dict(new_add, executed_qty='.2')], D('.01'),
+                     D('1.2'))['trim_remaining'] == D('.4')
+    assert new_setup(new_root, [dict(new_add, executed_qty='0')], D('.01'), D(1))['trim_remaining'] == 0
+    p.update(positionAmt='1.7')
 
     def fill(oid, amount, side, price, fee, realized, stamp):
         return dict(orderId=oid, id=oid, qty=amount, side=side, time=stamp, price=price,
@@ -95,7 +126,7 @@ with TemporaryDirectory() as tmp:
     assert len(closes) == 2 and closes[12]['decision']['stage'] == 'trim'
     assert sum(D(o['fees']) for o in closes.values()) == D('.22')
     assert sum(D(o['funding']) for o in closes.values()) == D('-.11')
-    assert setup()['trimmed'] == D('.5')
+    assert setup()['trim_remaining'] == D('.7')
     assert g['sync_external_demo_close'](order, {(symbol,str(key)):o for key,o in closes.items()}, 6000, [add_order])
     assert len([o for o in g['recent_orders']() if o.get('pnl') is not None]) == 2
 print('Passed: staging off, IOC sizing, restart ownership and hard stop, partial trim and idempotent fees/funding')
