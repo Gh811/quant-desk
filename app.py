@@ -184,7 +184,7 @@ def fast_structure_stop(entry, direction, extreme, volatility, base_stop, contra
     return distance
 
 
-def evaluate_entry_signal(symbol, mode, now, read, *, us_equity=False):
+def evaluate_entry_signal(symbol, mode, now, read, *, us_equity=False, continuation=False):
     base, confirm, backdrop = SIGNAL_TIMEFRAMES[mode]
     bars, raw = read(base, now, 49)
     candle, score, volatility, reason = entry_signal(symbol, mode, bars)
@@ -195,7 +195,16 @@ def evaluate_entry_signal(symbol, mode, now, read, *, us_equity=False):
         if direction is not None:
             stressed, retest = fast_volatility_setup(bars, direction, volatility)
             if stressed and retest is None:
-                return candle, None, volatility, '波动突增 · 等待突破后回踩确认', {}
+                column = 2 if direction > 0 else 3
+                lookback = STRATEGY_LOOKBACK['fast']
+                level = (max if direction > 0 else min)(bar[column] for bar in bars[-lookback-2:-2])
+                previous, current = bars[-2:]
+                if (not continuation or direction * (previous[4] - level) <= 0
+                        or direction * (current[3 if direction > 0 else 2] - level) <= 0
+                        or direction * (current[4] - previous[4]) <= 0):
+                    return candle, None, volatility, '波动突增 · 等待突破后回踩确认', {}
+                score = current[4] / level - 1
+                reason = '高波动突破延续做多' if direction > 0 else '高波动跌破延续做空'
             if retest is not None:
                 score = bars[-1][4]/retest - 1
                 reason = '高波动回踩做多' if direction > 0 else '高波动反抽做空'
@@ -395,12 +404,13 @@ FAST_CORRELATED_ASSETS = {'BTC', 'ETH', 'SOL'}
 FAST_CRYPTO_ASSETS = FAST_CORRELATED_ASSETS | {'BNB', 'ZEC'}
 
 
-BACKTEST_RULES = {'current': '当前策略', 'confirmation': '严格确认', 'retest': '严格确认＋回踩'}
+BACKTEST_RULES = {'current': '当前策略', 'continuation': '突破延续研究', 'confirmation': '严格确认', 'retest': '严格确认＋回踩'}
 
 
 def backtest_entry_signal(symbol, mode, now, read, rules, *, us_equity=False):
-    candle, score, volatility, reason, context = evaluate_entry_signal(symbol, mode, now, read, us_equity=us_equity)
-    if rules == 'current' or score is None:
+    candle, score, volatility, reason, context = evaluate_entry_signal(symbol, mode, now, read, us_equity=us_equity,
+                                                                      continuation=rules == 'continuation')
+    if rules in {'current', 'continuation'} or score is None:
         return candle, score, volatility, reason, context
     if rules == 'retest' and mode != 'swing' and reason in {'突破做多', '跌破做空'}:
         return candle, None, volatility, '等待回踩或反抽', {}
@@ -456,7 +466,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
     cost_cap = SHORT_COST_CAP if cost_control else Decimal('.75')
     reentry_at = {}
     max_hours = {'intraday': 4, 'swing': 48, 'us_open': 1.5}.get(mode)
-    assets = sorted(asset for asset in markets if mode != 'us_open' or asset in US_EQUITY_ASSETS)
+    assets = sorted(asset for asset in markets if mode != 'us_open' or equity_kind(asset+'USDT', (contracts or {}).get(asset)) == 'us')
     us_assets = {asset for asset in assets if equity_kind(asset+'USDT', (contracts or {}).get(asset)) == 'us'}
 
     for index, stamp in enumerate(range(start, end, 60000)):
@@ -1892,7 +1902,9 @@ def backtest_range(params):
     modes = ['fast']
     intervals = SIGNAL_TIMEFRAMES['fast']
     now = time.time_ns() // 1_000_000 // 60000 * 60000
-    if 'start_at' in params:
+    if params.get('days') == ['all']:
+        start, end = 0, now
+    elif 'start_at' in params:
         start, end = (int(params[key][0]) for key in ('start_at', 'end_at'))
     elif 'start' in params and 'end' in params:
         start, end = (int(datetime.fromisoformat(params[key][0]+'T00:00:00+08:00').timestamp()*1000)
@@ -1910,19 +1922,24 @@ def backtest_range(params):
 def backtest_coverage(params):
     assets, modes, intervals, requested_start, requested_end = backtest_range(params)
     venue, source_label = backtest_feed(params)
+    requested_modes = params.get('mode', ['fast'])
+    modes = list(dict.fromkeys(requested_modes))
+    if not modes or any(mode not in {'fast', 'intraday', 'swing', 'us_open'} for mode in modes):
+        raise ValueError('回测策略无效')
+    intervals = sorted({frame for mode in modes for frame in SIGNAL_TIMEFRAMES[mode]}, key=TIMEFRAME_MINUTES.get)
     feeds = [(interval, '/fapi/v1/klines', 50) for interval in intervals]
     feeds += [('1m', '/fapi/v1/klines', 0), ('1m', '/fapi/v1/markPriceKlines', 0)]
 
     def first_usable(feed):
         asset, interval, endpoint, warmup = feed
         step = TIMEFRAME_MINUTES.get(interval, 1) * 60000
-        desired = requested_start // step * step - warmup*step
+        desired = max(0, requested_start // step * step - warmup*step)
         rows = backtest_request(venue, endpoint, symbol=asset+'USDT', interval=interval,
                                 startTime=desired, endTime=requested_end-1, limit=1)
         if not rows:
             raise ValueError(f'{source_label}中 {asset} 的 {interval} 历史行情不足或不可用')
         first = int(rows[0][0])
-        return requested_start if first == desired else first + warmup*step
+        return requested_start if first <= requested_start // step * step - warmup*step else first + warmup*step
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         starts = list(pool.map(first_usable, [(asset, *feed) for asset in assets for feed in feeds]))
@@ -1931,7 +1948,7 @@ def backtest_coverage(params):
         raise ValueError('该标的历史不足以完成所选策略的预热，无法回测')
     return dict(assets=assets, venue=venue, source_label=source_label, start=start, end=requested_end,
                 requested_start=requested_start,
-                strategies=[STRATEGY_NAMES[key] for key in modes])
+                modes=modes, intervals=intervals, strategies=[STRATEGY_NAMES[key] for key in modes])
 
 
 @contextmanager
@@ -2062,6 +2079,8 @@ def execute_backtest_job(job, asset, source, start, end):
         with backtest_database() as database:
             row = database.execute('SELECT settings FROM backtest_costs WHERE job=?', (job,)).fetchone()
         settings = json.loads(row[0]) if row else None
+        if settings and settings.get('modes'):
+            params['mode'] = settings['modes']
         result = run_backtest(params, lambda detail: update('running', detail), settings=settings)
         update('done', result=zlib.compress(json.dumps(result, allow_nan=False).encode()))
     except Exception as error:
@@ -2095,8 +2114,13 @@ def backtest_cost_settings(params):
     mode = params.get('execution', ['taker'])[0]
     if mode not in {'maker', 'taker'}:
         raise ValueError('成交模型无效')
-    settings = {'execution': mode}
-    for name, default in (('maker_bps', '2'), ('taker_bps', '5'), ('slippage_bps', '1')):
+    modes = list(dict.fromkeys(params.get('mode', ['fast'])))
+    if not modes or any(key not in {'fast', 'intraday', 'swing', 'us_open'} for key in modes):
+        raise ValueError('回测策略无效')
+    settings = {'execution': mode, 'modes': modes}
+    if params.get('compare') == ['1'] and 'fast' in modes:
+        settings['compare'] = True
+    for name, default in (('maker_bps', '2'), ('taker_bps', '5'), ('slippage_bps', '0')):
         try:
             value = Decimal(params.get(name, [default])[0])
         except InvalidOperation:
@@ -2115,6 +2139,9 @@ def run_backtest(params, progress, *, settings=None):
     # Replay only needs optional metadata. Never wait on the trading catalogue lock.
     cached = catalog_cache.get(venue)
     contract = cached[1].get(symbol) if cached else None
+    if contract is None and 'us_open' in coverage['modes'] and equity_kind(symbol, None) != 'us':
+        catalog = backtest_request(venue, '/fapi/v1/exchangeInfo')
+        contract = next((item for item in catalog['symbols'] if item['symbol'] == symbol), None)
     progress('读取历史 K 线与资金费')
 
     def load_funding():
@@ -2137,19 +2164,27 @@ def run_backtest(params, progress, *, settings=None):
         marks = pool.submit(historical_bars, venue, symbol, '1m', start, end, mark=True, compact=True)
         funding = pool.submit(load_funding)
         data = {frame:historical_bars(venue, symbol, frame, start-50*TIMEFRAME_MINUTES[frame]*60000, end)
-                for frame in SIGNAL_TIMEFRAMES['fast']}
+                for frame in coverage['intervals']}
         data['1m'] = trades.result()
         mark_bars = marks.result()
         funding_rows = funding.result()
-    progress('运行 5 分钟策略')
+    progress('运行所选策略')
     if settings is None:
-        settings = {'execution': 'taker', 'maker_bps': '2', 'taker_bps': '5', 'slippage_bps': '3'}
+        settings = {'execution': 'taker', 'maker_bps': '2', 'taker_bps': '5', 'slippage_bps': '0'}
     fee = Decimal(settings['taker_bps']) / 10000
     slippage = Decimal(settings['slippage_bps']) / 10000
     maker_fee = Decimal(settings['maker_bps']) / 10000 if settings['execution'] == 'maker' else None
-    result = replay_portfolio('fast', {asset: (data, mark_bars, funding_rows)}, start, end,
-                              fee, slippage, contracts={asset: contract}, maker_fee=maker_fee)
-    return {**coverage, 'cost_settings': settings, 'funding_samples': len(funding_rows), 'results': [result]}
+    variants = [(mode, 'current') for mode in coverage['modes'] if mode != 'us_open' or equity_kind(symbol, contract) == 'us']
+    if settings.get('compare') and ('fast', 'current') in variants:
+        variants.append(('fast', 'continuation'))
+    if not variants:
+        raise ValueError('该标的不适用所选策略')
+    results = []
+    for mode, rules in variants:
+        progress(f'运行 {STRATEGY_NAMES[mode]} · {BACKTEST_RULES[rules]}')
+        results.append(replay_portfolio(mode, {asset: (data, mark_bars, funding_rows)}, start, end,
+                                       fee, slippage, rules=rules, contracts={asset: contract}, maker_fee=maker_fee))
+    return {**coverage, 'cost_settings': settings, 'funding_samples': len(funding_rows), 'results': results}
 
 
 def restore_strategy_positions(positions, assets, mode):
@@ -3423,9 +3458,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlsplit(self.path)
         try:
-            if parsed.path in {'/', '/backtest'}:
-                main, _, backtest = Path(__file__).with_name('index.html').read_bytes().partition(b'<!-- backtest-page -->')
-                self.send(200, 'text/html', backtest if parsed.path == '/backtest' else main)
+            if parsed.path in {'/', '/backtest', '/strategies'}:
+                main, _, pages = Path(__file__).with_name('index.html').read_bytes().partition(b'<!-- backtest-page -->')
+                backtest, _, strategies = pages.partition(b'<!-- strategies-page -->')
+                self.send(200, 'text/html', {'/': main, '/backtest': backtest, '/strategies': strategies}[parsed.path])
                 return
             if parsed.path == '/version':
                 self.send(200, 'application/json', json.dumps(dict(commit=deployed_commit())).encode())
