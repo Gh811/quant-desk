@@ -118,7 +118,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 </div>
 <button id="strategy-start" type="button" disabled>正在同步状态…</button>
 <button id="strategy-entries" type="button" disabled>停止开新仓</button>
-<button id="strategy-stop" type="button" disabled>停止并平仓</button><form id="config"><h3>允许交易的标的</h3><div id="assets"></div></form></aside>
+<button id="strategy-stop" type="button" disabled>停止并平仓</button><form id="config"><h3>允许交易的标的</h3><p id="strategy-asset-note" hidden>1 小时回测候选：SOXL、QQQ、TSLA。后 21 天组合成交 29 笔，净收益 +428.65 USDT，最大回撤 2.15%。由你勾选启用。</p><div id="assets"></div></form></aside>
 <section><header class="desk-heading"><h1>量化交易仪表盘</h1><a href="./backtest" target="_blank" rel="noopener">历史回测 ↗</a></header>
 <div class="account" aria-labelledby="account-title">
   <div class="account-header">
@@ -396,11 +396,7 @@ function addAssetCheckbox(asset, checked) {
   const assetName = orderElement('span', '', name(asset));
   assetName.title = name(asset);
   label.append(checkbox, assetName);
-  const remove = orderElement('button', 'watch-remove');
-  Object.assign(remove, {type:'button', textContent:'移出', disabled:true});
-  remove.setAttribute('aria-label', '移出 ' + name(asset));
-  remove.addEventListener('click', () => setAssetWatch(asset, false));
-  choice.append(label, remove);
+  choice.append(label);
   el('assets').append(choice);
 }
 function row(table, values) {
@@ -422,10 +418,6 @@ const preferences = readSaved('config');
 const poolWatch = new Set(Array.isArray(preferences?.poolWatch)
   ? preferences.poolWatch.filter(asset => typeof asset === 'string' && /^[A-Z0-9]{1,24}$/.test(asset)) : []);
 const removedAssets = new Set(Array.isArray(preferences?.removedAssets) ? preferences.removedAssets : []);
-const watchedAssets = new Set([...defaultAssets, ...poolWatch].filter(asset => !removedAssets.has(asset)));
-const selectedAssets = new Set(Array.isArray(preferences?.assets) ? preferences.assets :
-  defaultAssets.filter(asset => !['SAMSUNG','XAU','BNB','ZEC','INTC'].includes(asset)));
-for (const asset of watchedAssets) addAssetCheckbox(asset, selectedAssets.has(asset));
 const strategyMode = el('strategy-mode');
 el('strategy-details').onclick = event => { event.currentTarget.href = './strategies?mode=' + encodeURIComponent(strategyMode.value); };
 const strategySizing = el('strategy-sizing');
@@ -435,12 +427,40 @@ strategyNotional.value = preferences?.notional ?? '';
 const strategyNames = Object.fromEntries([...strategyMode.options].map(option => [option.value, option.textContent]));
 if (preferences?.strategy === 'scalp') strategyMode.value = 'fast';
 else if (Object.hasOwn(strategyNames, preferences?.strategy)) strategyMode.value = preferences.strategy;
+const selectionByMode = new Map();
+function validAsset(value) { return typeof value === 'string' && /^[A-Z0-9]{1,24}$/.test(value); }
+for (const key of Object.keys(strategyNames)) {
+  const saved = preferences?.assetsByStrategy?.[key];
+  if (Array.isArray(saved)) selectionByMode.set(key, new Set(saved.filter(validAsset)));
+}
+if (!preferences?.assetsByStrategy) {
+  const legacy = Array.isArray(preferences?.assets) ? preferences.assets.filter(validAsset) :
+    defaultAssets.filter(asset => !['SAMSUNG','XAU','BNB','ZEC','INTC'].includes(asset));
+  selectionByMode.set(strategyMode.value, new Set(legacy.filter(asset => !removedAssets.has(asset))));
+}
+function selectionFor(mode) {
+  if (!selectionByMode.has(mode)) selectionByMode.set(mode, new Set());
+  return selectionByMode.get(mode);
+}
+function syncAssetCheckboxes(active = selectionFor(strategyMode.value)) {
+  el('strategy-asset-note').hidden = strategyMode.value !== 'swing';
+  const visible = new Set([...defaultAssets, ...poolWatch].filter(asset => !removedAssets.has(asset)));
+  for (const asset of active) visible.add(asset);
+  for (const input of config.querySelectorAll('[name=asset]')) {
+    if (!visible.delete(input.value)) input.closest('.asset-choice').remove();
+    else input.checked = active.has(input.value);
+  }
+  for (const asset of visible) addAssetCheckbox(asset, active.has(asset));
+}
+syncAssetCheckboxes();
 function savePreferences() {
-  writeSaved('config', {assets:[...selectedAssets],
+  const assetsByStrategy = Object.fromEntries([...selectionByMode].map(([mode, assets]) => [mode, [...assets]]));
+  writeSaved('config', {assetsByStrategy,
     poolWatch:[...poolWatch], removedAssets:[...removedAssets], strategy:strategyMode.value,
     sizing:strategySizing.value, notional:strategyNotional.value});
 }
 strategyMode.addEventListener('change', () => {
+  syncAssetCheckboxes();
   renderMarketRows();
   renderStrategyControls();
   savePreferences();
@@ -976,7 +996,6 @@ function renderStrategyControls() {
     checkbox.disabled = assetEditingLocked() || (checkbox.checked && assetBusy(checkbox.value)) || !market?.demo_tradeable || (strategyMode.value === 'us_open' && market.equity !== 'us');
     checkbox.parentElement.dataset.unavailable = String(!market?.demo_tradeable);
     checkbox.parentElement.title = market?.demo_tradeable ? '' : '模拟盘未确认可交易';
-    checkbox.closest('.asset-choice').querySelector('button').disabled = assetEditingLocked() || assetBusy(checkbox.value);
   }
 }
 function setMarketPill(cell, label, tone) {
@@ -1084,27 +1103,10 @@ async function refreshStrategyStatus() {
       if (state.fixed_notional != null) strategyNotional.value = state.fixed_notional;
     }
     if (state.running && Array.isArray(state.assets)) {
-      let selectionChanged = false;
-      const existing = new Set([...config.querySelectorAll('[name=asset]')].map(input=>input.value));
-      for (const asset of state.assets) {
-        if (!existing.has(asset) && !removedAssets.has(asset)) {
-          addAssetCheckbox(asset, true);
-          selectionChanged = true;
-        }
-      }
-      for (const checkbox of config.querySelectorAll('[name=asset]')) {
-        const selected = state.assets.includes(checkbox.value);
-        if (checkbox.checked !== selected) {
-          checkbox.checked = selected;
-          selectionChanged = true;
-        }
-      }
-      if (selectionChanged) renderMarketRows();
+      syncAssetCheckboxes(new Set(state.assets));
+      renderMarketRows();
     } else if (wasRunning) {
-      for (const input of config.querySelectorAll('[name=asset]')) {
-        if (removedAssets.has(input.value)) input.closest('.asset-choice').remove();
-        else input.checked = selectedAssets.has(input.value);
-      }
+      syncAssetCheckboxes();
       renderMarketRows();
     }
     if (state.running) strategyStartError = '';
@@ -1121,7 +1123,10 @@ for (const control of ['start','stop','entries']) {
     if (button.disabled || strategyAction) return;
     const action = control === 'entries' ? (strategyState.entries_paused ? 'resume-entries' : 'pause-entries') : control;
     if (action === 'stop' && !confirm('停止后台策略并平掉币安模拟盘的所有单向持仓？')) return;
-    const params = new URLSearchParams(new FormData(config));
+    const params = new URLSearchParams();
+    if (action === 'start') {
+      for (const asset of new FormData(config).getAll('asset')) params.append('asset', asset);
+    }
     params.set('strategy', strategyMode.value);
     if (action === 'start') {
       params.set('sizing', strategySizing.value);
@@ -1192,6 +1197,7 @@ config.addEventListener('change', async event => {
     input.checked = enabled;
   }
   if (input.name === 'asset') {
+    const selectedAssets = selectionFor(strategyMode.value);
     if (input.checked) selectedAssets.add(input.value);
     else selectedAssets.delete(input.value);
     savePreferences();
@@ -1206,17 +1212,13 @@ async function loadMarketStatus() {
     if (!response.ok) throw Error(universe.error);
     marketCatalog = universe.markets;
     marketByAsset = new Map(marketCatalog.map(market => [market.asset, market]));
-    const existing = new Set([...config.querySelectorAll('[name=asset]')].map(input=>input.value));
-    for (const market of marketCatalog) {
-      if (poolWatch.has(market.asset) && !removedAssets.has(market.asset) && !existing.has(market.asset))
-        addAssetCheckbox(market.asset, selectedAssets.has(market.asset));
-    }
+    syncAssetCheckboxes(strategyState?.running ? new Set(strategyState.assets) : undefined);
     renderStrategyControls();
     renderMarketRows();
     renderPool();
     el('market-status').textContent = universe.demo_error ? '模拟盘目录核验失败 · ' + universe.demo_error : '币安模拟盘目录 · ' + date(Date.now());
     el('pool-status').textContent = universe.live_error ? '实盘目录暂不可用 · ' + universe.live_error
-      : marketCatalog.filter(isPoolMarket).length + ' 个候选 · 加入观察后可在左侧选择模拟盘支持的合约';
+      : marketCatalog.filter(isPoolMarket).length + ' 个候选 · 加入列表只改变左侧可见选项，交易标的以策略勾选为准';
   } catch (error) {
     el('market-status').textContent += ' · 本次未能验证：' + error.message;
     el('pool-status').textContent = '候选池读取失败 · ' + error.message;
@@ -1244,26 +1246,20 @@ function renderPool() {
     const button = orderElement('button', 'compact-button', watched ? '移出列表' : '加入列表');
     button.classList.toggle('watch-remove', watched);
     button.type = 'button';
-    button.disabled = watched && (assetEditingLocked() || assetBusy(market.asset));
     button.addEventListener('click', () => setAssetWatch(market.asset, !watched));
     item.cells[4].append(button);
   }
   if (!rows.length) row('pool-rows', ['暂无匹配合约', '—', '—', '—', '—']);
 }
-async function setAssetWatch(asset, watched) {
-  const input = [...config.querySelectorAll('[name=asset]')].find(input=>input.value === asset);
-  if (!watched) {
-    if (assetEditingLocked() || assetBusy(asset)) return;
-    if (strategyState.running && strategyState.assets.includes(asset) && !(await changeRunningAsset(asset, false))) return;
-    poolWatch.delete(asset);
-    removedAssets.add(asset);
-    selectedAssets.delete(asset);
-    input?.closest('.asset-choice').remove();
-  } else {
+function setAssetWatch(asset, watched) {
+  if (watched) {
     removedAssets.delete(asset);
     poolWatch.add(asset);
-    if (!input) addAssetCheckbox(asset, false);
+  } else {
+    poolWatch.delete(asset);
+    removedAssets.add(asset);
   }
+  syncAssetCheckboxes(strategyState?.running ? new Set(strategyState.assets) : undefined);
   savePreferences();
   renderStrategyControls();
   renderMarketRows();
