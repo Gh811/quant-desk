@@ -78,14 +78,15 @@ def load(asset, begin, end):
     return frames, marks, funding
 
 def compare_fast_exits(markets, begin, end):
-    for staged in (False,True):
+    for rebalance in (False, True):
         report=engine.replay_portfolio('fast',markets,begin,end,Decimal('.0005'),Decimal('.0001'),
-            rules='continuation',staged_take=staged,max_positions=5)
+            rules='continuation',staged_take=True, max_positions=5, rebalance_entry=rebalance, maker_rebalance=rebalance,
+            maker_entry_assets={a for a in markets if engine.equity_kind(a+'USDT', None)=='us'})
         checks=report['entry_checks']
         trades=report['trades']
         assert abs(sum(t['net'] for t in trades)-report['net'])<1e-6
-        print(staged,{k:report[k] for k in ('count','net','drawdown')},
-              {k:checks.get(k,0) for k in ('TP1 成交','TP2 成交','TP3 尾仓跟踪启动')},
+        print(rebalance,{k:report[k] for k in ('count','net','drawdown','win_rate','profit_factor','fees','funding')},
+              {k:checks.get(k,0) for k in ('模拟开仓','补仓 GTX 成交','回均价减仓成交','TP1 成交','TP2 成交','TP3 尾仓跟踪启动')},
               {d:sum(t['direction']==d for t in trades) for d in (-1,1)},flush=True)
 
 

@@ -705,7 +705,7 @@ def backtest_entry_signal(symbol, mode, now, read, rules, *, us_equity=False):
 
 def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *, rules='current', contracts=None, maker_fee=None, weight_opportunity=False, target_r=None, max_positions=BACKTEST_MAX_POSITIONS, holding_hours=None, failed_rebound_hours=None, relative_strength_benchmark=None, entry_factor=None, split_entry=False, leverage_override=None, reentry_bars=SHORT_REENTRY_COOLDOWN_BARS, rebalance_entry=False, staged_take=False, maker_entry_assets=(), maker_offset=Decimal('.0001'), maker_rebalance=False, maker_add_offset=Decimal('.0001')):
     split_entry = split_entry or rebalance_entry
-    if split_entry and (maker_fee is not None or max_positions != 5 or mode != 'intraday'):
+    if split_entry and (maker_fee is not None or max_positions != 5):
         raise ValueError('分批入场研究只使用 15 分钟信号、吃单与 5 仓位上限')
     entry_fee = fee if maker_fee is None else maker_fee
     entry_slip = slippage if maker_fee is None else Decimal(0)
@@ -968,7 +968,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                         position['entry_slippage'] += added*abs(price-opening)
                     entry_checks['分批补仓成交'] += 1
             reduce_qty = position.get('reduce_qty', Decimal(0))
-            if reduce_qty and stamp > position['add_at'] and stamp-position['opened'] < max_hours*HOUR:
+            if reduce_qty and stamp > position['add_at'] and (max_hours is None or stamp-position['opened'] < max_hours*HOUR):
                 # Allocation to this leg uses weighted-average cost and proportional funding.
                 close_price = Decimal(str(trade_open))*(1-direction*slippage)
                 funding_share = position['funding'] * reduce_qty / amount
