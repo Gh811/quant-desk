@@ -1909,6 +1909,7 @@ button[aria-pressed=true],button:hover,.link:hover{background:#234264;border-col
 <p>回放按已收盘的 K 线生成信号，以分钟级行情模拟执行。成交模型、手续费和滑点可分别配置。<br><a href="https://www.freqtrade.io/en/latest/lookahead-analysis/">Freqtrade · 未来数据检查</a> · <a href="https://www.quantconnect.com/docs/v2/writing-algorithms/live-trading/trading-and-orders">QuantConnect LEAN · 成交与成本模型</a></p>
 </section>
 <section class="research"><h2>42 天共享账户对照</h2><p>2026/09/20 08:00 至 11/01 08:00（北京时间）。17 个标的共享 10,000 USDT。零滑点，双边各 5 bp 手续费，计入资金费。动量回撤与布林带区间回归为离线研究。</p><div class="scroller"><table><thead><tr><th>策略</th><th>成交笔数</th><th>胜率</th><th>平均盈亏比</th><th>净盈亏 USDT</th><th>最大回撤</th></tr></thead><tbody><tr><td>多周期动量回撤</td><td>1248</td><td>33.8%</td><td>1.04</td><td>−4,175.37</td><td>41.90%</td></tr><tr><td>5 分钟双向</td><td>850</td><td>31.5%</td><td>1.10</td><td>−3,784.54</td><td>38.93%</td></tr><tr><td>1 小时双向</td><td>234</td><td>49.1%</td><td>0.97</td><td>−270.49</td><td>13.08%</td></tr></tbody></table></div></section>
+<section class="research" id="return-ranked"><h2>半年回测 · 按扣费后净收益排序</h2><p>2026 年 5–10 月（UTC），初始权益 10,000 USDT。每组最多两个标的，共享资金，计入双边各 5 bp 手续费及资金费，滑点为零。各组按 5–7 月净收益选参数和标的，8–10 月独立重放。该验证期已用于先前研究。</p><div class="scroller"><table><thead><tr><th>策略</th><th>标的</th><th>止盈目标</th><th>半年笔数</th><th>半年净收益率</th><th>半年胜率</th><th>最大回撤</th><th>8–10 月净收益率</th></tr></thead><tbody><tr><td>RSI 回撤修复（阈值 20）</td><td>MU</td><td>1.25R</td><td>140</td><td>+7.29%</td><td>53.57%</td><td>10.56%</td><td>+1.48%</td></tr><tr><td>RSI 回撤修复（阈值 35）</td><td>MU</td><td>1.25R</td><td>154</td><td>+6.02%</td><td>53.25%</td><td>10.53%</td><td>-0.01%</td></tr><tr><td>24 小时通道突破</td><td>MU、ETH</td><td>1.25R</td><td>395</td><td>+5.76%</td><td>50.38%</td><td>9.53%</td><td>-0.76%</td></tr><tr><td>多日趋势内短线恢复</td><td>ETH</td><td>3R</td><td>92</td><td>-1.03%</td><td>46.74%</td><td>5.72%</td><td>-2.28%</td></tr><tr><td>布林带＋主动买量（仅做多）</td><td>NVDA</td><td>0.5R</td><td>40</td><td>-2.34%</td><td>67.50%</td><td>5.36%</td><td>-3.97%</td></tr><tr><td>48 小时通道突破</td><td>MU</td><td>1.25R</td><td>160</td><td>-3.51%</td><td>48.13%</td><td>9.71%</td><td>-3.98%</td></tr><tr><td>15 分钟趋势内均值回归</td><td>ETH</td><td>1.5R</td><td>266</td><td>-6.66%</td><td>44.36%</td><td>9.63%</td><td>-8.42%</td></tr></tbody></table></div></section>
 <section class="research" id="snapshot">
 <h2>历史回放 · 17 个标的</h2>
 <p class="note">北京时间 2026/10/03 09:00 至 2026/11/01 08:00。每个标的独立使用 10,000 USDT，两边各收 5 bp，计入资金费，滑点为 0。净盈亏为独立结果加总。</p>
@@ -1920,6 +1921,320 @@ button[aria-pressed=true],button:hover,.link:hover{background:#234264;border-col
 </section>
 </main>
 <script>
+const studyStrategies = {
+  "rsi20": [
+    "RSI 回撤修复（阈值 20）",
+    "1h",
+    [
+      "趋势过滤",
+      "48 根均线向上且价格在其上方"
+    ],
+    [
+      "RSI",
+      "前两次收盘变动计算简单 RSI，低于或等于 20"
+    ],
+    [
+      "入场",
+      "小时线收阳且高于上一根收盘，只做多"
+    ]
+  ],
+  "rsi35": [
+    "RSI 回撤修复（阈值 35）",
+    "1h",
+    [
+      "趋势过滤",
+      "48 根均线向上且价格在其上方"
+    ],
+    [
+      "RSI",
+      "前两次收盘变动计算简单 RSI，低于或等于 35"
+    ],
+    [
+      "入场",
+      "小时线收阳且高于上一根收盘，只做多"
+    ]
+  ],
+  "channel24": [
+    "24 小时通道突破",
+    "1h",
+    [
+      "价格通道",
+      "用此前 24 根小时线的最高价和最低价"
+    ],
+    [
+      "波动过滤",
+      "按 14 根真实波幅检查波动"
+    ],
+    [
+      "入场",
+      "收盘突破上沿做多，跌破下沿做空"
+    ]
+  ],
+  "channel48": [
+    "48 小时通道突破",
+    "1h",
+    [
+      "价格通道",
+      "用此前 48 根小时线的最高价和最低价"
+    ],
+    [
+      "波动过滤",
+      "按 14 根真实波幅检查波动"
+    ],
+    [
+      "入场",
+      "收盘突破上沿做多，跌破下沿做空"
+    ]
+  ],
+  "fade24": [
+    "24 小时假突破反转",
+    "1h",
+    [
+      "价格通道",
+      "以突破前 24 根小时线确定边界"
+    ],
+    [
+      "失败确认",
+      "前一根在区间外收盘，后一根收回"
+    ],
+    [
+      "入场",
+      "收复下沿做多，跌回上沿做空"
+    ]
+  ],
+  "fade48": [
+    "48 小时假突破反转",
+    "1h",
+    [
+      "价格通道",
+      "以突破前 48 根小时线确定边界"
+    ],
+    [
+      "失败确认",
+      "前一根在区间外收盘，后一根收回"
+    ],
+    [
+      "入场",
+      "收复下沿做多，跌回上沿做空"
+    ]
+  ],
+  "bb_macd_reentry": [
+    "布林带回归＋MACD",
+    "1h",
+    [
+      "布林带",
+      "此前 20 根收盘价均值及两倍标准差"
+    ],
+    [
+      "MACD",
+      "12、26、9 计算柱值，要求与反弹方向一致"
+    ],
+    [
+      "入场",
+      "收盘回到外轨内且尚未越过中轨"
+    ]
+  ],
+  "bb_macd_pullback": [
+    "布林带顺势回踩＋MACD",
+    "1h",
+    [
+      "布林带",
+      "20 根收盘价均值及 1.5 倍标准差"
+    ],
+    [
+      "MACD 与均线",
+      "MACD 柱改善，48 根均线方向同向"
+    ],
+    [
+      "入场",
+      "从轨外收回轨内"
+    ]
+  ],
+  "bb_macd_breakout": [
+    "布林带突破＋MACD",
+    "1h",
+    [
+      "布林带",
+      "20 根收盘价均值及两倍标准差"
+    ],
+    [
+      "MACD",
+      "柱值与突破同向并继续扩大"
+    ],
+    [
+      "入场",
+      "收盘穿越外轨"
+    ]
+  ],
+  "bb_macd_trend": [
+    "布林带中轨趋势延续",
+    "1h",
+    [
+      "布林中轨",
+      "以此前 20 根收盘价计算中轨"
+    ],
+    [
+      "趋势与 MACD",
+      "48 根均线位置和 MACD 柱一起确认"
+    ],
+    [
+      "入场",
+      "价格在带内穿越中轨"
+    ]
+  ],
+  "bb_macd_flow": [
+    "布林带＋成交确认",
+    "1h",
+    [
+      "布林带与 MACD",
+      "价格收回 1.5 倍标准差外轨内，MACD 柱改善"
+    ],
+    [
+      "成交量",
+      "当前成交量至少达到前 20 根中位数"
+    ],
+    [
+      "成交方向",
+      "主动买入至少 52% 做多，至多 48% 做空"
+    ]
+  ],
+  "bb_macd_flow_long": [
+    "布林带＋主动买量（仅做多）",
+    "1h",
+    [
+      "布林带与 MACD",
+      "价格收回 1.5 倍标准差下轨，MACD 柱转强"
+    ],
+    [
+      "成交量",
+      "当前成交量至少达到前 20 根中位数"
+    ],
+    [
+      "主动买量",
+      "主动买量至少 52%，只生成多头订单"
+    ]
+  ],
+  "session_momentum": [
+    "美股尾盘趋势延续",
+    "15m",
+    [
+      "时段",
+      "纽约时间 14:30–15:00 检查入场"
+    ],
+    [
+      "日内方向",
+      "价格相对 09:30 开盘价偏离至少 0.4%"
+    ],
+    [
+      "突破",
+      "突破此前两小时区间且与日内方向一致"
+    ]
+  ],
+  "short_reversion": [
+    "15 分钟趋势内均值回归",
+    "15m",
+    [
+      "趋势",
+      "比较短窗口均值与较长窗口均值"
+    ],
+    [
+      "价格",
+      "价格重新收回布林外轨"
+    ],
+    [
+      "主动成交",
+      "入场方向需得到主动成交占比确认"
+    ]
+  ],
+  "volume_squeeze": [
+    "低波动放量突破",
+    "15m",
+    [
+      "波幅压缩",
+      "最近 8 根平均波幅不超过此前窗口的 70%"
+    ],
+    [
+      "放量",
+      "成交量达到基准中位数 1.5 倍"
+    ],
+    [
+      "突破确认",
+      "穿越前 8 根区间并得到主动成交方向确认"
+    ]
+  ],
+  "range_reclaim": [
+    "日内区间扫低收复",
+    "15m",
+    [
+      "区间",
+      "用此前 16 根 K 线确定高低边界"
+    ],
+    [
+      "收复",
+      "当根下破低点后收复，收盘位于当根上四分位"
+    ],
+    [
+      "入场",
+      "收阳且仍低于区间中点"
+    ]
+  ],
+  "open_gap_reclaim": [
+    "美股开盘缺口修复",
+    "15m",
+    [
+      "时段",
+      "纽约时间 10:00 判断，周一跳过"
+    ],
+    [
+      "缺口",
+      "相对前一日 16:00 合约价出现至少 0.5% 缺口"
+    ],
+    [
+      "修复",
+      "突破开盘首根 K 线边界且未完全填补缺口"
+    ]
+  ],
+  "persistent_momentum": [
+    "多日趋势内短线恢复",
+    "15m / 1h",
+    [
+      "多日动量",
+      "近 48 小时变化超过 1.5% 且与均值方向一致"
+    ],
+    [
+      "回撤结束",
+      "15 分钟线突破前 4 根高点或低点"
+    ],
+    [
+      "追价限制",
+      "突破幅度不超过当期真实波幅均值"
+    ]
+  ],
+  "swing_pullback": [
+    "1 小时顺势回踩",
+    "1h / 4h / 1d",
+    [
+      "趋势",
+      "4 小时确认方向，日线不能反向"
+    ],
+    [
+      "入场",
+      "只做回踩确认，过滤直接突破"
+    ]
+  ],
+  "swing_aligned": [
+    "1 小时顺势回踩＋日线同向",
+    "1h / 4h / 1d",
+    [
+      "趋势",
+      "要求 4 小时与日线都同向"
+    ],
+    [
+      "入场",
+      "只做回踩确认，过滤直接突破"
+    ]
+  ]
+};
 const strategies = {
   reversion: ['布林带区间回归 · 研究','5m / 15m'],
   momentum: ['多周期动量回撤 · 研究','5m / 1h'],
@@ -1959,6 +2274,10 @@ const layouts = {
     [['信号汇合','趋势、结构、量价和波动共同确认后才生成入场信号。'],['仓位与成本','按初始止损距离配仓，研究回放采用共享资金和组合仓位上限。'],['退出','2R 止盈、结构止损或 90 分钟到期。']]
   ]
 };
+for (const [key,[name,frames,...modules]] of Object.entries(studyStrategies)) {
+  strategies[key] = [name + ' · 研究',frames];
+  layouts[key] = [modules,[['仓位与成本','单标的或少量标的共享资金，计入开平费用与资金费。'],['退出与回测','用分钟级行情检查止损和止盈。配置和结果见下方历史回放。']]];
+}
 const colors = ['#538fff','#3ebcde','#4dc9ba','#f89751','#f0bd58','#f7839f','#9f9aff'];
 const params = new URLSearchParams(location.search);
 let active = Object.hasOwn(strategies,params.get('mode')) ? params.get('mode') : 'fast';
@@ -1972,7 +2291,7 @@ const button = (label, pressed, action) => {
 function render() {
   const [name, frames, entry, size, risk] = strategies[active];
   const mode = ['continuation','reversion','momentum'].includes(active) ? 'fast' : active;
-  const researchOnly = ['reversion','momentum'].includes(active);
+  const researchOnly = ['reversion','momentum'].includes(active) || Object.hasOwn(studyStrategies,active);
   byId('backtest').hidden = researchOnly;
   byId('backtest').href = './backtest?' + new URLSearchParams({mode,days:'all'});
   const details = [
