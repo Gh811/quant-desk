@@ -1003,7 +1003,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 # A minute bar cannot establish when the order joined the queue or filled.
                 # Count adverse stop touches, and suppress favorable exits in the fill minute.
                 favorable = entry
-            if fast_trend and not maker_fill_bar:
+            if fast_trend and not maker_fill_bar and not position.get('take_stage'):
                 review, detail = position.get('review', (None, ''))
                 mark = Decimal(str(mark_open))
                 current = direction*(mark/entry-1)
@@ -1024,7 +1024,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                     if candidate is not None and direction*(mark-candidate) > 0:
                         trail = position['trail'] = (max if direction > 0 else min)(trail, candidate)
                 review_window = stamp // interval
-                if take_return is not None and reason is None and position.get('take_reviewed') != review_window:
+                if not staged_take and take_return is not None and reason is None and position.get('take_reviewed') != review_window:
                     take = position['take'] = (min if direction > 0 else max)(take, entry*(1+direction*take_return))
                     position['take_reviewed'] = review_window
             if reason is None:
@@ -1047,7 +1047,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 elif staged_take and not maker_fill_bar and take_stage < 3:
                     trade_bar = data['1m'][index][0]
                     trade_extreme = Decimal(str(trade_bar[2 if direction > 0 else 3]))
-                    risk_distance = abs(take-entry) / take_multiple
+                    risk_distance = entry * stop
                     levels = (take, take + direction*risk_distance/2, take + direction*risk_distance)
                     # The existing stop wins an ambiguous minute. New stops take effect on the next minute.
                     for stage in range(take_stage, len(levels)):
@@ -1061,6 +1061,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                         position['take_stage'] = stage+1
                         position['reserve'] = Decimal(0)
                         if stage < 2:
+                            position.setdefault('take_start_amount', amount)
                             quantity = position['amount']/2
                             settle_leg(position, quantity, level, maker=maker_exit)
                             position['reduce_qty'] = Decimal(0)
@@ -1086,7 +1087,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 balance += net
                 family = fast_signal_family(position['signal'])
                 if fast_trend and family and reason != '回测结束结算':
-                    result_r = net / (entry * amount * stop)
+                    result_r = (net + position.get('partial_net', 0)) / (entry * position.get('take_start_amount', amount) * stop)
                     learning_samples[direction].append((stamp + 60000, asset+'USDT', direction, family,
                                                         float(max(Decimal(-3), min(Decimal(3), result_r)))))
                 trades.append(dict(symbol=asset+'USDT', opened=position['opened'], closed=stamp, entry=float(entry), exit=float(price),

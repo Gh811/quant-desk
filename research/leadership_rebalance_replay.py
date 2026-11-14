@@ -20,6 +20,12 @@ def rows(asset, kind, month):
     suffix = kind if kind == 'fundingRate' else '1m'
     name = f'{asset}USDT-{suffix}-2026-{month}.zip'
     path = (ROOT/'sep'/kind/name if month == '09' else ROOT/'earlier-replays'/f'portfolio-{kind}-{name}')
+    if asset == 'BTC' and month == '10':
+        path = ROOT/'earlier-replays'/{
+            'klines': 'quant-oct-test.zip',
+            'markPriceKlines': 'quant-btc-markPriceKlines-oct.zip',
+            'fundingRate': 'quant-BTCUSDT-fundingRate-2026-10.zip',
+        }[kind]
     with ZipFile(path) as archive, archive.open(archive.namelist()[0]) as data:
         for row in csv.reader(line.decode() for line in data):
             if row and row[0].isdigit():
@@ -71,14 +77,32 @@ def load(asset, begin, end):
     frames['1m'] = trades
     return frames, marks, funding
 
+def compare_fast_exits(markets, begin, end):
+    for staged in (False,True):
+        report=engine.replay_portfolio('fast',markets,begin,end,Decimal('.0005'),Decimal('.0001'),
+            rules='continuation',staged_take=staged,max_positions=5)
+        checks=report['entry_checks']
+        trades=report['trades']
+        assert abs(sum(t['net'] for t in trades)-report['net'])<1e-6
+        print(staged,{k:report[k] for k in ('count','net','drawdown')},
+              {k:checks.get(k,0) for k in ('TP1 成交','TP2 成交','TP3 尾仓跟踪启动')},
+              {d:sum(t['direction']==d for t in trades) for d in (-1,1)},flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--staged', action='store_true', help='比较三档止盈与提高入场频次的设置')
     parser.add_argument('--maker-rebalance', action='store_true', help='比较补仓只挂单及净保本减仓')
+    parser.add_argument('--fast-exits', action='store_true', help='对照5分钟双向策略的三档止盈')
     args = parser.parse_args()
     begin, end = stamp('2026-09-20'), stamp('2026-11-01')
     assets = ASSETS + ['SNDK'] if args.staged or args.maker_rebalance else ASSETS
+    if args.fast_exits:
+        assets = ASSETS + ['SNDK', 'BTC', 'ETH', 'SOL', 'XAU']
     markets = {asset: load(asset, begin, end) for asset in assets}
+    if args.fast_exits:
+        compare_fast_exits(markets, begin, end)
+        return
     benchmark = markets.pop('QQQ')[0]['1h']
     if args.staged or args.maker_rebalance:
         original_markets = {asset: markets[asset] for asset in ASSETS if asset != 'QQQ'}
