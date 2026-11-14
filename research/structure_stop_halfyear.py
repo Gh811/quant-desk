@@ -69,7 +69,7 @@ def load(a):
       b=buffers[f];b[2]=max(b[2],bar[2]);b[3]=min(b[3],bar[3]);b[4]=bar[4];b[5]+=float(row[7]);b[6]+=float(row[10])
      if (t+60000)%width==0:
       if f not in buffers: continue
-     b=buffers[f];dest.append((tuple(b[:5]),(0,0,0,0,0,0,0,b[5],0,0,b[6])))
+      b=buffers[f];dest.append((tuple(b[:5]),(0,0,0,0,0,0,0,b[5],0,0,b[6])))
   if len(series)!=(end-series.start)//60000: raise ValueError(f'{k} 长度不完整')
  funding=[]
  for m in active_months:
