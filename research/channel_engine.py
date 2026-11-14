@@ -552,6 +552,8 @@ INTRADAY_RESEARCH_RULES = {
     'hourly_rsi_5m': '小时趋势 5 分钟回撤',
     'hourly_rsi_15m': '小时趋势 15 分钟回撤',
     'hourly_rsi_15m_flow': '小时趋势 15 分钟回撤与成交确认',
+    'hourly_rsi_15m_both_reset': '小时趋势 15 分钟双向回撤与均线收复',
+    'hourly_rsi_15m_both': '小时趋势 15 分钟双向回撤',
     'hourly_rsi_15m_frequent': '小时趋势 15 分钟回撤（RSI≤35）',
 }
 BACKTEST_RULES.update(INTRADAY_RESEARCH_RULES)
@@ -578,7 +580,7 @@ def intraday_research_signal(now, read, rule):
                 side, boundary = 1, upper
             elif close < lower and close/day_open < .996:
                 side, boundary = -1, lower
-    elif rule in {'hourly_rsi_5m', 'hourly_rsi_15m', 'hourly_rsi_15m_flow', 'hourly_rsi_15m_frequent'}:
+    elif rule in {'hourly_rsi_5m', 'hourly_rsi_15m', 'hourly_rsi_15m_flow', 'hourly_rsi_15m_frequent', 'hourly_rsi_15m_both', 'hourly_rsi_15m_both_reset'}:
         hours, _ = read('1h', now, 50)
         hourly = [bar[4] for bar in hours]
         mean = statistics.mean(hourly[-49:-1])
@@ -588,10 +590,19 @@ def intraday_research_signal(now, read, rule):
         rsi = 100 * sum(max(0, change) for change in changes) / total if total else 50
         volume = float(raw[-1][7])
         buy = float(raw[-1][10])/volume if volume > 0 else .5
-        rsi_limit = 35 if rule == 'hourly_rsi_15m_frequent' else 20
+        rsi_limit = 35 if rule in {'hourly_rsi_15m_frequent', 'hourly_rsi_15m_both', 'hourly_rsi_15m_both_reset'} else 20
         if (hourly[-1] > mean and trend > 0 and rsi <= rsi_limit and close > max(previous, current[1])
                 and (rule != 'hourly_rsi_15m_flow' or buy >= .55)):
             side, boundary = 1, current[3]
+        elif (rule in {'hourly_rsi_15m_both', 'hourly_rsi_15m_both_reset'} and hourly[-1] < mean and trend < 0
+              and rsi >= 100-rsi_limit and close < min(previous, current[1])):
+            side, boundary = -1, current[2]
+        if not side and rule == 'hourly_rsi_15m_both_reset':
+            average = statistics.mean(closes[-7:-1])
+            if hourly[-1] > mean and trend > 0 and previous <= average < close and close > current[1]:
+                side, boundary = 1, current[3]
+            elif hourly[-1] < mean and trend < 0 and previous >= average > close and close < current[1]:
+                side, boundary = -1, current[2]
         _, volatility = trend_metrics(hours)
     elif rule == 'persistent_momentum':
         hours, _ = read('1h', now, 49)
@@ -703,7 +714,7 @@ def backtest_entry_signal(symbol, mode, now, read, rules, *, us_equity=False):
     return candle, score, volatility, reason, context
 
 
-def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *, rules='current', contracts=None, maker_fee=None, weight_opportunity=False, target_r=None, max_positions=BACKTEST_MAX_POSITIONS, holding_hours=None, failed_rebound_hours=None, relative_strength_benchmark=None, entry_factor=None, split_entry=False, leverage_override=None, reentry_bars=SHORT_REENTRY_COOLDOWN_BARS, rebalance_entry=False, staged_take=False, maker_entry_assets=(), maker_offset=Decimal('.0001'), maker_rebalance=False, maker_add_offset=Decimal('.0001')):
+def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *, rules='current', contracts=None, maker_fee=None, weight_opportunity=False, target_r=None, max_positions=BACKTEST_MAX_POSITIONS, holding_hours=None, failed_rebound_hours=None, relative_strength_benchmark=None, entry_factor=None, split_entry=False, leverage_override=None, reentry_bars=SHORT_REENTRY_COOLDOWN_BARS, rebalance_entry=False, staged_take=False, maker_entry_assets=(), maker_offset=Decimal('.0001'), maker_rebalance=False, maker_add_offset=Decimal('.0001'), thesis_stop=False, staggered_listing=False):
     split_entry = split_entry or rebalance_entry
     if split_entry and (maker_fee is not None or max_positions != 5):
         raise ValueError('分批入场研究只使用 15 分钟信号、吃单与 5 仓位上限')
@@ -716,6 +727,8 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
 
     def read(asset, frame, cutoff, required):
         duration = TIMEFRAME_MINUTES[frame] * 60000
+        if frame == '1m' and '1m_signal' in starts[asset]:
+            frame = '1m_signal'
         end_index = (cutoff - starts[asset][frame]) // duration
         if end_index < required:
             raise ValueError('回测预热数据不足')
@@ -788,6 +801,9 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
         if stamp % interval == 0 and equity > 0:
             candidates = []
             for asset in assets:
+                if staggered_listing and any(stamp < starts[asset][frame] + 50*TIMEFRAME_MINUTES[frame]*60000
+                                             for frame in ('15m', '1h')):
+                    continue
                 if asset in positions:
                     entry_checks['持仓中'] += 1
                     continue
@@ -855,6 +871,10 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                         continue
                 if split_entry:
                     stop *= Decimal('1.5')
+                if thesis_stop:
+                    swing_bars, _ = read(asset, '15m', stamp, 6)
+                    extreme = (min if direction > 0 else max)(bar[3 if direction > 0 else 2] for bar in swing_bars)
+                    stop = max(stop, direction*(1-Decimal(str(extreme))/entry) + volatility*Decimal('.35'))
                 cost = fee + slippage if post_only else entry_fee + fee + entry_slip + slippage
                 if cost > stop*cost_cap:
                     entry_checks['预估成本过高'] += 1
@@ -865,7 +885,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                     if target_return < max(stop * Decimal('1.1'), 3 * cost):
                         entry_checks['回归空间不足'] += 1
                         continue
-                if fast_trend:
+                if fast_trend and not thesis_stop:
                     try:
                         target_return, _ = fast_take_target(entry, direction, stop, volatility, cost,
                                                             context.get('obstacles', ()))
@@ -1003,7 +1023,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 # A minute bar cannot establish when the order joined the queue or filled.
                 # Count adverse stop touches, and suppress favorable exits in the fill minute.
                 favorable = entry
-            if fast_trend and not maker_fill_bar and not position.get('take_stage'):
+            if fast_trend and not maker_fill_bar and not position.get('take_stage') and not thesis_stop:
                 review, detail = position.get('review', (None, ''))
                 mark = Decimal(str(mark_open))
                 current = direction*(mark/entry-1)
@@ -1048,7 +1068,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                     trade_bar = data['1m'][index][0]
                     trade_extreme = Decimal(str(trade_bar[2 if direction > 0 else 3]))
                     risk_distance = entry * stop
-                    levels = (take, take + direction*risk_distance/2, take + direction*risk_distance)
+                    levels = (take, take + direction*risk_distance/2, take + direction*risk_distance*(Decimal('1.5') if thesis_stop else 1))
                     # The existing stop wins an ambiguous minute. New stops take effect on the next minute.
                     for stage in range(take_stage, len(levels)):
                         level = levels[stage]
@@ -1105,7 +1125,7 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                     runner_peak = position['runner_peak'] = tighten(position['runner_peak'], close)
                     runner_stop = runner_peak-direction*entry*stop*Decimal('.75')
                     position['trail'] = tighten(trail, runner_stop)
-                elif (not staged_take or not position['take_stage']) and not fast_trend and rules not in {'reversion', 'momentum'} and peak >= stop:
+                elif not thesis_stop and (not staged_take or not position['take_stage']) and not fast_trend and rules not in {'reversion', 'momentum'} and peak >= stop:
                     breakeven = (entry+direction*(position['entry_fee_unit']-position['funding']/amount))/(1-direction*fee)
                     candidate = (max if direction > 0 else min)(entry*(1+direction*(peak-stop)), breakeven)
                     if direction*(close-candidate) > 0 and direction*(candidate-trail) > 0:
