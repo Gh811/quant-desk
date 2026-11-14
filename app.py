@@ -964,6 +964,7 @@ def place_protection(symbol, kind, price, context=None, *, direction=1):
         if 400 <= error.code < 500 and error.code not in {408, 429}:
             journal('demo_protection_resolved', dict(clientAlgoId=client_id, rejected=error.code,
                                                      exchange_code=code, detail=detail))
+        failure.exchange_code = code
         raise failure from None
     journal('demo_protection_response', dict(intent=intent, response=response))
     try:
@@ -1053,8 +1054,52 @@ def set_initial_protection(symbol, entry, stop_loss, tick, context, *, direction
             place_protection(symbol, kind, price, context, direction=direction)
 
 
+class ReplacementStopReached(ValueError):
+    pass
+
+
+def replace_conflicting_strategy_stop(symbol, old, target, context, *, amount):
+    direction = 1 if amount > 0 else -1
+    previous = Decimal(old['triggerPrice'])
+
+    def check_position_and_mark(trigger):
+        account = demo_signed('/fapi/v3/account')
+        positions = [p for p in account['positions']
+                     if p['symbol'] == symbol and Decimal(p['positionAmt'])]
+        if (len(positions) != 1 or positions[0].get('positionSide', 'BOTH') != 'BOTH'
+                or Decimal(positions[0]['positionAmt']) != amount):
+            raise ValueError(f'{symbol} 替换止损期间仓位已变化，等待重新核对')
+        mark = Decimal(request(DEMO_VENUE, '/fapi/v1/premiumIndex', symbol=symbol)['markPrice'])
+        if not mark.is_finite() or mark <= 0:
+            raise ValueError(f'{symbol} 标记价不可用')
+        if direction * (mark - trigger) <= 0:
+            raise ReplacementStopReached(f'标记价 {mark:f} 已触及移动止损 {trigger:f}')
+
+    check_position_and_mark(target)
+    try:
+        cancel_protection(old)
+        check_position_and_mark(target)
+        place_protection(symbol, 'stop', target, context, direction=direction)
+    except (OSError, ValueError, KeyError, ArithmeticError, sqlite3.Error) as error:
+        if isinstance(error, ReplacementStopReached):
+            raise
+        try:
+            if not confirmed_strategy_stop(symbol, previous, direction=direction):
+                check_position_and_mark(target)
+                previous_intent = pending_protection().get(old['clientAlgoId'], {})
+                restored_context = previous_intent.get('context') or dict(context, moved=False)
+                place_protection(symbol, 'stop', previous, restored_context, direction=direction)
+        except ReplacementStopReached:
+            raise
+        except (OSError, ValueError, KeyError, ArithmeticError, sqlite3.Error) as restore_error:
+            raise ValueError(f'{error} · 原止损恢复未确认：{restore_error}') from restore_error
+        if confirmed_strategy_stop(symbol, target, direction=direction):
+            return
+        raise ValueError(f'{error} · 原止损仍有效或已恢复 {previous:f}') from error
+
+
 def align_strategy_protection(symbol, entry, mark, stop_loss, stop, tick, context, *, direction=1, take=None,
-                              take_multiple=2, review=''):
+                              take_multiple=2, review='', replace_amount=None):
     if min(entry, mark, tick) <= 0:
         raise ValueError('保护单价格数据无效')
     initial_take = protection_price(entry, take_multiple*stop_loss, tick, direction=direction, kind='take')
@@ -1092,7 +1137,19 @@ def align_strategy_protection(symbol, entry, mark, stop_loss, stop, tick, contex
                     record_runtime(f'{action}已发起', detail=detail, **event)
                 try:
                     protection_context = dict(context, moved=movement, review=review) if movement else context
-                    place_protection(symbol, kind, target, protection_context, direction=direction)
+                    try:
+                        place_protection(symbol, kind, target, protection_context, direction=direction)
+                    except HTTPError as conflict:
+                        if (str(getattr(conflict, 'exchange_code', None)) != '-4130'
+                                or kind != 'stop' or len(matching) != 1 or not replace_amount):
+                            raise
+                        old = matching[0]
+                        if (old.get('positionSide', 'BOTH') != 'BOTH'
+                                or direction * (target - Decimal(old['triggerPrice'])) <= 0):
+                            raise
+                        replace_conflicting_strategy_stop(symbol, old, target, protection_context,
+                                                          amount=replace_amount)
+                        matching = []
                 except (OSError, ValueError, KeyError, ArithmeticError, sqlite3.Error) as error:
                     if movement:
                         record_runtime(f'{action}未确认', detail=f'{detail} · {error}', **event)
@@ -2512,7 +2569,8 @@ class DemoStrategy:
                             actual_stop, actual_take = align_strategy_protection(symbol, entry_price, mark, stop_loss, stop, tick,
                                                       dict(opening_id=opening_id, opened=int(opened*1000),
                                                            leverage=leverage, strategy=mode), direction=direction,
-                                                      take=take, take_multiple=target_return / stop_loss, review=review_note)
+                                                      take=take, take_multiple=target_return / stop_loss, review=review_note,
+                                                      replace_amount=amount if symbol not in pending_entries else None)
                             if fast_trend:
                                 fast_takes[symbol] = actual_take
                                 stop = actual_stop
@@ -2527,6 +2585,8 @@ class DemoStrategy:
                             if fast_trend and not review_note and symbol in review_retry:
                                 label = '持仓监控中 · 趋势行情待重试'
                             self.checks = {**self.checks, symbol[:-4]: label}
+                        except ReplacementStopReached as error:
+                            dynamic_exit = ('达到移动止损线', str(error))
                         except (OSError, ValueError, KeyError, ArithmeticError, sqlite3.Error) as error:
                             detail = str(error)
                             if protection_errors.get(symbol) != detail:
