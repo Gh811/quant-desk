@@ -1884,22 +1884,21 @@ main{max-width:1120px;margin:auto;padding:32px 20px 56px}a{color:#88c9ff}header{
 button,.link{font:inherit;color:inherit;background:#172233;border:1px solid #385471;border-radius:8px;padding:8px 13px;cursor:pointer;text-decoration:none}
 button[aria-pressed=true],button:hover,.link:hover{background:#234264;border-color:#91d3ff}button:focus-visible,a:focus-visible{outline:2px solid #fff;outline-offset:4px}
 .board{border:1px solid #314359;border-radius:14px;padding:28px;background:radial-gradient(circle,#28374a 1px,transparent 1px) 0 0/22px 22px,#131c29}
-.flow{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));list-style:none;padding:0;margin:0;gap:22px 36px}
-.flow li{position:relative;min-width:0}.flow button{width:100%;min-height:64px;border-color:var(--signal);box-shadow:0 0 12px color-mix(in srgb,var(--signal) 26%,transparent);text-align:left;font-weight:650}
-.flow li:nth-child(5){grid-row:2;grid-column:4}.flow li:nth-child(6){grid-row:2;grid-column:3}.flow li:nth-child(7){grid-row:2;grid-column:2}
-.edge{position:absolute;top:50%;left:100%;width:36px;height:2px;background:var(--signal);pointer-events:none}.edge::after{content:"";position:absolute;top:-3px;left:0;width:8px;height:8px;border-radius:100%;background:var(--signal);box-shadow:0 0 12px var(--signal);animation:travel 1.45s linear infinite}
-.flow li:nth-child(4) .edge{top:100%;left:50%;width:2px;height:22px}.flow li:nth-child(4) .edge::after{left:-3px;top:0;animation:down 1.45s linear infinite}
-.flow li:nth-child(5) .edge,.flow li:nth-child(6) .edge{left:auto;right:100%}.flow li:nth-child(5) .edge::after,.flow li:nth-child(6) .edge::after{animation-direction:reverse}
-@keyframes travel{from{transform:translateX(0)}to{transform:translateX(28px)}}@keyframes down{from{transform:translateY(0)}to{transform:translateY(14px)}}
-#snapshot p{margin-top:10px}
-@media(prefers-reduced-motion:reduce){.edge::after{animation:none}}
-@media(max-width:680px){.flow{grid-template-columns:1fr;gap:18px}.flow li:nth-child(n){grid-column:auto;grid-row:auto}.flow li:nth-child(n) .edge{top:100%;right:auto;left:50%;width:2px;height:18px}.flow li:nth-child(n) .edge::after{top:0;left:-3px;animation-name:down}}
+.module-row{display:flex;list-style:none;margin:0;padding:0;gap:36px}
+.module-row+.module-row{margin-top:36px}.module-row.reverse{flex-direction:row-reverse;justify-content:flex-start}
+.module-row li{position:relative;flex:1;min-width:0}.module-row button{width:100%;min-height:72px;border-color:var(--signal);box-shadow:0 0 12px color-mix(in srgb,var(--signal) 26%,transparent);text-align:left;font-weight:650}
+.edge{position:absolute;top:50%;left:100%;width:36px;height:2px;background:var(--signal);pointer-events:none}.edge::after{content:"";position:absolute;top:-3px;left:0;width:8px;height:8px;border-radius:50%;background:var(--signal);box-shadow:0 0 12px var(--signal);animation:travel 1.45s linear infinite}
+.reverse .edge{left:auto;right:100%}.reverse .edge::after{animation-direction:reverse}
+.module-row li:last-child .edge{top:100%;left:50%;right:auto;width:2px;height:36px}.module-row li:last-child .edge::after{left:-3px;top:0;animation:down 1.45s linear infinite}
+@keyframes travel{to{transform:translateX(28px)}}@keyframes down{to{transform:translateY(28px)}}
+@media(max-width:680px){.module-spacer{display:none}.module-row,.module-row.reverse{flex-direction:column;gap:36px}.module-row li .edge{top:100%;left:50%;right:auto;width:2px;height:36px}.module-row li .edge::after{left:-3px;top:0;animation:down 1.45s linear infinite}}
+@media(prefers-reduced-motion:reduce){.edge::after{animation:none!important}}
 .note,small{color:#b1c4da}.detail,.research{padding:18px 0;border-bottom:1px solid #314359}.scroller{overflow:auto}table{width:100%;border-collapse:collapse;text-align:left}th,td{padding:6px 10px;border-bottom:1px solid #314359;white-space:nowrap}
 </style>
 <main>
 <header><div><a href="./">← 交易面板</a><h1>策略库</h1></div><a class="link" id="backtest" href="./backtest">打开历史回测 ↗</a></header>
 <nav aria-label="选择策略" id="modes"></nav>
-<section class="board" aria-label="策略信号流程"><ol class="flow" id="flow"></ol></section>
+<section class="board" aria-label="策略信号流程"><div id="flow"></div></section>
 <section class="detail" aria-live="polite"><h2 id="stage"></h2><p id="explanation"></p></section>
 <section class="research">
 <h2>理论与回测方法</h2>
@@ -1924,7 +1923,28 @@ const strategies = {
   swing: ['1 小时双向','1h / 4h / 1d','1 小时寻找突破与回踩，4 小时确认方向，日线反向时拒绝。','按账户权益、保证金和止损风险计算名义仓位。','跟踪止损并检查最长 48 小时的持仓时间。'],
   us_open: ['美股双向测试','15m / 1h / 4h','仅美股合约。使用 15 分钟信号、1 小时确认和 4 小时趋势过滤。','按止损距离与手续费估计控制单笔风险。','跟踪止损并检查最长 90 分钟的持仓时间。']
 };
-const titles = ['行情数据','数据处理','入场信号','策略分支','仓位管理','风险控制','交易引擎'];
+const layouts = {
+  fast: [
+    [['多周期收盘行情',0],['5m 突破 / 回踩',2],['高波动回踩过滤','波动突增时，只接受确认的回踩或反抽。'],['15m / 1h 方向确认','15 分钟须同向，1 小时不能反向，美股须同向。']],
+    [['5× 风险仓位',4],['结构止损 / 止盈',5],['持仓趋势复评','持续以 5 分钟收盘复评入场结构；趋势走弱时收紧保护线。'],['保护单确认','币安模拟盘核对保护单和成交状态。']]
+  ],
+  continuation: [
+    [['同一批 5m / 15m / 1h 数据',0],['回踩与突破延续分支',2],['原版方向与成本校验','沿用 5 分钟基线的方向过滤、成交验证及成本门槛。']],
+    [['分钟级成交回放',4],['基线退出规则',5],['与原版对照','在同一标的、区间和费率下比较成交次数、净收益、胜率与回撤。']]
+  ],
+  intraday: [
+    [['15m 突破 / 回踩',2],['1h 同向确认','1 小时趋势须确认开仓方向。'],['4h 反向过滤','4 小时趋势与信号相反时跳过。']],
+    [['手续费 / 点差与仓位',4],['跟踪止损',5],['4 小时持仓上限','达到最长持仓时触发退出。']]
+  ],
+  swing: [
+    [['1h 突破 / 回踩',2],['4h 趋势确认','4 小时趋势须确认开仓方向。'],['日线方向过滤','日线反向时跳过。']],
+    [['波段风险仓位',4],['跟踪止损与 48 小时退出',5]]
+  ],
+  us_open: [
+    [['美股合约筛选','只允许通过美股合约筛选的标的进入扫描。'],['15m 信号',2],['1h / 4h 方向检查','1 小时确认方向，4 小时反向时跳过。']],
+    [['美股风险仓位',4],['跟踪止损',5],['90 分钟持仓上限','达到最长持仓时触发退出。']]
+  ]
+};
 const colors = ['#538fff','#3ebcde','#4dc9ba','#f89751','#f0bd58','#f7839f','#9f9aff'];
 const params = new URLSearchParams(location.search);
 let active = Object.hasOwn(strategies,params.get('mode')) ? params.get('mode') : 'fast';
@@ -1952,20 +1972,41 @@ function render() {
     render();
     byId('modes').querySelector('[aria-pressed=true]').focus();
   })));
+  const modules = layouts[active].flat();
   function show(index) {
     selected = index;
-    byId('stage').textContent = titles[index];
-    byId('explanation').textContent = details[index];
-    [...byId('flow').querySelectorAll('button')].forEach((el,i) => el.setAttribute('aria-pressed', i === index));
+    const [title, description] = modules[index];
+    byId('stage').textContent = title;
+    byId('explanation').textContent = typeof description === 'number' ? details[description] : description;
+    [...byId('flow').querySelectorAll('button')].forEach(el => el.setAttribute('aria-pressed', Number(el.dataset.module) === index));
   }
-  byId('flow').replaceChildren(...titles.map((title,i) => {
-    const li = document.createElement('li');
-    li.style.setProperty('--signal',colors[i]);
-    li.append(button(title,i === selected,() => show(i)));
-    if (i < titles.length-1) {
-      const edge = document.createElement('span'); edge.className='edge'; edge.setAttribute('aria-hidden','true'); li.append(edge);
+  let index = 0;
+  byId('flow').replaceChildren(...layouts[active].map((row, rowIndex) => {
+    const lane = document.createElement('ol');
+    lane.className = 'module-row';
+    if (rowIndex % 2) lane.classList.add('reverse');
+    for (let n = row.length; n < layouts[active][0].length; n++) {
+      const spacer = document.createElement('li');
+      spacer.className = 'module-spacer';
+      spacer.setAttribute('aria-hidden','true');
+      lane.append(spacer);
     }
-    return li;
+    for (const [title] of row) {
+      const stage = index++;
+      const li = document.createElement('li');
+      li.style.setProperty('--signal',colors[stage % colors.length]);
+      const node = button(title, stage === selected, () => show(stage));
+      node.dataset.module = stage;
+      li.append(node);
+      if (stage < modules.length - 1) {
+        const edge = document.createElement('span');
+        edge.className = 'edge';
+        edge.setAttribute('aria-hidden','true');
+        li.append(edge);
+      }
+      lane.insertBefore(li, lane.querySelector('.module-spacer'));
+    }
+    return lane;
   }));
   show(selected);
 }
