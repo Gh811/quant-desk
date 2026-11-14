@@ -106,7 +106,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 <small id="desk-version" class="desk-version" hidden>GitHub <a target="_blank" rel="noopener"></a></small></div>
 <p id="strategy-status" role="status">正在读取后台策略状态…</p>
 <label for="strategy-mode">策略</label>
-<select id="strategy-mode" disabled><option value="swing">1 小时双向</option><option value="intraday">15 分钟双向</option><option value="fast">5 分钟双向</option><option value="scalp">1 分钟双向 · 高频测试</option><option value="us_open">美股双向测试</option></select>
+<select id="strategy-mode" disabled><option value="swing">1 小时双向</option><option value="intraday">15 分钟双向</option><option value="fast">5 分钟双向</option><option value="us_open">美股双向测试</option></select>
 <div class="desk-sizing">
   <label for="strategy-sizing">单笔仓位</label>
   <select id="strategy-sizing" disabled><option value="capital">按账户本金计算</option><option value="fixed">固定 USDT 名义仓位</option></select>
@@ -432,7 +432,8 @@ const strategyNotional = el('strategy-notional');
 strategySizing.value = preferences?.sizing === 'fixed' ? 'fixed' : 'capital';
 strategyNotional.value = preferences?.notional ?? '';
 const strategyNames = Object.fromEntries([...strategyMode.options].map(option => [option.value, option.textContent]));
-if (Object.hasOwn(strategyNames, preferences?.strategy)) strategyMode.value = preferences.strategy;
+if (preferences?.strategy === 'scalp') strategyMode.value = 'fast';
+else if (Object.hasOwn(strategyNames, preferences?.strategy)) strategyMode.value = preferences.strategy;
 function savePreferences() {
   writeSaved('config', {assets:[...selectedAssets],
     poolWatch:[...poolWatch], removedAssets:[...removedAssets], strategy:strategyMode.value,
@@ -1077,7 +1078,7 @@ async function refreshStrategyStatus() {
         ? '最近一轮 ' + date(state.checked_at) + ' · 耗时 ' + (state.scan_ms/1000).toFixed(1) + ' 秒'
         : '';
     if (state.running || state.switch_blocked) {
-      strategyMode.value = state.mode;
+      if (Object.hasOwn(strategyNames, state.mode)) strategyMode.value = state.mode;
       strategySizing.value = state.fixed_notional == null ? 'capital' : 'fixed';
       if (state.fixed_notional != null) strategyNotional.value = state.fixed_notional;
     }
