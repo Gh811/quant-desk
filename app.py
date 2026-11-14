@@ -562,12 +562,15 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                     reason, price = f'入场条件失效 · {detail}', Decimal(str(trade_open))
                 elif review == 'weak' and current <= stop_return:
                     reason, price = f'行情走弱触及收紧保护线 · {detail}', Decimal(str(trade_open))
-                if stop_return is not None and reason is None:
-                    candidate = entry*(1+direction*stop_return)
+                early_breakeven = position['peak'] >= stop and current > 0
+                if (stop_return is not None or early_breakeven) and reason is None:
+                    candidate = entry*(1+direction*stop_return) if stop_return is not None else None
                     breakeven = (entry*(1+direction*entry_fee)-direction*position['funding']/amount)/(1-direction*fee)
+                    breakeven /= 1-direction*slippage
                     if direction*(mark-breakeven) > 0:
-                        candidate = (max if direction > 0 else min)(candidate, breakeven)
-                    if direction*(mark-candidate) > 0:
+                        candidate = (breakeven if candidate is None else
+                                     (max if direction > 0 else min)(candidate, breakeven))
+                    if candidate is not None and direction*(mark-candidate) > 0:
                         trail = position['trail'] = (max if direction > 0 else min)(trail, candidate)
                 review_window = stamp // interval
                 if take_return is not None and reason is None and position.get('take_reviewed') != review_window:
@@ -1056,7 +1059,8 @@ def align_strategy_protection(symbol, entry, mark, stop_loss, stop, tick, contex
                     event = dict(mode=context['strategy'], scope='protection', symbol=symbol)
                     record_runtime(f'{action}已发起', detail=detail, **event)
                 try:
-                    place_protection(symbol, kind, target, context, direction=direction)
+                    protection_context = dict(context, moved=movement, review=review) if movement else context
+                    place_protection(symbol, kind, target, protection_context, direction=direction)
                 except (OSError, ValueError, KeyError, ArithmeticError, sqlite3.Error) as error:
                     if movement:
                         record_runtime(f'{action}未确认', detail=f'{detail} · {error}', **event)
@@ -1158,10 +1162,15 @@ def reconcile_protection_fill(event):
         if order.get('status') != 'FILLED':
             return
         context = event.get('context') or {}
+        action = '止损' if event['kind'] == 'stop' else '止盈'
+        if context.get('moved'):
+            action = '移动' + action
+        detail = '触发价 ' + event['price']
+        if context.get('review'):
+            detail += ' · ' + context['review']
         intent = dict(context, clientOrderId=client_id, symbol=symbol, side=order.get('side') or event.get('side', 'SELL'),
                       quantity=order['executedQty'], reduce_only=True,
-                      decision=dict(reason='交易所止损触发' if event['kind'] == 'stop' else '交易所止盈触发',
-                                    detail='触发价 ' + event['price']))
+                      decision=dict(reason=f'交易所{action}触发', detail=detail))
         order.setdefault('side', intent['side'])
         journal('demo_order_response', dict(intent=intent, response=order))
         if context.get('opening_id') is not None:
@@ -2421,8 +2430,10 @@ class DemoStrategy:
                                 closer = protection_price(entry_price, proposed_take, tick, direction=direction, kind='take')
                                 if direction*(closer-mark) >= 2*tick:
                                     take = (min if direction > 0 else max)(take, closer) if take is not None else closer
-                    if proposed_stop is not None and not (timed_out or fixed_exit or dynamic_exit):
-                        candidate = protection_price(entry_price, proposed_stop, tick, direction=direction, kind='stop')
+                    early_breakeven = fast_trend and peak >= stop_loss and price_return > 0
+                    if (proposed_stop is not None or early_breakeven) and not (timed_out or fixed_exit or dynamic_exit):
+                        candidate = (protection_price(entry_price, proposed_stop, tick, direction=direction, kind='stop')
+                                     if proposed_stop is not None else None)
                         try:
                             breakeven = None
                             if not fast_trend or price_return > 0:
@@ -2431,9 +2442,13 @@ class DemoStrategy:
                         except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
                             breakeven = None
                         if breakeven is not None and (not fast_trend or direction*(mark-breakeven) >= 2*tick):
-                            candidate = (max if direction > 0 else min)(candidate, breakeven)
-                        if (fast_trend or breakeven is not None) and direction*(mark-candidate) >= 2*tick and direction*(candidate-stop) > 0:
+                            candidate = (breakeven if candidate is None else
+                                         (max if direction > 0 else min)(candidate, breakeven))
+                        if (candidate is not None and (fast_trend or breakeven is not None)
+                                and direction*(mark-candidate) >= 2*tick and direction*(candidate-stop) > 0):
                             stop = candidate
+                            if early_breakeven and candidate == breakeven and not review_note:
+                                review_note = f'最大浮盈 {peak/stop_loss:.2f}R · 按已核对费用移至净保本价'
                     trailing = stop != minimum_stop and direction*(mark-stop) <= 0
                     dynamic_take_hit = fast_trend and take is not None and direction*(take-mark) <= 0
                     missing_stop = False
@@ -2504,7 +2519,9 @@ class DemoStrategy:
                         else:
                             reason, threshold = '无法确认有效止损，保护性退出', protection_errors.get(symbol, '')
                         age = f' · 持仓 {elapsed // 60} 分钟' if elapsed is not None else ''
-                        decision = dict(reason=reason, detail=f'判断时浮动收益率 {price_return:.3%}{age} · {threshold}')
+                        decision = dict(reason=reason, detail=f'判断时浮动收益率 {price_return:.3%}{age} · {threshold}'
+                                        f' · 最大浮盈 {max(Decimal(0), peak):.3%}'
+                                        f' · 初始止损 {minimum_stop:f} · 最终止损 {stop:f}')
                         self.checks = {**self.checks, symbol[:-4]: f'正在提交平仓 · {reason}'}
                         try:
                             order = close_strategy_position(symbol, amount, opened, leverage, opening_id, mode, decision)
@@ -3331,6 +3348,13 @@ class Handler(BaseHTTPRequestHandler):
                                                                     checked_at=self.server.strategy.checked_at,
                                                                     scan_ms=self.server.strategy.scan_ms)).encode())
                 return
+            if parsed.path == '/strategy/decisions':
+                params = parse_qs(parsed.query)
+                page = int(params.get('page', ['1'])[0])
+                query = asset_search_term(params.get('q', [''])[0])
+                view = params.get('view', ['important'])[0]
+                self.send(200, 'application/json', json.dumps(decision_history(page, query, view)).encode())
+                return
             if parsed.path == '/strategy/protection-decisions':
                 self.send(200, 'application/json', json.dumps(protection_decisions()).encode())
                 return
@@ -3347,8 +3371,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.send(200, 'application/json', json.dumps(recent_orders()).encode())
                 return
             if parsed.path == '/account/demo-history':
-                page = int(parse_qs(parsed.query).get('page', ['1'])[0])
-                self.send(200, 'application/json', json.dumps(demo_history(page)).encode())
+                params = parse_qs(parsed.query)
+                page = int(params.get('page', ['1'])[0])
+                query = asset_search_term(params.get('q', [''])[0])
+                self.send(200, 'application/json', json.dumps(demo_history(page, query)).encode())
                 return
             if parsed.path != '/scan':
                 self.send(404,'text/plain',b'Not found')
@@ -3483,25 +3509,43 @@ def runtime_logs():
         return [json.loads(payload) for (payload,) in rows]
 
 
-def protection_decisions():
+def asset_search_term(value):
+    term = ''.join(value.upper().split())[:40]
+    if term in {'SK', '海力士', 'SK海力士'}:
+        return 'SKHYNIX'
+    return term
+
+
+def protection_decisions(limit=200, *, query='', confirmed=False):
     path = journal_path()
     if not path.exists():
         return []
     with closing(sqlite3.connect(path)) as database:
         rows = database.execute(
-            "SELECT payload FROM events WHERE kind = 'demo_runtime' "
-            "AND json_extract(payload, '$.scope') = 'protection' ORDER BY id DESC LIMIT 200"
+            """
+            SELECT payload FROM events
+            WHERE kind = 'demo_runtime' AND json_extract(payload, '$.scope') = 'protection'
+              AND (? = '' OR instr(upper(json_extract(payload, '$.symbol')), ?) > 0)
+              AND (NOT ? OR json_extract(payload, '$.message') LIKE '%已确认')
+            ORDER BY id DESC LIMIT ?
+            """, (query, query, confirmed, -1 if limit is None else limit)
         )
         return [json.loads(payload) for (payload,) in rows]
 
 
-def recent_orders(limit=50):
+def recent_orders(limit=50, *, query=''):
     path = journal_path()
     if not path.exists():
         return []
     with closing(sqlite3.connect(path)) as database:
         rows = database.execute(
-            "SELECT created_at, kind, payload FROM events WHERE kind LIKE 'demo_order_%' ORDER BY id DESC"
+            """
+            SELECT created_at, kind, payload FROM events
+            WHERE kind LIKE 'demo_order_%'
+              AND (? = '' OR instr(upper(coalesce(json_extract(payload, '$.intent.symbol'),
+                                                 json_extract(payload, '$.symbol'))), ?) > 0)
+            ORDER BY id DESC
+            """, (query, query)
         )
         orders = {}
         seen = set()
@@ -3547,15 +3591,36 @@ def recent_orders(limit=50):
         return list(orders.values())[:limit]
 
 
-def demo_history(page):
+def journal_page(rows, page):
     page_size = 9
-    orders = [order for order in recent_orders(limit=None)
-              if order.get('reduce_only') and order['status'] == 'FILLED']
-    orders.sort(key=lambda order: int(order['closed'] or order['time']), reverse=True)
-    pages = max(1, (len(orders) + page_size - 1) // page_size)
+    pages = max(1, (len(rows) + page_size - 1) // page_size)
     page = max(1, min(page, pages))
     start = (page - 1) * page_size
-    return dict(page=page, pages=pages, orders=orders[start:start + page_size])
+    return page, pages, rows[start:start + page_size]
+
+
+def demo_history(page, query=''):
+    orders = [order for order in recent_orders(limit=None, query=query)
+              if order.get('reduce_only') and order['status'] == 'FILLED']
+    orders.sort(key=lambda order: int(order['closed'] or order['time']), reverse=True)
+    page, pages, orders = journal_page(orders, page)
+    return dict(page=page, pages=pages, orders=orders)
+
+
+def decision_history(page, query, view):
+    orders = recent_orders(limit=None, query=query)
+    if view == 'closed':
+        orders = [order for order in orders if order.get('reduce_only') and has_order_fill(order)]
+        protections = []
+    else:
+        if view != 'all':
+            orders = [order for order in orders if has_order_fill(order)]
+        protections = protection_decisions(limit=None, query=query, confirmed=view != 'all')
+    records = [dict(order=order, at=int(order['closed'] or order['opened'] or order['time'])) for order in orders]
+    records.extend(dict(event=event, at=int(event['at'])) for event in protections)
+    records.sort(key=lambda record: record['at'], reverse=True)
+    page, pages, records = journal_page(records, page)
+    return dict(page=page, pages=pages, records=records)
 
 
 def order_outcome(intent, response, payload=None):

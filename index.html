@@ -159,12 +159,16 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
   <nav id="positions-pages" class="pagination" aria-label="当前持仓分页" hidden></nav>
 </div>
 <div id="history-panel" hidden>
+  <label>检索平仓标的 <input id="trade-history-search" type="search" placeholder="例如 SK、海力士或 BTC"></label>
   <small>平仓净收益已扣开平仓手续费，并计入资金费。</small>
   <p id="order-status" role="status">正在读取交易历史…</p>
   <div id="demo-orders" class="order-grid"></div>
   <nav id="history-pages" class="pagination" aria-label="交易历史分页" hidden></nav>
 </div>
 <div id="decisions-panel" class="decision-list" hidden>
+  <label>检索决策标的 <input id="decision-search" type="search" placeholder="例如 SK、海力士或 BTC"></label>
+  <label>记录类型 <select id="decision-view"><option value="important">成交与已确认保护</option><option value="closed">仅平仓</option><option value="all">全部（含尝试及撤单）</option></select></label>
+  <p id="decision-status" role="status"></p>
   <div id="decision-events"></div>
   <nav id="decisions-pages" class="pagination" aria-label="决策日志分页" hidden></nav>
 </div>
@@ -599,7 +603,11 @@ function orderCard(order, position, snapshot) {
   const details = document.createElement('details');
   details.append(orderElement('summary', '', '客户端订单号'), orderElement('code', '', order.clientOrderId || '—'));
   if (position) card.append(holdingMetrics(position, order.leverage), protectionPanel(position, snapshot));
-  else card.append(metrics, times);
+  else {
+    card.append(metrics, times);
+    if (order.decision?.reason) card.append(orderElement('p', 'order-strategy',
+      ['平仓原因 ' + order.decision.reason, order.decision.detail].filter(Boolean).join(' · ')));
+  }
   card.append(details);
   return card;
 }
@@ -737,7 +745,8 @@ let renderedHistory;
 async function loadHistory(page) {
   if (page == null && historyRequest) return;
   const requestedPage = page ?? el('history-pages').dataset.page ?? 1;
-  const request = fetch('./account/demo-history?page=' + requestedPage, {signal:AbortSignal.timeout(6000)});
+  const params = new URLSearchParams({page:requestedPage, q:el('trade-history-search').value.trim()});
+  const request = fetch('./account/demo-history?' + params, {cache:'no-store', signal:AbortSignal.timeout(6000)});
   historyRequest = request;
   const status = el('order-status');
   try {
@@ -758,41 +767,53 @@ async function loadHistory(page) {
       grid.replaceChildren(...cards);
       renderedHistory = signature;
     }
-    status.textContent = history.orders.length ? '' : '暂无本程序记录的已平仓交易';
+    status.textContent = history.orders.length ? '' : '没有匹配的平仓记录';
   } catch (error) {
     if (historyRequest === request) status.textContent = '读取交易历史失败：' + error.message;
   } finally {
     if (historyRequest === request) historyRequest = null;
   }
 }
-let protectionDecisions = [];
-let protectionDecisionsPending = false;
-async function loadProtectionDecisions() {
-  if (protectionDecisionsPending) return;
-  protectionDecisionsPending = true;
+let decisionsRequest;
+let renderedDecisions;
+async function loadDecisions(page) {
+  if (page == null && decisionsRequest) return;
+  const params = new URLSearchParams({page:page ?? el('decisions-pages').dataset.page ?? 1,
+    q:el('decision-search').value.trim(), view:el('decision-view').value});
+  const request = fetch('./strategy/decisions?' + params, {cache:'no-store', signal:AbortSignal.timeout(6000)});
+  decisionsRequest = request;
+  const status = el('decision-status');
   try {
-    const response = await fetch('./strategy/protection-decisions', {cache:'no-store', signal:AbortSignal.timeout(6000)});
-    if (!response.ok) throw Error('HTTP ' + response.status);
-    const events = await response.json();
-    if (JSON.stringify(events) !== JSON.stringify(protectionDecisions)) {
-      protectionDecisions = events;
-      renderDecisions();
+    const response = await request;
+    const data = await response.json();
+    if (decisionsRequest !== request) return;
+    if (!response.ok) throw Error(data.error || 'HTTP ' + response.status);
+    renderPagination('decisions-pages', data.page, data.pages, loadDecisions);
+    const signature = JSON.stringify(data.records);
+    if (signature !== renderedDecisions) {
+      renderDecisions(data.records);
+      renderedDecisions = signature;
     }
+    status.textContent = '';
   } catch (error) {
-    console.error('读取保护单决策失败：', error);
+    if (decisionsRequest === request) status.textContent = '读取决策日志失败：' + error.message;
   } finally {
-    protectionDecisionsPending = false;
+    if (decisionsRequest === request) decisionsRequest = null;
   }
 }
-function renderDecisions() {
-  const records = [
-    ...latestOrders.map(order => ({order, at:Number(order.time || order.closed || order.opened || 0)})),
-    ...protectionDecisions.map(event => ({event, at:Number(event.at)}))
-  ].sort((a, b) => b.at - a.at);
-  const items = pageItems(records, 'decisions-pages', renderDecisions).map(({order, event}) => {
+for (const [id, load] of [['trade-history-search', loadHistory], ['decision-search', loadDecisions]]) {
+  let timer;
+  el(id).addEventListener('input', () => {
+    clearTimeout(timer);
+    timer = setTimeout(() => load(1), 250);
+  });
+}
+el('decision-view').addEventListener('change', () => loadDecisions(1));
+function renderDecisions(records) {
+  const items = records.map(({order, event}) => {
     if (event) {
       const item = orderElement('article', 'decision-item');
-      item.append(orderElement('strong', '', event.symbol + ' · ' + event.message),
+      item.append(orderElement('strong', '', [event.symbol, event.message].filter(Boolean).join(' · ')),
         orderElement('p', '', event.detail),
         orderElement('small', '', [strategyNames[event.mode], date(event.at)].filter(Boolean).join(' · ')));
       return item;
@@ -816,7 +837,7 @@ function renderDecisions() {
     }
     return item;
   });
-  el('decision-events').replaceChildren(...(items.length ? items : [orderElement('p', '', '暂无决策记录')]));
+  el('decision-events').replaceChildren(...(items.length ? items : [orderElement('p', '', '没有匹配的决策记录')]));
 }
 const runtimeTimeFormat = new Intl.DateTimeFormat('zh-CN', {
   year:'numeric', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit',
@@ -868,7 +889,6 @@ async function loadOrders() {
     if (!response.ok) throw Error(orders.error);
     latestOrders = orders;
     renderOrderCards();
-    if (!el('decisions-panel').hidden) renderDecisions();
     const returns = await fetch('./account/demo-realized-return');
     if (returns.ok) {
       realizedReturnSnapshot = await returns.json();
@@ -1473,20 +1493,17 @@ for (const tab of positionTabs) {
       item.setAttribute('aria-pressed', String(item === tab));
       el(item.getAttribute('aria-controls')).hidden = item !== tab;
     }
-    if (tab.getAttribute('aria-controls') === 'decisions-panel') {
-      renderDecisions();
-      loadProtectionDecisions();
-    }
+    if (tab.getAttribute('aria-controls') === 'decisions-panel') loadDecisions();
     if (tab.getAttribute('aria-controls') === 'runtime-panel') loadRuntimeLogs();
     if (tab.getAttribute('aria-controls') === 'history-panel') loadHistory();
   };
 }
 setInterval(() => {
   if (!el('runtime-panel').hidden) loadRuntimeLogs();
-  if (!el('decisions-panel').hidden) loadProtectionDecisions();
 }, 2500);
 setInterval(() => {
   if (!el('history-panel').hidden) loadHistory();
+  if (!el('decisions-panel').hidden) loadDecisions();
 }, 10000);
 const statsToggle = el('stats-toggle');
 const statsPanel = el('stats-panel');
