@@ -106,7 +106,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 <small id="desk-version" class="desk-version" hidden>GitHub <a target="_blank" rel="noopener"></a></small></div>
 <p id="strategy-status" role="status">正在读取后台策略状态…</p>
 <label for="strategy-mode">策略 · <a id="strategy-details" href="./strategies">查看详情</a></label>
-<select id="strategy-mode" disabled><option value="swing">1 小时双向</option><option value="intraday">15 分钟双向</option><option value="fast">5 分钟双向</option><option value="us_open">美股双向测试</option></select>
+<select id="strategy-mode" disabled><option value="swing">1 小时双向</option><option value="intraday">15 分钟双向</option><option value="fast">5 分钟双向</option><option value="us_open">美股双向测试</option><option value="mu_relative_strength">MU · 15 分钟相对强弱回撤</option></select>
 <div class="desk-sizing">
   <label for="strategy-sizing">单笔仓位</label>
   <select id="strategy-sizing" disabled><option value="capital">按账户本金计算</option><option value="fixed">固定 USDT 名义仓位</option></select>
@@ -446,6 +446,7 @@ function syncAssetCheckboxes(active = selectionFor(strategyMode.value)) {
   el('strategy-asset-note').hidden = strategyMode.value !== 'swing';
   const visible = new Set([...defaultAssets, ...poolWatch].filter(asset => !removedAssets.has(asset)));
   for (const asset of active) visible.add(asset);
+  if (strategyMode.value === 'mu_relative_strength') visible.add('MU');
   for (const input of config.querySelectorAll('[name=asset]')) {
     if (!visible.delete(input.value)) input.closest('.asset-choice').remove();
     else input.checked = active.has(input.value);
@@ -978,7 +979,8 @@ function renderStrategyControls() {
   strategyNotional.disabled = locked || strategySizing.value !== 'fixed';
   start.disabled = locked || !marketCatalog || ![...config.querySelectorAll('[name=asset]:checked')]
     .some(input=>marketByAsset.get(input.value)?.demo_tradeable &&
-      (strategyMode.value !== 'us_open' || marketByAsset.get(input.value)?.equity === 'us'));
+      (strategyMode.value !== 'us_open' || marketByAsset.get(input.value)?.equity === 'us') &&
+      (strategyMode.value !== 'mu_relative_strength' || input.value === 'MU'));
   start.dataset.running = String(running && !stopping);
   if (stopping) start.textContent = '正在停止策略…';
   else if (running) start.textContent = '✓ 策略运行中';
@@ -993,7 +995,7 @@ function renderStrategyControls() {
   entries.textContent = strategyState?.entries_paused ? '恢复开新仓' : '停止开新仓';
   for (const checkbox of config.querySelectorAll('[name=asset]')) {
     const market = marketByAsset.get(checkbox.value);
-    checkbox.disabled = assetEditingLocked() || (checkbox.checked && assetBusy(checkbox.value)) || !market?.demo_tradeable || (strategyMode.value === 'us_open' && market.equity !== 'us');
+    checkbox.disabled = assetEditingLocked() || (checkbox.checked && assetBusy(checkbox.value)) || !market?.demo_tradeable || (strategyMode.value === 'us_open' && market.equity !== 'us') || (strategyMode.value === 'mu_relative_strength' && checkbox.value !== 'MU');
     checkbox.parentElement.dataset.unavailable = String(!market?.demo_tradeable);
     checkbox.parentElement.title = market?.demo_tradeable ? '' : '模拟盘未确认可交易';
   }
@@ -2302,8 +2304,10 @@ function render() {
   const [name, frames, entry, size, risk] = strategies[active];
   const mode = ['continuation','reversion','momentum'].includes(active) ? 'fast' : active;
   const researchOnly = ['reversion','momentum'].includes(active) || Object.hasOwn(studyStrategies,active);
-  byId('backtest').hidden = researchOnly;
-  byId('backtest').href = './backtest?' + new URLSearchParams({mode,days:'all'});
+  if (active === 'mu_relative_strength') byId('backtest').textContent = '查看 MU 回测结果';
+  else byId('backtest').textContent = '历史回测';
+  byId('backtest').hidden = researchOnly && active !== 'mu_relative_strength';
+  byId('backtest').href = active === 'mu_relative_strength' ? '#mu-relative-strength-results' : './backtest?' + new URLSearchParams({mode,days:'all'});
   const details = [
     '币安合约成交 K 线、标记价格与历史资金费。信号周期 ' + frames + '。',
     '只读取已经收盘的 K 线。回测检查所需周期的预热和连续覆盖，缺口会报告为失败。',
