@@ -106,7 +106,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 <small id="desk-version" class="desk-version" hidden>GitHub <a target="_blank" rel="noopener"></a></small></div>
 <p id="strategy-status" role="status">正在读取后台策略状态…</p>
 <label for="strategy-mode">策略 · <a id="strategy-details" href="./strategies">查看详情</a></label>
-<select id="strategy-mode" disabled><option value="swing">1 小时双向</option><option value="intraday">15 分钟双向</option><option value="fast">5 分钟双向</option><option value="us_open">美股双向测试</option><option value="mu_relative_strength">MU · 15 分钟相对强弱回撤</option></select>
+<select id="strategy-mode" disabled><option value="swing">1 小时双向</option><option value="intraday">15 分钟双向</option><option value="fast">5 分钟双向</option><option value="us_open">美股双向测试</option><option value="mu_relative_strength">领航回撤 · 15 分钟</option></select>
 <div class="desk-sizing">
   <label for="strategy-sizing">单笔仓位</label>
   <select id="strategy-sizing" disabled><option value="capital">按账户本金计算</option><option value="fixed">固定 USDT 名义仓位</option></select>
@@ -387,6 +387,7 @@ demoSync.onclick = async () => {
   }
 };
 const name = asset => ({XAU:'黄金', SKHYNIX:'SK 海力士', SAMSUNG:'三星电子', GOOGL:'Google（GOOGL）', INTC:'英特尔（INTC）'})[asset] || asset;
+const leadershipAssets = new Set('AMZN GOOGL KORU META MU NVDA SAMSUNG SKHYNIX SOXL SPCX TSLA'.split(' '));
 const defaultAssets = 'ETH BTC XAU SNDK SOXL KORU MU NVDA SOL SKHYNIX SAMSUNG QQQ GOOGL SPCX META TSLA AMZN BNB ZEC INTC'.split(' ');
 function addAssetCheckbox(asset, checked) {
   const choice = document.createElement('div');
@@ -446,7 +447,10 @@ function syncAssetCheckboxes(active = selectionFor(strategyMode.value)) {
   el('strategy-asset-note').hidden = strategyMode.value !== 'swing';
   const visible = new Set([...defaultAssets, ...poolWatch].filter(asset => !removedAssets.has(asset)));
   for (const asset of active) visible.add(asset);
-  if (strategyMode.value === 'mu_relative_strength') visible.add('MU');
+  if (strategyMode.value === 'mu_relative_strength') {
+    visible.clear();
+    for (const asset of leadershipAssets) visible.add(asset);
+  }
   for (const input of config.querySelectorAll('[name=asset]')) {
     if (!visible.delete(input.value)) input.closest('.asset-choice').remove();
     else input.checked = active.has(input.value);
@@ -980,7 +984,7 @@ function renderStrategyControls() {
   start.disabled = locked || !marketCatalog || ![...config.querySelectorAll('[name=asset]:checked')]
     .some(input=>marketByAsset.get(input.value)?.demo_tradeable &&
       (strategyMode.value !== 'us_open' || marketByAsset.get(input.value)?.equity === 'us') &&
-      (strategyMode.value !== 'mu_relative_strength' || input.value === 'MU'));
+      (strategyMode.value !== 'mu_relative_strength' || leadershipAssets.has(input.value)));
   start.dataset.running = String(running && !stopping);
   if (stopping) start.textContent = '正在停止策略…';
   else if (running) start.textContent = '✓ 策略运行中';
@@ -995,7 +999,7 @@ function renderStrategyControls() {
   entries.textContent = strategyState?.entries_paused ? '恢复开新仓' : '停止开新仓';
   for (const checkbox of config.querySelectorAll('[name=asset]')) {
     const market = marketByAsset.get(checkbox.value);
-    checkbox.disabled = assetEditingLocked() || (checkbox.checked && assetBusy(checkbox.value)) || !market?.demo_tradeable || (strategyMode.value === 'us_open' && market.equity !== 'us') || (strategyMode.value === 'mu_relative_strength' && checkbox.value !== 'MU');
+    checkbox.disabled = assetEditingLocked() || (checkbox.checked && assetBusy(checkbox.value)) || !market?.demo_tradeable || (strategyMode.value === 'us_open' && market.equity !== 'us') || (strategyMode.value === 'mu_relative_strength' && !leadershipAssets.has(checkbox.value));
     checkbox.parentElement.dataset.unavailable = String(!market?.demo_tradeable);
     checkbox.parentElement.title = market?.demo_tradeable ? '' : '模拟盘未确认可交易';
   }
@@ -1911,7 +1915,16 @@ button[aria-pressed=true],button:hover,.link:hover{background:#234264;border-col
 <p>回放按已收盘的 K 线生成信号，以分钟级行情模拟执行。成交模型、手续费和滑点可分别配置。<br><a href="https://www.freqtrade.io/en/latest/lookahead-analysis/">Freqtrade · 未来数据检查</a> · <a href="https://www.quantconnect.com/docs/v2/writing-algorithms/live-trading/trading-and-orders">QuantConnect LEAN · 成交与成本模型</a></p>
 </section>
 <section class="research"><h2>42 天共享账户对照</h2><p>2026/09/20 08:00 至 11/01 08:00（北京时间）。17 个标的共享 10,000 USDT。零滑点，双边各 5 bp 手续费，计入资金费。动量回撤与布林带区间回归为离线研究。</p><div class="scroller"><table><thead><tr><th>策略</th><th>成交笔数</th><th>胜率</th><th>平均盈亏比</th><th>净盈亏 USDT</th><th>最大回撤</th></tr></thead><tbody><tr><td>多周期动量回撤</td><td>1248</td><td>33.8%</td><td>1.04</td><td>−4,175.37</td><td>41.90%</td></tr><tr><td>5 分钟双向</td><td>850</td><td>31.5%</td><td>1.10</td><td>−3,784.54</td><td>38.93%</td></tr><tr><td>1 小时双向</td><td>234</td><td>49.1%</td><td>0.97</td><td>−270.49</td><td>13.08%</td></tr></tbody></table></div></section>
-<section class="research" id="mu-relative-strength-results"><h2>MU · 相对强弱回撤</h2>
+<section class="research" id="mu-relative-strength-results"><h2>领航回撤 · 模拟盘与回测</h2>
+<p>模拟盘可勾选 AMZN、GOOGL、KORU、META、MU、NVDA、SAMSUNG、SKHYNIX、SOXL、SPCX、TSLA。QQQ 用作强弱基准。策略用 5× 杠杆，同时最多 5 个仓位，组合初始风险预算 2%，开仓名义额度按账户权益限制。</p>
+<div class="scroller"><table><thead><tr><th>组合与开仓方式</th><th>区间（UTC）</th><th>平仓笔数</th><th>胜率</th><th>扣费后净收益</th><th>最大回撤</th></tr></thead><tbody>
+<tr><td>MU＋NVDA · 一次开仓</td><td>2026 年 5–10 月</td><td>342</td><td>50.00%</td><td>+1.36%</td><td>4.85%</td></tr>
+<tr><td>MU＋NVDA · 试仓、补仓再减仓</td><td>2026 年 5–10 月</td><td>295</td><td>58.31%</td><td>+0.01%</td><td>1.76%</td></tr>
+<tr><td>11 个标的 · 一次开仓</td><td>2026/09/20–11/01</td><td>305</td><td>45.90%</td><td>−3.67%</td><td>11.62%</td></tr>
+<tr><td>11 个标的 · 一次开仓，缩短冷却</td><td>2026/09/20–11/01</td><td>331</td><td>44.41%</td><td>−5.66%</td><td>13.39%</td></tr>
+<tr><td>11 个标的 · 试仓、补仓再减仓</td><td>2026/09/20–11/01</td><td>267</td><td>53.18%</td><td>−3.56%</td><td>5.30%</td></tr>
+</tbody></table></div>
+<p>上表计入资金费、每边 5 bp 手续费和每边 1 bp 滑点。分批入场仅供回测对照，按计划名义仓位的 1/3 开首单，逆向达到初始止损距离的 1/3 后最多补首单 2 倍数量。重新计算加权均价，以覆盖成本后减掉补仓数量；首单的硬止损距离为普通版的 1.5 倍，补仓后保留该价位，止盈按新均价到止损距离的 1.25 倍重算。下表为此前单标的、最高 3× 回测。</p>
 <p>2026 年 5–10 月（UTC），初始权益 10,000 USDT，计入双边各 5 bp 手续费和资金费。8–10 月已用于先前研究。</p>
 <div class="scroller"><table><thead><tr><th>区间</th><th>滑点（每边）</th><th>成交笔数</th><th>胜率</th><th>净收益率</th></tr></thead><tbody>
 <tr><td>半年</td><td>0 bp</td><td>187</td><td>57.22%</td><td>+7.07%</td></tr>
@@ -1933,7 +1946,7 @@ button[aria-pressed=true],button:hover,.link:hover{background:#234264;border-col
 </main>
 <script>
 const studyStrategies = {
-  "mu_relative_strength": ["MU · 相对强弱回撤","15m / 1h",["相对 QQQ 强弱","只做 MU 多头。要求 MU 最近 24 小时收益率高于 QQQ，两者用同一时刻已收盘的小时线计算。"],["1 小时趋势","MU 收盘高于上行的 48 根小时均线。"],["15 分钟入场","前两次收盘变动的简单 RSI ≤ 20，最新一根收阳且高于上一根收盘。"],["止损与退出","按小时 ATR 控制止损距离，目标为初始止损的 1.25 倍，最长持仓 24 小时。"]],
+  "mu_relative_strength": ["领航回撤 · 15 分钟","15m / 1h",["相对 QQQ 强弱","可选 11 个标的，只做多。要求标的最近 24 小时收益率高于 QQQ，按同一时刻已收盘的小时线计算。"],["1 小时趋势","标的收盘高于上行的 48 根小时均线。"],["15 分钟入场","前两次收盘变动的简单 RSI ≤ 20，最新一根收阳且高于上一根收盘。"],["止损与退出","按小时 ATR 控制止损距离，目标为初始止损的 1.25 倍，最长持仓 24 小时。"]],
   "rsi20": [
     "RSI 回撤修复（阈值 20）",
     "1h",
@@ -2287,7 +2300,7 @@ const layouts = {
   ]
 };
 for (const [key,[name,frames,...modules]] of Object.entries(studyStrategies)) {
-  strategies[key] = [name + ' · 研究',frames];
+  strategies[key] = [key === 'mu_relative_strength' ? name : name + ' · 研究',frames];
   layouts[key] = [modules,[['仓位与成本','单标的或少量标的共享资金，计入开平费用与资金费。'],['退出与回测','用分钟级行情检查止损和止盈。配置和结果见下方历史回放。']]];
 }
 const colors = ['#538fff','#3ebcde','#4dc9ba','#f89751','#f0bd58','#f7839f','#9f9aff'];
@@ -2304,7 +2317,7 @@ function render() {
   const [name, frames, entry, size, risk] = strategies[active];
   const mode = ['continuation','reversion','momentum'].includes(active) ? 'fast' : active;
   const researchOnly = ['reversion','momentum'].includes(active) || Object.hasOwn(studyStrategies,active);
-  if (active === 'mu_relative_strength') byId('backtest').textContent = '查看 MU 回测结果';
+  if (active === 'mu_relative_strength') byId('backtest').textContent = '查看领航回撤结果';
   else byId('backtest').textContent = '历史回测';
   byId('backtest').hidden = researchOnly && active !== 'mu_relative_strength';
   byId('backtest').href = active === 'mu_relative_strength' ? '#mu-relative-strength-results' : './backtest?' + new URLSearchParams({mode,days:'all'});
