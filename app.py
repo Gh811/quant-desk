@@ -86,7 +86,7 @@ STRATEGY_INTERVALS = {mode: TIMEFRAME_MINUTES[frames[0]] * 60000 for mode, frame
 STRATEGY_LOOKBACK = {'scalp': 6, 'fast': 12, 'intraday': 20, 'swing': 24, 'us_open': 20}
 STRATEGY_MAX_ATR = {'scalp': Decimal('.008'), 'fast': Decimal('.008'), 'intraday': Decimal('.012'), 'swing': Decimal('.02'),
                     'us_open': Decimal('.015')}
-ENTRY_EQUITY_RISK = {'scalp': Decimal('.002'), 'fast': Decimal('.005'), 'intraday': Decimal('.00325'), 'swing': Decimal('.0075'),
+ENTRY_EQUITY_RISK = {'fast': Decimal('.005'), 'intraday': Decimal('.00325'), 'swing': Decimal('.0075'),
                      'us_open': Decimal('.002')}
 SHORT_COST_CAP = Decimal('.30')
 SHORT_REENTRY_COOLDOWN_BARS = 3
@@ -109,6 +109,8 @@ def entry_stop_fraction(asset, mode, volatility, *, us_equity=False):
 def entry_notional_budget(mode, equity, free_margin, leverage, slots, stop, cost, risk_scale=1):
     capital_cap = equity * (3 if mode == 'swing' else 1)
     margin_cap = leverage * free_margin * Decimal('.95')
+    if mode == 'scalp':
+        return max(Decimal(0), min(capital_cap, margin_cap))
     if mode != 'fast':
         margin_cap /= slots
     risk_cap = equity * ENTRY_EQUITY_RISK[mode] * risk_scale / (stop + cost)
@@ -2291,7 +2293,8 @@ class DemoStrategy:
         cooldown_bars = 1 if mode == 'scalp' else SHORT_REENTRY_COOLDOWN_BARS
         cooldown_ms = cooldown_bars * STRATEGY_INTERVALS[mode]
         reentry_at = {}
-        max_positions = self.FAST_MAX_POSITIONS if mode == 'fast' else self.MAX_POSITIONS
+        fixed_leverage = mode in {'fast', 'scalp'}
+        max_positions = self.FAST_MAX_POSITIONS if fixed_leverage else self.MAX_POSITIONS
         max_hold_hours = {'scalp': .5, 'intraday': 4, 'swing': 48, 'us_open': 1.5}.get(mode)
         holdings = {}
         entry_attempts = {}
@@ -2760,7 +2763,7 @@ class DemoStrategy:
                             self.checks = checks.copy()
                             continue
                         leverage_cap = 3 if short_term else 5
-                        leverage_target = (self.FAST_LEVERAGE if mode == 'fast'
+                        leverage_target = (self.FAST_LEVERAGE if fixed_leverage
                                            else min(leverage_cap, max(1, int(Decimal('.05') / stop_loss))))
                         risk_scale = Decimal(str(evidence['risk_scale'])) if evidence else 1
                         budget = entry_notional_budget(mode, equity, free_margin, leverage_target,
