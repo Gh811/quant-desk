@@ -861,7 +861,13 @@ def demo_entry_book(symbol, contract_type):
     return book, bid, ask
 
 
-def select_demo_entry(direction, book, bid, ask, budget, step, stop_loss, cost, *, minimum_quantity=None):
+def select_demo_entry(direction, book, bid, ask, budget, step, stop_loss, cost, *,
+                      minimum_quantity=None, prefer_maker=False):
+    if prefer_maker:
+        price = bid if direction > 0 else ask
+        amount = (budget / price // step) * step
+        if amount >= (minimum_quantity or step):
+            return price, amount, 'GTX'
     price = ask if direction > 0 else bid
     amount = (budget / price // step) * step
     try:
@@ -1357,18 +1363,24 @@ def protection_watch():
 demo_fee_rates = {}
 
 
-def demo_taker_fee_rate(symbol):
+def demo_fee_schedule(symbol):
     cached = demo_fee_rates.get(symbol)
     if cached and cached[0] > time.monotonic():
         return cached[1]
     try:
-        rate = Decimal(demo_signed('/fapi/v1/commissionRate', symbol=symbol)['takerCommissionRate'])
-        if not rate.is_finite() or rate < 0:
-            rate = None
+        response = demo_signed('/fapi/v1/commissionRate', symbol=symbol)
+        taker = Decimal(str(response['takerCommissionRate']))
+        maker = Decimal(str(response.get('makerCommissionRate', 'NaN')))
+        rates = (maker if maker.is_finite() else None,
+                 taker if taker.is_finite() and taker >= 0 else None)
     except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
-        rate = None
-    demo_fee_rates[symbol] = (time.monotonic() + (60 if rate is not None else 15), rate)
-    return rate
+        rates = (None, None)
+    demo_fee_rates[symbol] = (time.monotonic() + (60 if rates[1] is not None else 15), rates)
+    return rates
+
+
+def demo_taker_fee_rate(symbol):
+    return demo_fee_schedule(symbol)[1]
 
 
 position_open_times = {}
@@ -2900,7 +2912,10 @@ class DemoStrategy:
                             book_time = int(book['time'])
                             midpoint = (bid + ask) / 2
                             spread = (ask - bid) / midpoint
-                            cost = spread + 2 * fee + funding_cost
+                            prefer_maker = item['contractType'] == 'TRADIFI_PERPETUAL' and equity_kind(symbol, item) == 'us'
+                            maker_fee = demo_fee_schedule(symbol)[0] if prefer_maker else None
+                            entry_fee = max(Decimal(0), maker_fee) if maker_fee is not None else fee
+                            cost = spread + entry_fee + fee + funding_cost
                             if direction * (midpoint / signal_context['close'] - 1) > volatility / 2:
                                 raise ValueError('盘口已远离信号收盘价，避免追价')
                             tolerance = 0 if signal_context['stressed'] else -volatility / 4
@@ -2954,10 +2969,23 @@ class DemoStrategy:
                             budget = min(budget, fixed_notional)
                         minimum = Decimal(filters.get('MIN_NOTIONAL', {}).get('notional', '0'))
                         aggressive_price = ask if direction > 0 else bid
-                        minimum_quantity = max(Decimal(lot['minQty']), minimum / aggressive_price)
+                        sizing_price = (bid if direction > 0 else ask) if prefer_maker else aggressive_price
+                        minimum_quantity = max(Decimal(lot['minQty']), minimum / sizing_price)
                         price, amount, time_in_force = select_demo_entry(
                             direction, book, bid, ask, budget, step, stop_loss, cost,
-                            minimum_quantity=minimum_quantity if fast_trend else None)
+                            minimum_quantity=minimum_quantity if fast_trend or prefer_maker else None,
+                            prefer_maker=prefer_maker)
+                        if time_in_force == 'IOC' and prefer_maker:
+                            entry_fee = fee
+                            cost = spread + 2 * fee + funding_cost
+                            if cost > stop_loss * cost_cap:
+                                checks[symbol[:-4]] = f'跳过 · 吃单后预估成本 {cost:.3%} 超过风控上限'
+                                self.checks = checks.copy()
+                                continue
+                            budget = min(budget, entry_notional_budget(
+                                mode, equity, free_margin, leverage_target, max_positions-len(occupied),
+                                stop_loss, cost, risk_scale))
+                            amount = min(amount, (budget / price // step) * step)
                         attempt = (candle, direction, demo_now_ms(), price, time_in_force, cost)
                         retry_block = entry_retry_block(
                             entry_attempts.get(symbol), attempt, ENTRY_RETRY_COOLDOWN_SECONDS[mode],
@@ -3022,11 +3050,12 @@ class DemoStrategy:
                             raise ValueError('合约价格步长无效')
                         detail = f'{execution} · 信号幅度 {abs(score):.3%} · ATR {volatility:.3%} · 计划止损 {stop_loss:.3%}'
                         detail += (f' · {signal_context["detail"]} · 点差 {spread:.3%} · '
-                                   f'预估双边手续费 {2 * fee:.3%} · 下一次不利资金费 {funding_cost:.3%}')
+                                   f'预估开仓手续费 {entry_fee:.3%} · 预估保护性平仓费 {fee:.3%} · 下一次不利资金费 {funding_cost:.3%}')
                         if fixed_notional is not None:
                             detail += f' · 目标仓位 {fixed_notional:f} USDT · 本单名义金额 {notional:.2f} USDT'
                         if time_in_force == 'GTX':
-                            maker_reason = '吃单成本偏高' if cost > stop_loss / 2 else '对手盘一档数量不足'
+                            maker_reason = ('美股永续优先做 Maker' if prefer_maker else
+                                            '吃单成本偏高' if cost > stop_loss / 2 else '对手盘一档数量不足')
                             detail += f' · {maker_reason}，改为限价挂单'
                         if fixed_leverage:
                             try:
