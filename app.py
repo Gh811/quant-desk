@@ -67,8 +67,10 @@ def trend_metrics(bars, direction=1, *, fast_period=12, slow_period=48):
     return direction*closes[-1] > direction*fast > direction*slow, Decimal(str(atr_fraction))
 
 
+LEADERSHIP_ASSETS = frozenset({'AMZN', 'GOOGL', 'KORU', 'META', 'MU', 'NVDA',
+                               'SAMSUNG', 'SKHYNIX', 'SOXL', 'SPCX', 'TSLA'})
 STRATEGY_NAMES = {
-    'mu_relative_strength': 'MU · 15 分钟相对强弱回撤',
+    'mu_relative_strength': '领航回撤 · 15 分钟',
     'swing': '中长线 · 1 小时双向突破与回踩',
     'intraday': '短线 · 15 分钟双向突破与回踩',
     'scalp': '1 分钟双向 · 高频测试',
@@ -1604,7 +1606,7 @@ def scan_entry_signal(symbol, mode, *, venue=DEMO_VENUE, us_equity=False):
         benchmark, _ = closed_demo_bars('QQQUSDT', '1h', cutoff, 25, venue=venue)
         strength = last/hourly[-25][4] - benchmark[-1][4]/benchmark[0][4]
         if strength <= 0:
-            return candle, None, volatility, 'MU 过去 24 小时未跑赢 QQQ', {}
+            return candle, None, volatility, '过去 24 小时未跑赢 QQQ', {}
         return candle, 1, volatility, '15 分钟 RSI 回撤修复', dict(
             close=Decimal(str(close)), boundary=Decimal(str(low)), stressed=False,
             priority=strength, detail=f'RSI {rsi:.1f} · 24 小时领先 QQQ {strength:.2%}')
@@ -2390,8 +2392,8 @@ class DemoStrategy:
                 return
             symbol = asset + 'USDT'
             if enabled:
-                if self.mode == 'mu_relative_strength' and asset != 'MU':
-                    raise ValueError('相对强弱回撤策略只交易 MU')
+                if self.mode == 'mu_relative_strength' and asset not in LEADERSHIP_ASSETS:
+                    raise ValueError('领航回撤不支持该标的')
                 demo = futures_catalog(DEMO_VENUE).get(symbol)
                 if not tradable_future(demo) or (self.mode == 'us_open' and equity_kind(symbol, demo) != 'us'):
                     raise ValueError('模拟盘或当前策略不支持：' + asset)
@@ -2933,6 +2935,21 @@ class DemoStrategy:
                         risk_scale = Decimal(str(evidence['risk_scale'])) if evidence else 1
                         budget = entry_notional_budget(mode, equity, free_margin, leverage_target,
                                                        max_positions-len(occupied), stop_loss, cost, risk_scale)
+                        if mode == 'mu_relative_strength':
+                            if pending_entries or any(not order.get('reduceOnly') for order in open_orders):
+                                checks[symbol[:-4]] = '等待在途开仓委托核对后再分配仓位'
+                                self.checks = checks.copy()
+                                break
+                            committed = reserved = Decimal(0)
+                            for key, (quantity, _, _, risk, _) in holdings.items():
+                                exposure = abs(quantity) * Decimal(positions[key]['entryPrice'])
+                                committed += exposure
+                                reserved += exposure * (risk + cost)
+                            budget = min(budget, equity - committed, (equity * Decimal('.02') - reserved) / (stop_loss + cost))
+                            if budget <= 0:
+                                checks[symbol[:-4]] = '组合仓位或风险额度已用完'
+                                self.checks = checks.copy()
+                                continue
                         if fixed_notional is not None:
                             budget = min(budget, fixed_notional)
                         minimum = Decimal(filters.get('MIN_NOTIONAL', {}).get('notional', '0'))
@@ -3080,6 +3097,11 @@ class DemoStrategy:
                                                         leverage=leverage_target, strategy=mode), direction=direction,
                                                    take_multiple=take_multiple, target_return=target_return)
                             checks[symbol[:-4]] = '开仓已成交 · 止盈止损已挂'
+                            if mode == 'mu_relative_strength':
+                                stop_price = protection_price(entry, -stop_loss, tick, direction=direction, kind='stop')
+                                take_price = protection_price(entry, take_multiple*stop_loss, tick, direction=direction, kind='take')
+                                record_runtime('领航回撤保护价已确认', mode=mode, symbol=symbol,
+                                               detail=f'成交均价 {entry:f} · 止损 {stop_price:f} · 止盈 {take_price:f}')
                         except (ValueError, OSError, KeyError, ArithmeticError, sqlite3.Error) as error:
                             protection_errors[symbol] = str(error)
                             checks[symbol[:-4]] = '保护单未全部确认 · ' + str(error)
@@ -3470,8 +3492,8 @@ class Handler(BaseHTTPRequestHandler):
             if mode == 'scalp':
                 self.send(400, 'application/json', json.dumps({'error': '1 分钟策略已下线，请选择 5 分钟双向策略'}).encode())
                 return
-            if mode == 'mu_relative_strength' and assets != {'MU'}:
-                self.send(400, 'application/json', json.dumps({'error': '请仅勾选 MU'}).encode())
+            if mode == 'mu_relative_strength' and not assets <= LEADERSHIP_ASSETS:
+                self.send(400, 'application/json', json.dumps({'error': '请选择领航回撤支持的标的'}).encode())
                 return
             if mode not in STRATEGY_NAMES:
                 self.send(400, 'application/json', '{"error":"未知策略"}'.encode())
