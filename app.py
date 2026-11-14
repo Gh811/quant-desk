@@ -943,7 +943,8 @@ def strategy_limit_entry(order):
 
 def has_order_fill(order):
     return order['status'] == 'FILLED' or (
-        strategy_limit_entry(order) and Decimal(order.get('executed_qty') or '0') > 0
+        (strategy_limit_entry(order) or (order.get('decision') or {}).get('stage'))
+        and Decimal(order.get('executed_qty') or '0') > 0
     )
 
 
@@ -1150,7 +1151,7 @@ def replace_conflicting_strategy_take(symbol, old, target, context, *, amount):
 
 
 def align_strategy_protection(symbol, entry, mark, stop_loss, stop, tick, context, *, direction=1, take=None,
-                              take_multiple=2, review='', replace_amount=None):
+                              take_multiple=2, review='', replace_amount=None, exact_take=False):
     if min(entry, mark, tick) <= 0:
         raise ValueError('保护单价格数据无效')
     initial_take = protection_price(entry, take_multiple*stop_loss, tick, direction=direction, kind='take')
@@ -1168,7 +1169,8 @@ def align_strategy_protection(symbol, entry, mark, stop_loss, stop, tick, contex
             def acceptable(order):
                 trigger = direction*Decimal(order['triggerPrice'])
                 return (direction*target <= trigger < direction*mark if kind == 'stop'
-                        else direction*mark < trigger <= direction*target)
+                        else direction*mark < trigger <= direction*target
+                        and (not exact_take or trigger == direction*target))
 
             valid = [order for order in matching if acceptable(order)]
             if valid:
@@ -1196,8 +1198,9 @@ def align_strategy_protection(symbol, entry, mark, stop_loss, stop, tick, contex
                             raise
                         old = matching[0]
                         if (old.get('positionSide', 'BOTH') != 'BOTH'
-                                or (1 if kind == 'stop' else -1) * direction
-                                   * (target - Decimal(old['triggerPrice'])) <= 0):
+                                or ((kind == 'stop' or not exact_take)
+                                    and (1 if kind == 'stop' else -1) * direction
+                                    * (target - Decimal(old['triggerPrice'])) <= 0)):
                             raise
                         replace = (replace_conflicting_strategy_stop if kind == 'stop'
                                    else replace_conflicting_strategy_take)
@@ -1315,12 +1318,13 @@ def reconcile_protection_fill(event):
                       decision=dict(reason=f'交易所{action}触发', detail=detail))
         order.setdefault('side', intent['side'])
         journal('demo_order_response', dict(intent=intent, response=order))
-        if context.get('opening_id') is not None:
+        if context.get('opening_id') is not None and not staged_opening(symbol, context['opening_id']):
             try:
                 settlement = settle_demo_trade(symbol, context['opening_id'], order, context.get('opened'))
             except (OSError, ValueError, KeyError, ArithmeticError):
                 return
             journal('demo_order_settled', dict(intent=intent, response=order, **settlement))
+        external_demo_close_wake.set()
     elif conditional.get('algoStatus') not in {'CANCELED', 'EXPIRED', 'REJECTED'}:
         return
     journal('demo_protection_resolved', dict(clientAlgoId=client_id))
@@ -2254,6 +2258,122 @@ def run_backtest(params, progress, *, settings=None):
     return {**coverage, 'cost_settings': settings, 'funding_samples': len(funding_rows), 'results': results}
 
 
+def staged_position_orders(orders, symbol, opening_id):
+    return [order for order in orders if order['symbol'] == symbol
+            and str(order.get('opening_id')) == str(opening_id)
+            and (order.get('decision') or {}).get('stage') in {'add', 'trim'}]
+
+
+def staged_position_setup(root, orders, tick, amount):
+    plan = (root.get('decision') or {}).get('staged')
+    if not plan:
+        return None
+    first_qty = Decimal(root['executed_qty'])
+    first_quote = Decimal(root.get('filled') or 0)
+    if first_quote <= 0:
+        first_quote = Decimal(root.get('avg_price') or 0)*first_qty
+    if first_quote <= 0:
+        fills = demo_signed('/fapi/v1/userTrades', symbol=root['symbol'],
+                            orderId=root['exchange_order_id'], limit=1000)
+        if (len(fills) >= 1000 or sum(Decimal(fill['qty']) for fill in fills) != first_qty
+                or any(str(fill['orderId']) != str(root['exchange_order_id']) or fill['side'] != root['side']
+                       for fill in fills)):
+            raise ValueError('首仓成交金额待核对')
+        first_quote = sum(trade_quote(fill) for fill in fills)
+        if first_quote <= 0:
+            raise ValueError('首仓成交金额无效')
+    first_entry = first_quote / first_qty
+    direction = 1 if amount > 0 else -1
+    added = sum((Decimal(o.get('executed_qty') or 0) for o in orders if not o.get('reduce_only')), Decimal(0))
+    trimmed = sum((Decimal(o.get('executed_qty') or 0) for o in orders if o.get('reduce_only')), Decimal(0))
+    if first_qty + added - trimmed != abs(amount) or not 0 <= trimmed <= added:
+        raise ValueError('分批仓位数量待核对')
+    hard_stop = protection_price(first_entry, -Decimal(root['stop_loss']), tick, direction=direction, kind='stop')
+    return dict(plan, first_qty=first_qty, first_entry=first_entry, added=added, trimmed=trimmed,
+                hard_stop=hard_stop, add_attempted=any(not o.get('reduce_only') for o in orders))
+
+
+def manage_staged_position(symbol, amount, opened, opening_id, tick, mark, entry, setup, mode, *, allow_add):
+    direction = 1 if amount > 0 else -1
+    first_entry = setup['first_entry']
+    stop = setup['hard_stop']
+    add_line = first_entry * (1 - direction * Decimal(setup['base_stop']) / 3)
+    trim = setup['added'] - setup['trimmed']
+    adding = allow_add and not setup['add_attempted'] and direction * (mark - add_line) <= 0
+    if not adding and (not trim or direction * (mark-entry) <= 0):
+        return False
+
+    with protection_lock:
+        fresh = demo_signed('/fapi/v3/account')
+        positions = [p for p in fresh['positions'] if Decimal(p['positionAmt'])]
+        matching = [p for p in positions if p['symbol'] == symbol]
+        if (len(matching) != 1 or matching[0].get('positionSide', 'BOTH') != 'BOTH'
+                or Decimal(matching[0]['positionAmt']) != amount
+                or Decimal(matching[0]['entryPrice']) != entry
+                or demo_signed('/fapi/v1/openOrders')
+                or not confirmed_strategy_stop(symbol, stop, direction=direction)):
+            return False
+        book, bid, ask = demo_entry_book(symbol, setup['contract_type'])
+        reference = request(DEMO_VENUE, '/fapi/v1/premiumIndex', symbol=symbol)
+        now = demo_now_ms()
+        fresh_mark = Decimal(reference['markPrice'])
+        if (reference.get('symbol') != symbol
+                or not -1000 <= now - int(reference['time']) <= ENTRY_QUOTE_MAX_AGE_MS
+                or not -1000 <= now - int(book['time']) <= ENTRY_QUOTE_MAX_AGE_MS
+                or direction * (fresh_mark-stop) < 2*tick):
+            return False
+        if adding:
+            price = (ask if direction > 0 else bid)
+            if (max(direction*(price-add_line), direction*(fresh_mark-add_line)) > 0
+                    or direction*(price-stop) < 2*tick):
+                return False
+            step = Decimal(setup['step'])
+            equity = Decimal(fresh['totalMarginBalance'])
+            committed = sum(abs(Decimal(p['positionAmt'])) * Decimal(p['entryPrice']) for p in positions)
+            fee = demo_taker_fee_rate(symbol)
+            if fee is None:
+                return False
+            cost = (ask-bid)/price + 2*fee + Decimal(setup['funding_cost'])
+            risk = abs(amount) * (abs(entry-stop) + entry*cost)
+            # Reserve conservatively for every other open position.
+            reserved = (committed - abs(amount)*entry)*Decimal('.025')
+            remaining_risk = min(equity * ENTRY_EQUITY_RISK[mode], equity*Decimal('.02')-reserved) - risk
+            remaining_notional = min(Decimal(setup['budget']) - abs(amount)*entry, equity-committed,
+                                     5*Decimal(fresh['availableBalance'])*Decimal('.95'))
+            quantity = min(2 * setup['first_qty'], remaining_notional/price, Decimal(setup['max_qty']),
+                           remaining_risk/(abs(price-stop)+price*cost),
+                           Decimal(book['askQty' if direction > 0 else 'bidQty']))
+            quantity = (quantity // step) * step
+            if quantity <= 0 or quantity < Decimal(setup['min_qty']) or quantity*price < Decimal(setup['min_notional']):
+                return False
+            reason = '逆向到达补仓位 · 补仓一次'
+        else:
+            costs = position_breakeven_costs(symbol, opening_id, amount, {}, staged=True)
+            price = net_breakeven_price(entry, amount, tick, *costs)
+            if direction * ((bid if direction > 0 else ask)-price) < 0:
+                return False
+            quantity = trim
+            reason = '覆盖成本后减掉补仓数量'
+        # Verify exchange custody again after fee and quote requests, immediately before placing the IOC.
+        current = demo_signed('/fapi/v3/account')
+        active = [p for p in current['positions'] if p['symbol'] == symbol and Decimal(p['positionAmt'])]
+        if (len(active) != 1 or active[0].get('positionSide', 'BOTH') != 'BOTH'
+                or Decimal(active[0]['positionAmt']) != amount
+                or Decimal(active[0]['entryPrice']) != entry
+                or not confirmed_strategy_stop(symbol, stop, direction=direction)
+                or demo_now_ms() - int(book['time']) > ENTRY_QUOTE_MAX_AGE_MS):
+            return False
+        order = submit_demo_order(symbol, entry_side(amount) if adding else exit_side(amount), format(quantity, 'f'),
+                                  notional=str(quantity*price), leverage=5, reduce_only=not adding,
+                                  opened=int(opened*1000), opening_id=opening_id, strategy=mode,
+                                  decision=dict(stage='add' if adding else 'trim', reason=reason,
+                                                detail=f'限价 {price:f} · 当前均价 {entry:f} · 硬止损 {stop:f}'),
+                                  defer_confirmation=True, ioc_price=price)
+        external_demo_close_wake.set()
+        # A terminal zero-fill add attempt is persisted too.
+        return adding or order.get('status') in DEMO_ORDER_PENDING or Decimal(order.get('executedQty') or 0) > 0
+
+
 def restore_strategy_positions(positions, assets, mode):
     if not positions:
         return {}, {}, {}
@@ -2267,11 +2387,26 @@ def restore_strategy_positions(positions, assets, mode):
             continue
         opened_at, order_id = position_opened_at(position)
         previous = next((order for order in orders
-                         if order['symbol'] == symbol and has_order_fill(order)), None)
-        if not (previous and not previous.get('reduce_only') and previous['side'] == entry_side(amount) and previous.get('strategy') == mode
-                and opened_at and order_id is not None and str(previous['exchange_order_id']) == str(order_id)
+                         if order['symbol'] == symbol and has_order_fill(order)
+                         and str(order['exchange_order_id']) == str(order_id)), None)
+        if (previous and (previous.get('decision') or {}).get('stage') == 'add'
+                and previous.get('strategy') == mode and opened_at and previous['side'] == entry_side(amount)
                 and Decimal(previous['executed_qty']) == abs(amount)):
+            # Exchange-side stop/take can close the old position just before a non-reduce-only IOC fills.
+            # Close a new position created by that IOC, using its own ID for settlement.
+            result = close_strategy_position(symbol, amount, opened_at/1000, int(previous['leverage']),
+                                             order_id, mode, dict(reason='补仓时原仓已平 · 关闭意外新仓'))
+            if result:
+                record_runtime('补仓过渡仓位已提交保护性退出', mode=mode, symbol=symbol)
             continue
+        if not (previous and not previous.get('reduce_only') and previous['side'] == entry_side(amount)
+                and previous.get('strategy') == mode and opened_at and order_id is not None):
+            continue
+        staged = (previous.get('decision') or {}).get('staged')
+        if not staged:
+            newest = next(order for order in orders if order['symbol'] == symbol and has_order_fill(order))
+            if newest is not previous or Decimal(previous['executed_qty']) != abs(amount):
+                continue
 
         stop_loss = previous.get('stop_loss')
         tick = previous.get('price_tick')
@@ -2290,6 +2425,12 @@ def restore_strategy_positions(positions, assets, mode):
         tick = Decimal(tick)
         if tick <= 0:
             continue
+        if staged:
+            try:
+                setups[symbol] = staged_position_setup(previous, staged_position_orders(orders, symbol, order_id),
+                                                       tick, amount)
+            except (ValueError, ArithmeticError):
+                continue
         holdings[symbol] = (amount, opened_at/1000, int(previous['leverage']),
                             Decimal(stop_loss), order_id)
         ticks[symbol] = tick
@@ -2374,6 +2515,7 @@ class DemoStrategy:
         self.status = '未启动'
         self.mode = 'swing'
         self.fixed_notional = None
+        self.staged_entry = False
         self.assets = []
         self.busy_assets = []
         self.checks = {}
@@ -2442,7 +2584,7 @@ class DemoStrategy:
             finally:
                 self.draining = False
 
-    def run(self, assets, mode, fixed_notional=None):
+    def run(self, assets, mode, fixed_notional=None, staged_entry=False):
         short_term = mode != 'swing'
         fast_trend = mode == 'fast'
         cost_control = short_term
@@ -2457,6 +2599,8 @@ class DemoStrategy:
         max_hold_hours = {'mu_relative_strength': 24, 'scalp': .5, 'intraday': 4, 'swing': 48, 'us_open': 1.5}.get(mode)
         holdings = {}
         entry_attempts = {}
+        staged_retry = {}
+        staged_reload = set()
         peaks = {}
         protection_errors = {}
         ticks = {}
@@ -2522,13 +2666,15 @@ class DemoStrategy:
                 if recovering:
                     demo_return_baseline(account.get('totalWalletBalance'))
                 to_restore = {symbol: position for symbol, position in positions.items()
-                              if symbol not in holdings or Decimal(position['positionAmt']) != holdings[symbol][0]}
+                              if symbol in staged_reload or symbol not in holdings
+                              or Decimal(position['positionAmt']) != holdings[symbol][0]}
                 if to_restore:
                     restored, restored_ticks, restored_setups = restore_strategy_positions(to_restore, assets, mode)
                     for symbol, restored_holding in restored.items():
                         if symbol in holdings and holdings[symbol][4] != restored_holding[4]:
                             forget_protection(symbol)
                         breakeven_costs.pop(symbol, None)
+                    staged_reload.difference_update(restored)
                     holdings.update(restored)
                     ticks.update(restored_ticks)
                     fast_setups.update(restored_setups)
@@ -2543,10 +2689,18 @@ class DemoStrategy:
                     if cost_control:
                         reentry_at[symbol] = demo_now_ms() + cooldown_ms
                     forget_protection(symbol)
+                    staged_reload.discard(symbol)
                     self.checks = {**self.checks, symbol[:-4]: '已平仓 · 待下轮扫描'}
                     journal('demo_protection_position_closed', dict(symbol=symbol, opening_id=opening_id))
                 unmatched = {symbol for symbol, position in positions.items()
-                             if symbol not in holdings or Decimal(position['positionAmt']) != holdings[symbol][0]}
+                             if symbol in staged_reload or symbol not in holdings
+                             or Decimal(position['positionAmt']) != holdings[symbol][0]}
+                if unmatched - owned_pending and mode == 'mu_relative_strength' and to_restore:
+                    # A fresh snapshot distinguishes a just-closed IOC position from an unowned position.
+                    fresh = demo_signed('/fapi/v3/account')
+                    if {p['symbol']: Decimal(p['positionAmt']) for p in fresh['positions'] if Decimal(p['positionAmt'])} != {
+                            symbol: Decimal(position['positionAmt']) for symbol, position in positions.items()}:
+                        continue
                 if len(positions) != len(active) or unmatched - owned_pending:
                     details = '：' + '、'.join(sorted(unmatched)) if unmatched else ''
                     raise ValueError('账户持仓无法与所选策略的开仓成交核对' + details)
@@ -2585,6 +2739,14 @@ class DemoStrategy:
                     minimum_stop = protection_price(entry_price, -stop_loss, tick, direction=direction, kind='stop')
                     stop = trailing_stops.get(symbol, minimum_stop)
                     take = fast_takes.get(symbol)
+                    staged = mode == 'mu_relative_strength' and 'hard_stop' in setup
+                    proposed_take = None
+                    if staged:
+                        minimum_stop = setup['hard_stop']
+                        stop = trailing_stops.get(symbol, minimum_stop)
+                        target_return = take_multiple * abs(entry_price-minimum_stop) / entry_price
+                        take = protection_price(entry_price, target_return, tick, direction=direction, kind='take')
+                        fixed_exit = direction * (mark-minimum_stop) <= 0 or direction * (take-mark) <= 0
                     dynamic_exit = fast_exit_decisions.get(symbol)
                     review_note = ''
                     proposed_stop = peak-stop_loss if not fast_trend and peak >= stop_loss else None
@@ -2629,13 +2791,15 @@ class DemoStrategy:
                                 if direction*(closer-mark) >= 2*tick:
                                     take = (min if direction > 0 else max)(take, closer) if take is not None else closer
                     early_breakeven = fast_trend and peak >= stop_loss and price_return > 0
+                    if staged and setup['added'] != setup['trimmed']:
+                        proposed_stop = None
                     if (proposed_stop is not None or early_breakeven) and not (timed_out or fixed_exit or dynamic_exit):
                         candidate = (protection_price(entry_price, proposed_stop, tick, direction=direction, kind='stop')
                                      if proposed_stop is not None else None)
                         try:
                             breakeven = None
                             if not fast_trend or price_return > 0:
-                                costs = position_breakeven_costs(symbol, opening_id, amount, breakeven_costs)
+                                costs = position_breakeven_costs(symbol, opening_id, amount, breakeven_costs, staged=staged)
                                 breakeven = net_breakeven_price(entry_price, amount, tick, *costs)
                         except (OSError, ValueError, KeyError, TypeError, ArithmeticError):
                             breakeven = None
@@ -2652,7 +2816,7 @@ class DemoStrategy:
                     missing_stop = False
                     if not (timed_out or fixed_exit or trailing or dynamic_exit or dynamic_take_hit):
                         reviewed_window = None
-                        if not fast_trend and stop != minimum_stop and price_return >= (
+                        if not fast_trend and not staged and stop != minimum_stop and price_return >= (
                                 stop_loss * Decimal('.75') if mode == 'mu_relative_strength' else stop_loss):
                             window = demo_now_ms() // STRATEGY_INTERVALS[mode]
                             if take_reviewed.get(symbol) != window:
@@ -2673,7 +2837,8 @@ class DemoStrategy:
                                                       dict(opening_id=opening_id, opened=int(opened*1000),
                                                            leverage=leverage, strategy=mode), direction=direction,
                                                       take=take, take_multiple=target_return / stop_loss, review=review_note,
-                                                      replace_amount=amount if symbol not in pending_entries else None)
+                                                      replace_amount=amount if symbol not in pending_entries else None,
+                                                      exact_take=staged)
                             if fast_trend or mode == 'mu_relative_strength':
                                 fast_takes[symbol] = actual_take
                                 stop = actual_stop
@@ -2702,15 +2867,37 @@ class DemoStrategy:
                             label = ('止损未确认 · 等待开仓余单核对' if missing_stop
                                      else '止损有效 · 保护单待核对')
                             self.checks = {**self.checks, symbol[:-4]: label}
+                    if (staged and (not self.entries_paused.is_set() or setup['added'] > setup['trimmed'])
+                            and not pending_symbols
+                            and not (timed_out or fixed_exit or trailing or dynamic_exit or dynamic_take_hit or missing_stop)
+                            and now >= staged_retry.get(symbol, 0)):
+                        staged_retry[symbol] = now+3000
+                        try:
+                            changed = manage_staged_position(symbol, amount, opened, opening_id, tick, mark,
+                                                            entry_price, setup, mode,
+                                                            allow_add=not self.entries_paused.is_set())
+                        except (OSError, ValueError, KeyError, ArithmeticError) as error:
+                            record_runtime('分批委托待复查', mode=mode, symbol=symbol, detail=str(error))
+                            staged_reload.add(symbol)
+                            closed = True
+                            break
+                        if changed:
+                            self.checks = {**self.checks, symbol[:-4]: '分批委托已提交 · 正在核对成交与保护价'}
+                            # Reload the journal and exchange position before any new order uses these balances.
+                            staged_reload.add(symbol)
+                            peaks.pop(symbol, None)
+                            fast_takes.pop(symbol, None)
+                            closed = True
+                            break
                     if timed_out or fixed_exit or trailing or dynamic_exit or dynamic_take_hit or missing_stop:
                         if symbol in pending_entries:
                             continue
                         self.status = f'正在平仓 {symbol}'
                         if timed_out:
                             reason, threshold = '达到最长持仓时间', f'{max_hold_hours:g} 小时'
-                        elif price_return <= -stop_loss:
-                            reason, threshold = '达到止损线', f'{-stop_loss:.3%}'
-                        elif price_return >= target_return:
+                        elif (staged and direction*(mark-minimum_stop) <= 0) or (not staged and price_return <= -stop_loss):
+                            reason, threshold = '达到止损线', f'{minimum_stop:f}'
+                        elif (staged and direction*(take-mark) <= 0) or (not staged and price_return >= target_return):
                             reason, threshold = '达到止盈线', f'{target_return:.3%}'
                         elif trailing:
                             reason, threshold = '触发移动止损', f'移动止损价 {stop:f}'
@@ -2928,6 +3115,9 @@ class DemoStrategy:
                         leverage_cap = 3 if short_term else 5
                         leverage_target = (self.FAST_LEVERAGE if fixed_leverage
                                            else min(leverage_cap, max(1, int(Decimal('.05') / stop_loss))))
+                        base_stop = stop_loss
+                        if staged_entry:
+                            stop_loss *= Decimal('1.5')
                         risk_scale = Decimal(str(evidence['risk_scale'])) if evidence else 1
                         budget = entry_notional_budget(mode, equity, free_margin, leverage_target,
                                                        max_positions-len(occupied), stop_loss, cost, risk_scale)
@@ -2952,7 +3142,7 @@ class DemoStrategy:
                         aggressive_price = ask if direction > 0 else bid
                         minimum_quantity = max(Decimal(lot['minQty']), minimum / aggressive_price)
                         price, amount, time_in_force = select_demo_entry(
-                            direction, book, bid, ask, budget, step, stop_loss, cost,
+                            direction, book, bid, ask, budget/3 if staged_entry else budget, step, stop_loss, cost,
                             minimum_quantity=minimum_quantity if fast_trend else None)
                         attempt = (candle, direction, demo_now_ms(), price, time_in_force, cost)
                         retry_block = entry_retry_block(
@@ -3036,6 +3226,12 @@ class DemoStrategy:
                         if fast_trend:
                             detail += f' · 收盘至准备发单 {(now - signal_at) / 1000:.1f} 秒'
                         decision = dict(reason=reason, detail=detail, signal_at=signal_at)
+                        if staged_entry:
+                            decision['staged'] = dict(base_stop=str(base_stop), budget=str(budget), step=str(step),
+                                                      min_qty=lot['minQty'], max_qty=lot['maxQty'],
+                                                      min_notional=str(minimum), contract_type=item['contractType'],
+                                                      funding_cost=str(funding_cost))
+                            decision['detail'] += f' · 分批首仓 · 总计划名义金额 {budget:.2f} USDT'
                         if fast_trend:
                             decision['setup'] = fast_entry_setup(signal_context, volatility)
                             decision['setup']['target_return'] = str(target_return)
@@ -3079,6 +3275,8 @@ class DemoStrategy:
                             continue
                         holdings[symbol] = (direction*Decimal(order['executedQty']), int(order.get('updateTime') or 0)/1000, leverage_target, stop_loss, order.get('orderId'))
                         ticks[symbol] = tick
+                        if staged_entry:
+                            staged_retry.pop(symbol, None)
                         if fast_trend:
                             fast_setups[symbol] = decision['setup']
                         entry = Decimal(0)
@@ -3125,6 +3323,9 @@ class DemoStrategy:
                                     del holdings[symbol]
                                     forget_protection(symbol)
                                     checks[symbol[:-4]] = '未确认止损 · 已核对仓位关闭'
+                        if staged_entry and symbol in holdings:
+                            # Load staged state from durable fills, including after incomplete protection setup.
+                            staged_reload.add(symbol)
                         for _, other_symbol, *_ in candidates:
                             other_asset = other_symbol[:-4]
                             if checks[other_asset].endswith('等待下单检查'):
@@ -3491,6 +3692,10 @@ class Handler(BaseHTTPRequestHandler):
             if mode not in STRATEGY_NAMES:
                 self.send(400, 'application/json', '{"error":"未知策略"}'.encode())
                 return
+            staged_entry = params.get('staged_entry', ['0'])[0] == '1'
+            if staged_entry and mode != 'mu_relative_strength':
+                self.send(400, 'application/json', '{"error":"可选补仓仅支持领航回撤"}'.encode())
+                return
             sizing = params.get('sizing', ['capital'])[0]
             fixed_notional = None
             try:
@@ -3531,13 +3736,14 @@ class Handler(BaseHTTPRequestHandler):
                 strategy.wake.clear()
                 strategy.mode = mode
                 strategy.fixed_notional = fixed_notional
+                strategy.staged_entry = staged_entry
                 strategy.assets = sorted(assets)
                 strategy.busy_assets = []
                 strategy.checks = {}
                 strategy.checked_at = None
                 strategy.scan_ms = None
                 strategy.status = '正在核对模拟账户'
-                threading.Thread(target=strategy.run, args=(assets, mode, fixed_notional), daemon=True).start()
+                threading.Thread(target=strategy.run, args=(assets, mode, fixed_notional, staged_entry), daemon=True).start()
         else:
             self.send(404, 'text/plain', b'Not found')
             return
@@ -3589,6 +3795,7 @@ class Handler(BaseHTTPRequestHandler):
                                                                     entries_paused=self.server.strategy.entries_paused.is_set(),
                                                                     fixed_notional=(str(self.server.strategy.fixed_notional)
                                                                                     if self.server.strategy.fixed_notional is not None else None),
+                                                                    staged_entry=self.server.strategy.staged_entry,
                                                                     switch_blocked=self.server.strategy.switch_blocked,
                                                                     checks=self.server.strategy.checks,
                                                                     checked_at=self.server.strategy.checked_at,
@@ -3805,7 +4012,8 @@ def recent_orders(limit=50, *, query=''):
             seen.add(key)
             response = payload.get('response', {})
             executed_at = response.get('updateTime') if (response.get('status') == 'FILLED' or
-                (strategy_limit_entry(intent) and Decimal(response.get('executedQty') or '0') > 0)) else None
+                ((strategy_limit_entry(intent) or (intent.get('decision') or {}).get('stage'))
+                 and Decimal(response.get('executedQty') or '0') > 0)) else None
             is_close = intent.get('reduce_only')
             exchange_id = response.get('orderId')
             if is_close and exchange_id is not None:
@@ -3819,6 +4027,7 @@ def recent_orders(limit=50, *, query=''):
                     del orders[previous_key]
                 closes[exchange_key] = (key, priority)
             orders[key] = dict(intent, time=timestamp, filled=payload.get('filled_quote') or response.get('cumQuote'),
+                               avg_price=response.get('avgPrice'),
                                entry_value=payload.get('entry_value'),
                                entry_price=payload.get('entry_price'), exit_price=payload.get('exit_price'),
                                opened=(payload.get('opened_at') or intent.get('opened') if is_close
@@ -3937,6 +4146,7 @@ def reconcile_demo_orders(*, cancel_entries=False):
                 code = None
             age = int(time.time()*1000) - order['time']
             if (error.code != 400 or code != -2013 or not strategy_limit_entry(order)
+                    or (order.get('decision') or {}).get('stage')
                     or order['status'] not in {'待确认', '待核对'}
                     or not 60000 <= age < 3*24*HOUR):
                 pending.append(order)
@@ -3985,7 +4195,8 @@ def reconcile_demo_orders(*, cancel_entries=False):
             if status == order['status'] and response['executedQty'] == order.get('executed_qty'):
                 continue
         kind = 'demo_order_response'
-        if order.get('reduce_only') and order.get('opening_id') is not None and status == 'FILLED':
+        if (order.get('reduce_only') and order.get('opening_id') is not None
+                and status in DEMO_ORDER_TERMINAL and Decimal(response['executedQty']) > 0):
             kind = 'demo_order_settlement_pending'
         journal(kind, dict(intent=order, response=response, outcome=outcome, cancel_requested=cancel_requested))
     return pending
@@ -4055,7 +4266,7 @@ def demo_trade_window(symbol, start, end):
     return demo_trade_window(symbol, start, middle) + demo_trade_window(symbol, middle+1, end)
 
 
-def find_demo_position_fills(order, now):
+def find_demo_position_fills(order, now, additions=(), *, include_partial=False):
     symbol = order['symbol']
     opening_id = str(order['exchange_order_id'])
     expected = Decimal(order['executed_qty'])
@@ -4064,9 +4275,22 @@ def find_demo_position_fills(order, now):
             or any(str(fill['orderId']) != opening_id or fill['side'] != order['side']
                    or fill.get('positionSide', 'BOTH') != 'BOTH' for fill in opening)):
         return None
+    opening_ids = {opening_id}
+    for addition in additions:
+        exchange_id = str(addition['exchange_order_id'])
+        fills = demo_signed('/fapi/v1/userTrades', symbol=symbol, orderId=exchange_id, limit=1000)
+        quantity = Decimal(addition['executed_qty'])
+        if (not fills or len(fills) >= 1000 or sum(Decimal(fill['qty']) for fill in fills) != quantity
+                or any(str(fill['orderId']) != exchange_id or fill['side'] != order['side']
+                       or fill.get('positionSide', 'BOTH') != 'BOTH' for fill in fills)):
+            return None
+        opening_ids.add(exchange_id)
+        opening.extend(fills)
+        expected += quantity
     first = min(int(fill['time']) for fill in opening)
     opening_key = min((int(fill['time']), int(fill['id'])) for fill in opening)
     remaining = Decimal(0)
+    seen_opening = []
     exits = []
     cursor = first
     while cursor <= now:
@@ -4075,23 +4299,29 @@ def find_demo_position_fills(order, now):
             if (int(fill['time']), int(fill['id'])) < opening_key or fill.get('positionSide', 'BOTH') != 'BOTH':
                 continue
             quantity = Decimal(fill['qty'])
-            if str(fill['orderId']) == opening_id:
+            if str(fill['orderId']) in opening_ids:
                 remaining += quantity
+                seen_opening.append(fill)
             elif fill['side'] != ('SELL' if order['side'] == 'BUY' else 'BUY') or quantity > remaining:
                 return None
             else:
                 exits.append(fill)
                 remaining -= quantity
                 if not remaining:
-                    if sum(Decimal(exit_fill['qty']) for exit_fill in exits) != expected:
-                        return None
-                    return opening, exits
+                    closed = sum(Decimal(exit_fill['qty']) for exit_fill in exits)
+                    if closed == expected:
+                        return opening, exits
+                    if include_partial and closed == Decimal(order['executed_qty']) and all(
+                            str(fill['orderId']) == opening_id for fill in seen_opening):
+                        return seen_opening, exits
+                    return None
         cursor = end+1
-    return None
+    return (opening, exits) if include_partial and exits else None
 
 
-def sync_external_demo_close(order, known, now):
-    fills = find_demo_position_fills(order, now)
+def sync_external_demo_close(order, known, now, additions=()):
+    staged = bool((order.get('decision') or {}).get('staged'))
+    fills = find_demo_position_fills(order, now, additions, include_partial=staged)
     if fills is None:
         return False
     opening, exits = fills
@@ -4100,6 +4330,18 @@ def sync_external_demo_close(order, known, now):
         groups.setdefault(str(fill['orderId']), []).append(fill)
     missing = {key: group for key, group in groups.items()
                if known.get((order['symbol'], key), {}).get('pnl') is None}
+    staged_statuses = {}
+    if staged:
+        for close_id, group in missing.items():
+            record = known.get((order['symbol'], close_id))
+            if record is None:
+                record = demo_signed('/fapi/v1/order', symbol=order['symbol'], orderId=close_id)
+                status, executed = record['status'], record['executedQty']
+            else:
+                status, executed = record['status'], record['executed_qty']
+            if status not in DEMO_ORDER_TERMINAL or sum(Decimal(fill['qty']) for fill in group) != Decimal(executed):
+                return False
+            staged_statuses[close_id] = status
     if not missing:
         return True
     if any(fill['commissionAsset'] != 'USDT' for fill in opening + exits):
@@ -4118,7 +4360,9 @@ def sync_external_demo_close(order, known, now):
         exposed = (sum(Decimal(fill['qty']) for fill in opening if int(fill['time']) < at)
                    - sum(Decimal(fill['qty']) for fill in exits if int(fill['time']) <= at))
         eligible_qty = sum(Decimal(fill['qty']) for fill in eligible)
-        if exposed != eligible_qty or not exposed:
+        if not exposed or (not staged and exposed != eligible_qty) or eligible_qty > exposed:
+            if staged and not eligible:
+                continue
             raise ValueError('资金费时点仓位待核对')
         for fill in eligible:
             funded_exits.setdefault(str(fill['orderId']), []).append(
@@ -4131,9 +4375,9 @@ def sync_external_demo_close(order, known, now):
         closed_at = max(int(fill['time']) for fill in group)
         quantity = sum(Decimal(fill['qty']) for fill in group)
         share = quantity/opening_qty
-        entry_value = opening_value*share
         exit_value = sum(trade_quote(fill) for fill in group)
         gross = sum(Decimal(fill['realizedPnl']) for fill in group)
+        entry_value = exit_value - (gross if order['side'] == 'BUY' else -gross) if staged else opening_value*share
         fees = share*sum(Decimal(fill['commission']) for fill in opening) + sum(Decimal(fill['commission']) for fill in group)
         funding = sum((value for _, value in funded_exits.get(close_id, [])), Decimal(0))
         net = gross-fees+funding
@@ -4145,13 +4389,17 @@ def sync_external_demo_close(order, known, now):
                              - share*sum(Decimal(fill['commission']) for fill in opening if int(fill['time']) > since)
                              + sum(value for at, value in funded_exits.get(close_id, []) if at > since))
         previous = known.get((symbol, close_id))
-        client_id = f'demo-external-{symbol}-{close_id}'
         decision = ((previous or {}).get('decision') or
                     dict(reason='币安模拟盘外部平仓', detail='按交易所成交与资金费对账'))
-        intent = dict(clientOrderId=client_id, symbol=symbol, side=group[0]['side'], quantity=str(quantity),
-                      reduce_only=True, opening_id=order['exchange_order_id'], external_close=True,
-                      strategy=order.get('strategy'), leverage=order.get('leverage'), decision=decision)
-        response = dict(orderId=int(close_id), status='FILLED', executedQty=str(quantity), updateTime=closed_at)
+        intent = dict(clientOrderId=f'demo-external-{symbol}-{close_id}', symbol=symbol, side=group[0]['side'],
+                      quantity=str(quantity), reduce_only=True, opening_id=order['exchange_order_id'],
+                      external_close=True, strategy=order.get('strategy'), leverage=order.get('leverage'),
+                      decision=decision)
+        if staged and previous:
+            intent['source_client_order_id'] = previous.get('source_client_order_id', previous['clientOrderId'])
+            intent['limit_price'] = previous.get('limit_price')
+        response = dict(orderId=int(close_id), status=staged_statuses.get(close_id, 'FILLED'),
+                        executedQty=str(quantity), updateTime=closed_at)
         journal('demo_order_settled', dict(intent=intent, response=response, net_pnl=str(net),
                 net_roi=float(net/entry_value), fees=str(fees), funding=str(funding), return_pnl=return_pnl,
                 entry_value=str(entry_value), filled_quote=str(exit_value), entry_price=str(entry_value/quantity),
@@ -4175,19 +4423,27 @@ def external_demo_close_watch():
                         settled[key] = settled.get(key, Decimal(0)) + Decimal(order['executed_qty'])
             due = []
             for order in orders:
-                if (order.get('reduce_only') or order['status'] not in DEMO_ORDER_TERMINAL or not has_order_fill(order)
+                if (order.get('reduce_only') or (order.get('decision') or {}).get('stage') == 'add'
+                        or order['status'] not in DEMO_ORDER_TERMINAL or not has_order_fill(order)
                         or not order.get('opened') or order['exchange_order_id'] is None
                         or int(order['opened']) < now-89*24*HOUR):
                     continue
                 key = (order['symbol'], str(order['exchange_order_id']))
                 deadline = next_check.get(key, 0)
-                if deadline <= now and settled.get(key, 0) < Decimal(order['executed_qty']):
-                    due.append((deadline, order, key))
-            for _, order, key in sorted(due, key=lambda item: (item[0], -int(item[1]['opened'])))[:4]:
+                additions = []
+                if (order.get('decision') or {}).get('staged'):
+                    stages = staged_position_orders(orders, *key)
+                    if any(stage['status'] in DEMO_ORDER_PENDING for stage in stages):
+                        continue
+                    additions = [stage for stage in stages if not stage.get('reduce_only') and has_order_fill(stage)]
+                total = Decimal(order['executed_qty']) + sum(Decimal(a['executed_qty']) for a in additions)
+                if deadline <= now and settled.get(key, 0) < total:
+                    due.append((deadline, order, key, additions))
+            for _, order, key, additions in sorted(due, key=lambda item: (item[0], -int(item[1]['opened'])))[:4]:
                 age = now-int(order['opened'])
                 next_check[key] = now + (15_000 if age < 2*24*HOUR else 5*60_000)
                 try:
-                    sync_external_demo_close(order, known, now)
+                    sync_external_demo_close(order, known, now, additions)
                 except (OSError, ValueError, KeyError, TypeError, ArithmeticError, sqlite3.Error) as error:
                     print(f'外部平仓 {key[0]} {key[1]} 待核对：{error}', flush=True)
         except (OSError, ValueError, KeyError, ArithmeticError, sqlite3.Error) as error:
@@ -4195,18 +4451,26 @@ def external_demo_close_watch():
         external_demo_close_wake.wait(5)
 
 
-def position_breakeven_costs(symbol, opening_id, amount, cache):
+def position_breakeven_costs(symbol, opening_id, amount, cache, *, staged=False):
     cached = cache.get(symbol)
     if cached and time.monotonic() < cached[0]:
         return cached[1]
     taker_rate = demo_taker_fee_rate(symbol)
     if opening_id is None or taker_rate is None or taker_rate >= 1:
         raise ValueError('开仓订单或平仓费率未确认')
-    fills = demo_signed('/fapi/v1/userTrades', symbol=symbol, orderId=opening_id, limit=1000)
-    if (not fills or len(fills) >= 1000 or sum(Decimal(fill['qty']) for fill in fills) != abs(amount)
-            or any(str(fill['orderId']) != str(opening_id) or fill['side'] != entry_side(amount)
-                   or fill['commissionAsset'] != 'USDT' for fill in fills)):
-        raise ValueError('开仓成交或手续费未核对')
+    stages = staged_position_orders(recent_orders(limit=None, query=symbol), symbol, opening_id) if staged else []
+    opening_ids = [str(opening_id)] + [str(o['exchange_order_id']) for o in stages
+                                     if not o.get('reduce_only') and has_order_fill(o)]
+    fills = []
+    for key in opening_ids:
+        rows = demo_signed('/fapi/v1/userTrades', symbol=symbol, orderId=key, limit=1000)
+        if (not rows or len(rows) >= 1000 or any(str(fill['orderId']) != key or fill['side'] != entry_side(amount)
+                                                or fill['commissionAsset'] != 'USDT' for fill in rows)):
+            raise ValueError('开仓成交或手续费未核对')
+        fills.extend(rows)
+    trimmed = sum((Decimal(o.get('executed_qty') or 0) for o in stages if o.get('reduce_only')), Decimal(0))
+    if sum(Decimal(fill['qty']) for fill in fills) != abs(amount) + trimmed:
+        raise ValueError('开仓成交数量待核对')
     first = min(int(fill['time']) for fill in fills)
     now = demo_now_ms()
     if not 0 <= now-first < 89*24*HOUR:
@@ -4215,8 +4479,28 @@ def position_breakeven_costs(symbol, opening_id, amount, cache):
                        startTime=first+1, endTime=now, limit=1000) if now > first else []
     if len(rows) >= 1000 or any(row['asset'] != 'USDT' or not first < int(row['time']) <= now for row in rows):
         raise ValueError('资金费明细未核对')
-    open_fee = sum((Decimal(fill['commission']) for fill in fills), Decimal(0))
-    funding = sum((Decimal(row['income']) for row in rows), Decimal(0))
+    open_fee = sum((Decimal(fill['commission']) for fill in fills), Decimal(0)) * abs(amount)/(abs(amount)+trimmed)
+    if staged:
+        reductions = []
+        for order in stages:
+            if not order.get('reduce_only') or not has_order_fill(order):
+                continue
+            key = str(order['exchange_order_id'])
+            trades = demo_signed('/fapi/v1/userTrades', symbol=symbol, orderId=key, limit=1000)
+            if len(trades) >= 1000 or sum(Decimal(fill['qty']) for fill in trades) != Decimal(order['executed_qty']):
+                raise ValueError('减仓成交数量待核对')
+            reductions.extend(trades)
+        funding = Decimal(0)
+        for row in rows:
+            at = int(row['time'])
+            exposed = (sum(Decimal(fill['qty']) for fill in fills if int(fill['time']) < at)
+                       - sum(Decimal(fill['qty']) for fill in reductions if int(fill['time']) <= at))
+            if exposed <= 0:
+                raise ValueError('资金费时点仓位待核对')
+            share = min(abs(amount), exposed) / exposed
+            funding += Decimal(row['income']) * share
+    else:
+        funding = sum((Decimal(row['income']) for row in rows), Decimal(0))
     if not open_fee.is_finite() or not funding.is_finite():
         raise ValueError('费用或资金费无效')
     costs = (open_fee, taker_rate, funding)
@@ -4273,6 +4557,16 @@ def retry_pending_settlements():
                 kind == 'demo_order_settled' and not event.get('exit_price') and event['intent'].get('opening_id')
             ):
                 pending.append(event)
+    if not pending:
+        return
+    records = recent_orders(limit=None)
+    staged_keys = {(order['symbol'], str(order['exchange_order_id'])) for order in records
+                   if (order.get('decision') or {}).get('staged')}
+    settled_keys = {(order['symbol'], str(order['exchange_order_id'])) for order in records
+                    if order.get('reduce_only') and order.get('pnl') is not None}
+    pending = [event for event in pending
+               if (event['intent']['symbol'], str(event['intent'].get('opening_id'))) not in staged_keys
+               and (event['intent']['symbol'], str(event['response'].get('orderId'))) not in settled_keys]
     for event in pending[-3:]:
         intent, response = event['intent'], event['response']
         try:
@@ -4282,7 +4576,16 @@ def retry_pending_settlements():
         journal('demo_order_settled', dict(intent=intent, response=response, **settlement))
 
 
+def staged_opening(symbol, opening_id):
+    return any(r['symbol'] == symbol and str(r['exchange_order_id']) == str(opening_id)
+               and not r.get('reduce_only') and (r.get('decision') or {}).get('staged')
+               for r in recent_orders(limit=None, query=symbol))
+
+
 def settle_demo_trade(symbol, opening_id, order, opened=None):
+    if staged_opening(symbol, opening_id):
+        external_demo_close_wake.set()
+        raise ValueError('等待分批仓位成交与资金费对账')
     if opened and order.get('updateTime') and int(order['updateTime'])-int(opened) < 6*86400000:
         fills = demo_signed('/fapi/v1/userTrades', symbol=symbol, startTime=max(0, int(opened)-60000),
                             endTime=int(order['updateTime'])+1000, limit=1000)
@@ -4399,7 +4702,7 @@ def submit_demo_limit_entry(symbol, amount, price, leverage, strategy, stop_loss
     return dict(order, outcome=outcome)
 
 
-def submit_demo_order(symbol, side, quantity, *, notional=None, leverage=None, reduce_only=False, opened=None, opening_id=None, strategy=None, stop_loss=None, price_tick=None, decision=None, defer_confirmation=False):
+def submit_demo_order(symbol, side, quantity, *, notional=None, leverage=None, reduce_only=False, opened=None, opening_id=None, strategy=None, stop_loss=None, price_tick=None, decision=None, defer_confirmation=False, ioc_price=None):
     if side not in {'BUY', 'SELL'} or not symbol.isascii() or not symbol.isalnum():
         raise ValueError('请输入合约代码和 BUY 或 SELL')
     try:
@@ -4412,16 +4715,24 @@ def submit_demo_order(symbol, side, quantity, *, notional=None, leverage=None, r
     intent = dict(clientOrderId=order_id, symbol=symbol, side=side, quantity=str(amount),
                   notional=notional, leverage=leverage, opened=opened, reduce_only=reduce_only, opening_id=opening_id, strategy=strategy,
                   stop_loss=stop_loss, price_tick=price_tick, decision=decision)
+    if ioc_price is not None:
+        intent.update(time_in_force='IOC', limit_price=format(ioc_price, 'f'))
     journal('demo_order_intent', intent)
     print(f'币安模拟盘 · {symbol} {side} {amount} · 客户端订单号 {order_id}', flush=True)
     try:
+        execution = (dict(type='MARKET') if ioc_price is None else
+                     dict(type='LIMIT', timeInForce='IOC', price=format(ioc_price, 'f'), positionSide='BOTH'))
         order = demo_signed('/fapi/v1/order', method='POST', symbol=symbol,
-                           side=side, type='MARKET', quantity=str(amount),
+                           side=side, quantity=format(amount, 'f'),
                            newClientOrderId=order_id, newOrderRespType='RESULT',
-                           **({'reduceOnly': 'true'} if reduce_only else {}))
+                           **execution, **({'reduceOnly': 'true'} if reduce_only else {}))
+        if ioc_price is not None and not valid_demo_order_response(intent, order):
+            journal('demo_order_unknown', dict(intent, error='分批委托回报待核对'))
+            return dict(status='待核对', clientOrderId=order_id)
         order.setdefault('side', side)
         journal('demo_order_response', dict(intent=intent, response=order))
-        if reduce_only and order.get('status') == 'FILLED' and opening_id is not None:
+        if (reduce_only and order.get('status') in DEMO_ORDER_TERMINAL and opening_id is not None
+                and Decimal(order.get('executedQty') or 0) > 0):
             try:
                 settlement = settle_demo_trade(symbol, opening_id, order, opened)
             except (OSError, ValueError, KeyError, ArithmeticError) as error:

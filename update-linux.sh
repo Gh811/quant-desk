@@ -24,19 +24,33 @@ cleanup() {
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 
-if command -v git >/dev/null 2>&1; then
-    remote=$(git ls-remote --exit-code "$repo" refs/heads/main | cut -f1)
+use_git=0
+if command -v git >/dev/null 2>&1 && git ls-remote --exit-code "$repo" refs/heads/main > "$stage/refs"; then
+    remote=$(cut -f1 "$stage/refs")
+    use_git=1
 else
-    curl -fsS --connect-timeout 10 --max-time 25 \
-        https://api.github.com/repos/Gh811/quant-desk/commits/main > "$stage/head.json"
-    remote=$(/usr/bin/python3.11 -c 'import json,sys; print(json.load(sys.stdin)["sha"])' < "$stage/head.json")
+    # Public Git transport avoids the unauthenticated REST API rate limit.
+    if ! curl -fsS --connect-timeout 10 --max-time 25 \
+        "$repo/info/refs?service=git-upload-pack" > "$stage/refs"; then
+        echo '无法读取 GitHub main 引用，请检查服务器到 github.com 的连接。' >&2
+        exit 1
+    fi
+    remote=$(/usr/bin/python3.11 -c '
+import re
+import sys
+refs = re.findall(rb"([0-9a-f]{40}) refs/heads/main(?:\x00|\n)", sys.stdin.buffer.read())
+if len(refs) != 1:
+    sys.exit("GitHub 返回的分支引用无法核验")
+print(refs[0].decode("ascii"))
+' < "$stage/refs")
 fi
 printf '%s\n' "$remote" | grep -Eq '^[0-9a-f]{40}$'
 if [ -f "$app/.deployed-commit" ] && [ "$(cat "$app/.deployed-commit")" = "$remote" ]; then
+    chmod 0644 "$app/.deployed-commit"
     exit 0
 fi
 
-if command -v git >/dev/null 2>&1; then
+if [ "$use_git" = 1 ]; then
     git clone --quiet --depth 1 --single-branch --branch main "$repo" "$stage/repo"
     revision=$(git -C "$stage/repo" rev-parse HEAD)
 else
@@ -77,5 +91,6 @@ if ! cmp -s "$app/app.py" "$stage/repo/app.py" || ! cmp -s "$app/index.html" "$s
     restore=0
 fi
 printf '%s\n' "$revision" > "$stage/revision"
+chmod 0644 "$stage/revision"
 mv -f "$stage/revision" "$app/.deployed-commit"
 printf '已同步 GitHub main：%s\n' "$revision"
