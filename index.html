@@ -1893,6 +1893,13 @@ button[aria-pressed=true],button:hover,.link:hover{background:#234264;border-col
 @keyframes travel{to{transform:translateX(28px)}}@keyframes down{to{transform:translateY(28px)}}
 @media(max-width:680px){.module-spacer{display:none}.module-row,.module-row.reverse{flex-direction:column;gap:36px}.module-row li .edge{top:100%;left:50%;right:auto;width:2px;height:36px}.module-row li .edge::after{left:-3px;top:0;animation:down 1.45s linear infinite}}
 @media(prefers-reduced-motion:reduce){.edge::after{animation:none!important}}
+.factor-inputs{position:relative;margin-bottom:0;gap:14px}
+.factor-inputs li .edge,.factor-inputs li:last-child .edge{top:100%;left:50%;width:2px;height:18px}
+.factor-inputs li .edge::after,.factor-inputs li:last-child .edge::after{left:-3px;top:0;animation:down 1.45s linear infinite}
+.factor-inputs::after{content:"";position:absolute;top:calc(100% + 17px);left:16.7%;right:16.7%;height:18px;border-top:1px solid #75bbe9;pointer-events:none}
+.module-row+.module-row{position:relative;padding-top:16px}
+.module-row+.module-row::before{content:"";position:absolute;left:16.7%;top:-18px;width:2px;height:34px;background:#75bbe9}
+@media(max-width:680px){.factor-inputs{flex-direction:row}.factor-inputs button{font-size:12px;padding:6px}.module-row+.module-row::before{left:50%}}
 .note,small{color:#b1c4da}.detail,.research{padding:18px 0;border-bottom:1px solid #314359}.scroller{overflow:auto}table{width:100%;border-collapse:collapse;text-align:left}th,td{padding:6px 10px;border-bottom:1px solid #314359;white-space:nowrap}
 </style>
 <main>
@@ -1905,6 +1912,7 @@ button[aria-pressed=true],button:hover,.link:hover{background:#234264;border-col
 <p>趋势跟随研究为用历史价格方向过滤信号提供依据。Moskowitz、Ooi 和 Pedersen 验证的是月尺度动量，盘中突破与回踩仍需用本市场的历史数据检验。<br><a href="https://doi.org/10.1016/j.jfineco.2011.11.003">Time Series Momentum · Journal of Financial Economics</a> · <a href="https://www.aqr.com/insights/research/journal-article/a-century-of-evidence-on-trend-following-investing">AQR 长周期趋势跟随研究</a></p>
 <p>回放按已收盘的 K 线生成信号，以分钟级行情模拟执行。成交模型、手续费和滑点可分别配置。<br><a href="https://www.freqtrade.io/en/latest/lookahead-analysis/">Freqtrade · 未来数据检查</a> · <a href="https://www.quantconnect.com/docs/v2/writing-algorithms/live-trading/trading-and-orders">QuantConnect LEAN · 成交与成本模型</a></p>
 </section>
+<section class="research"><h2>42 天共享账户对照</h2><p>2026/09/20 08:00 至 11/01 08:00（北京时间）。17 个标的共享 10,000 USDT。零滑点，双边各 5 bp 手续费，计入资金费。动量回撤与布林带区间回归为离线研究。</p><div class="scroller"><table><thead><tr><th>策略</th><th>成交笔数</th><th>胜率</th><th>平均盈亏比</th><th>净盈亏 USDT</th><th>最大回撤</th></tr></thead><tbody><tr><td>多周期动量回撤</td><td>1248</td><td>33.8%</td><td>1.04</td><td>−4,175.37</td><td>41.90%</td></tr><tr><td>5 分钟双向</td><td>850</td><td>31.5%</td><td>1.10</td><td>−3,784.54</td><td>38.93%</td></tr><tr><td>1 小时双向</td><td>234</td><td>49.1%</td><td>0.97</td><td>−270.49</td><td>13.08%</td></tr></tbody></table></div></section>
 <section class="research" id="snapshot">
 <h2>历史回放 · 17 个标的</h2>
 <p class="note">北京时间 2026/10/03 09:00 至 2026/11/01 08:00。每个标的独立使用 10,000 USDT，两边各收 5 bp，计入资金费，滑点为 0。净盈亏为独立结果加总。</p>
@@ -1917,6 +1925,8 @@ button[aria-pressed=true],button:hover,.link:hover{background:#234264;border-col
 </main>
 <script>
 const strategies = {
+  reversion: ['布林带区间回归 · 研究','5m / 15m'],
+  momentum: ['多周期动量回撤 · 研究','5m / 1h'],
   fast: ['5 分钟双向','5m / 15m / 1h','5 分钟突破或回踩，15 分钟须确认趋势。美股另要求 1 小时同向。波动突增时等待突破后的回踩。','5× 杠杆，最多 5 个仓位。按止损距离和交易成本计算风险仓位。','根据结构和波动设置止损。持仓期间复评趋势并调整保护单。'],
   continuation: ['突破延续研究','5m / 15m / 1h','保留 5 分钟基线。在高波动且无回踩时，新增连续两根 K 线守住突破位且收盘继续推进的机会。','沿用 5 分钟回放的仓位计算。','沿用基线的结构止损和退出规则。'],
   intraday: ['15 分钟双向','15m / 1h / 4h','15 分钟寻找突破与回踩，1 小时确认方向，4 小时反向时拒绝。','按止损距离、成本和可用保证金计算名义仓位。','跟踪止损并检查最长 4 小时的持仓时间。'],
@@ -1925,24 +1935,32 @@ const strategies = {
 };
 const layouts = {
   fast: [
-    [['多周期收盘行情',0],['5m 突破 / 回踩',2],['高波动回踩过滤','波动突增时，只接受确认的回踩或反抽。'],['15m / 1h 方向确认','15 分钟须同向，1 小时不能反向，美股须同向。']],
-    [['5× 风险仓位',4],['结构止损 / 止盈',5],['持仓趋势复评','持续以 5 分钟收盘复评入场结构；趋势走弱时收紧保护线。'],['保护单确认','币安模拟盘核对保护单和成交状态。']]
+    [['多周期趋势','5m、15m、1h 通过收盘价、12 根和 48 根均线判定方向。美股要求 1h 同向。'],['ATR 与价格结构','14 根真实波幅均值除以收盘价。突破或回踩触发，波动突增时要求回踩确认。'],['量价确认','相对成交量以此前 20 根中位数为基准。突破至少 1.0×、回踩至少 0.7×；同向主动成交至少 45%。']],
+    [['入场判定',2],['风险仓位',4],['结构止损与持仓复评',5]]
   ],
   continuation: [
-    [['同一批 5m / 15m / 1h 数据',0],['回踩与突破延续分支',2],['原版方向与成本校验','沿用 5 分钟基线的方向过滤、成交验证及成本门槛。']],
-    [['分钟级成交回放',4],['基线退出规则',5],['与原版对照','在同一标的、区间和费率下比较成交次数、净收益、胜率与回撤。']]
+    [['两根收盘确认',2],['多周期方向','保留 15m 与 1h 方向过滤。'],['量价与 ATR','沿用基线成交量、主动成交方向、ATR 和追价校验。']],
+    [['合并回踩与延续信号','把新信号加入现有回踩规则做历史对照。'],['风险仓位',4],['基线退出',5]]
   ],
   intraday: [
-    [['15m 突破 / 回踩',2],['1h 同向确认','1 小时趋势须确认开仓方向。'],['4h 反向过滤','4 小时趋势与信号相反时跳过。']],
-    [['手续费 / 点差与仓位',4],['跟踪止损',5],['4 小时持仓上限','达到最长持仓时触发退出。']]
+    [['15m 价格结构',2],['1h 与 4h 均线','12 / 48 根均线判断趋势。1h 同向，4h 不能反向。'],['成交量与 ATR','突破相对量至少 1.2×，回踩至少 0.8×，并检查 ATR 与主动成交。']],
+    [['入场与成本校验',4],['跟踪止损',5],['最长 4 小时','到期退出。']]
   ],
   swing: [
-    [['1h 突破 / 回踩',2],['4h 趋势确认','4 小时趋势须确认开仓方向。'],['日线方向过滤','日线反向时跳过。']],
-    [['波段风险仓位',4],['跟踪止损与 48 小时退出',5]]
+    [['1h 突破与回踩',2],['4h 与日线均线','4h 须同向，日线不能反向。每个趋势使用收盘价及 12 / 48 根均线。'],['成交量与 ATR','以 20 根相对成交量和 14 根 ATR 检查推进行情。']],
+    [['波段风险仓位',4],['跟踪止损与到期退出',5]]
   ],
   us_open: [
-    [['美股合约筛选','只允许通过美股合约筛选的标的进入扫描。'],['15m 信号',2],['1h / 4h 方向检查','1 小时确认方向，4 小时反向时跳过。']],
-    [['美股风险仓位',4],['跟踪止损',5],['90 分钟持仓上限','达到最长持仓时触发退出。']]
+    [['美股标的范围','只扫描美股标的。'],['15m 突破或回踩',2],['1h / 4h 趋势与量价','1h 同向，4h 不能反向。并校验相对成交量、主动成交与 ATR。']],
+    [['美股风险仓位',4],['跟踪止损与到期退出',5]]
+  ],
+  reversion: [
+    [['布林带 20 / 2','基于触发前的 20 根收盘价计算均值和两倍总体标准差。先在带外收盘，再收回带内。'],['15m 趋势效率','净价格变化绝对值除以逐根变化绝对值之和，上限 0.35。'],['ATR 与两根极值','14 根 ATR 限制波动，两根信号 K 线的极值参与结构止损。']],
+    [['中轨目标','预计回归空间至少达到 1.1 倍初始止损，并至少覆盖 3 倍预估交易成本。'],['风险仓位与超时','按止损距离配仓，45 分钟退出。']]
+  ],
+  momentum: [
+    [['12 小时价格动量','用已收盘 1h K 线计算过去 12 小时价格变化，收盘还须位于 24 根均线的同向一侧。'],['5m 回撤与重启','前一根收盘回到此前 20 根均线的另一侧，当前收盘突破前一根高点或低点并回到均线同侧。'],['量价与波动','当前成交量达到前序中位数，同向主动成交至少 52%，并用 ATR 约束波动。']],
+    [['信号汇合','趋势、结构、量价和波动共同确认后才生成入场信号。'],['仓位与成本','按初始止损距离配仓，研究回放采用共享资金和组合仓位上限。'],['退出','2R 止盈、结构止损或 90 分钟到期。']]
   ]
 };
 const colors = ['#538fff','#3ebcde','#4dc9ba','#f89751','#f0bd58','#f7839f','#9f9aff'];
@@ -1957,7 +1975,9 @@ const button = (label, pressed, action) => {
 };
 function render() {
   const [name, frames, entry, size, risk] = strategies[active];
-  const mode = active === 'continuation' ? 'fast' : active;
+  const mode = ['continuation','reversion','momentum'].includes(active) ? 'fast' : active;
+  const researchOnly = ['reversion','momentum'].includes(active);
+  byId('backtest').hidden = researchOnly;
   byId('backtest').href = './backtest?' + new URLSearchParams({mode,days:'all'});
   const details = [
     '币安合约成交 K 线、标记价格与历史资金费。信号周期 ' + frames + '。',
@@ -1984,13 +2004,7 @@ function render() {
   byId('flow').replaceChildren(...layouts[active].map((row, rowIndex) => {
     const lane = document.createElement('ol');
     lane.className = 'module-row';
-    if (rowIndex % 2) lane.classList.add('reverse');
-    for (let n = row.length; n < layouts[active][0].length; n++) {
-      const spacer = document.createElement('li');
-      spacer.className = 'module-spacer';
-      spacer.setAttribute('aria-hidden','true');
-      lane.append(spacer);
-    }
+    if (rowIndex === 0) lane.classList.add('factor-inputs');
     for (const [title] of row) {
       const stage = index++;
       const li = document.createElement('li');
@@ -2004,7 +2018,7 @@ function render() {
         edge.setAttribute('aria-hidden','true');
         li.append(edge);
       }
-      lane.insertBefore(li, lane.querySelector('.module-spacer'));
+      lane.append(li);
     }
     return lane;
   }));
