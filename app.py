@@ -55,10 +55,10 @@ def equity_kind(symbol, item):
     return 'unclassified' if item['contractType'] == 'TRADIFI_PERPETUAL' else None
 
 
-def trend_metrics(bars, direction=1):
+def trend_metrics(bars, direction=1, *, fast_period=12, slow_period=48):
     closes = [bar[4] for bar in bars]
-    fast = statistics.mean(closes[-12:])
-    slow = statistics.mean(closes[-48:])
+    fast = statistics.mean(closes[-fast_period:])
+    slow = statistics.mean(closes[-slow_period:])
     true_ranges = [
         max(high-low, abs(high-prev[4]), abs(low-prev[4]))
         for prev, (_, _, high, low, _) in zip(bars[-15:-1], bars[-14:])
@@ -70,21 +70,23 @@ def trend_metrics(bars, direction=1):
 STRATEGY_NAMES = {
     'swing': '中长线 · 1 小时双向突破与回踩',
     'intraday': '短线 · 15 分钟双向突破与回踩',
+    'scalp': '1 分钟双向 · 高频测试',
     'fast': '短线 · 5 分钟双向突破与回踩',
     'us_open': '美股双向测试',
 }
 SIGNAL_TIMEFRAMES = {
+    'scalp': ('1m', '5m', '15m'),
     'fast': ('5m', '15m', '1h'),
     'intraday': ('15m', '1h', '4h'),
     'swing': ('1h', '4h', '1d'),
     'us_open': ('15m', '1h', '4h'),
 }
-TIMEFRAME_MINUTES = {'5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440}
+TIMEFRAME_MINUTES = {'1m': 1, '5m': 5, '15m': 15, '1h': 60, '4h': 240, '1d': 1440}
 STRATEGY_INTERVALS = {mode: TIMEFRAME_MINUTES[frames[0]] * 60000 for mode, frames in SIGNAL_TIMEFRAMES.items()}
-STRATEGY_LOOKBACK = {'fast': 12, 'intraday': 20, 'swing': 24, 'us_open': 20}
-STRATEGY_MAX_ATR = {'fast': Decimal('.008'), 'intraday': Decimal('.012'), 'swing': Decimal('.02'),
+STRATEGY_LOOKBACK = {'scalp': 6, 'fast': 12, 'intraday': 20, 'swing': 24, 'us_open': 20}
+STRATEGY_MAX_ATR = {'scalp': Decimal('.008'), 'fast': Decimal('.008'), 'intraday': Decimal('.012'), 'swing': Decimal('.02'),
                     'us_open': Decimal('.015')}
-ENTRY_EQUITY_RISK = {'fast': Decimal('.005'), 'intraday': Decimal('.00325'), 'swing': Decimal('.0075'),
+ENTRY_EQUITY_RISK = {'scalp': Decimal('.002'), 'fast': Decimal('.005'), 'intraday': Decimal('.00325'), 'swing': Decimal('.0075'),
                      'us_open': Decimal('.002')}
 SHORT_COST_CAP = Decimal('.30')
 SHORT_REENTRY_COOLDOWN_BARS = 3
@@ -116,10 +118,11 @@ def entry_notional_budget(mode, equity, free_margin, leverage, slots, stop, cost
 def entry_signal(symbol, strategy, bars):
     lookback = STRATEGY_LOOKBACK[strategy]
     close = bars[-1][4]
+    fast_period, slow_period = (6, 20) if strategy == 'scalp' else (12, 48)
     direction = 1
-    trend, volatility = trend_metrics(bars)
+    trend, volatility = trend_metrics(bars, fast_period=fast_period, slow_period=slow_period)
     if not trend:
-        trend, _ = trend_metrics(bars, -1)
+        trend, _ = trend_metrics(bars, -1, fast_period=fast_period, slow_period=slow_period)
         if trend:
             direction = -1
     recent = bars[-lookback-1:-1]
@@ -134,8 +137,8 @@ def entry_signal(symbol, strategy, bars):
         reason = '突破做多' if direction > 0 else '跌破做空'
         score = direction*breakout
     else:
-        fast_average = statistics.mean(bar[4] for bar in bars[-12:])
-        previous_average = statistics.mean(bar[4] for bar in bars[-13:-1])
+        fast_average = statistics.mean(bar[4] for bar in bars[-fast_period:])
+        previous_average = statistics.mean(bar[4] for bar in bars[-fast_period-1:-1])
         previous = bars[-2]
         if direction > 0 and previous[3] <= previous_average and close > max(fast_average, previous[2]):
             reason, score = '回踩做多', close / max(fast_average, previous[2]) - 1
@@ -200,7 +203,11 @@ def evaluate_entry_signal(symbol, mode, now, read, *, us_equity=False):
     signal_at = candle + STRATEGY_INTERVALS[mode]
     direction = 1 if score > 0 else -1
     confirmation, _ = read(confirm, signal_at, 48)
-    if not trend_metrics(confirmation, direction)[0]:
+    confirmed = trend_metrics(confirmation, direction)[0]
+    if mode == 'scalp':
+        if not confirmed and trend_metrics(confirmation, -direction)[0]:
+            return candle, None, volatility, f'{reason} · {confirm} 趋势反向', {}
+    elif not confirmed:
         return candle, None, volatility, f'{reason} · {confirm} 趋势未确认', {}
     background, _ = read(backdrop, signal_at, 48)
     if trend_metrics(background, -direction)[0]:
@@ -223,6 +230,8 @@ def evaluate_entry_signal(symbol, mode, now, read, *, us_equity=False):
     volume_floor = 1.2 if reason in {'突破做多', '跌破做空'} else 0.8
     if mode == 'fast':
         volume_floor = 1.0 if reason in {'突破做多', '跌破做空'} else 0.7
+    if mode == 'scalp':
+        volume_floor = 0.65
     if relative_volume < volume_floor:
         return candle, None, volatility, f'{reason} · 相对成交量偏低（{relative_volume:.2f}×）', {}
     if side_flow < 0.45:
@@ -245,7 +254,7 @@ def evaluate_entry_signal(symbol, mode, now, read, *, us_equity=False):
         priority=int(aligned) + min(relative_volume, 2.0) / 2 + side_flow
                  + min(abs(score) / float(volatility), 0.75),
         close=Decimal(str(close)), boundary=Decimal(str(retest if retest is not None else close / (1 + score))),
-        detail=f'{confirm} 同向 · {backdrop}{" 同向" if aligned else " 中性"} · '
+        detail=f'{confirm}{" 同向" if confirmed else " 中性"} · {backdrop}{" 同向" if aligned else " 中性"} · '
                f'相对成交量 {relative_volume:.2f}× · 同向主动成交 {side_flow:.0%}')
 
 
@@ -657,9 +666,9 @@ DEMO_ORDER_TERMINAL = {'FILLED', 'CANCELED', 'EXPIRED', 'EXPIRED_IN_MATCH', 'REJ
 DEMO_CLOCK_TTL_NS = 60 * 1_000_000_000
 TRADIFI_QUOTE_MAX_AGE_MS = 30_000
 TRADIFI_QUOTE_MAX_DEVIATION = Decimal('.03')
-ENTRY_WAIT_SECONDS = {'fast': 60, 'intraday': 90, 'swing': 120, 'us_open': 60}
+ENTRY_WAIT_SECONDS = {'scalp': 8, 'fast': 60, 'intraday': 90, 'swing': 120, 'us_open': 60}
 ENTRY_QUOTE_MAX_AGE_MS = 5_000
-ENTRY_RETRY_COOLDOWN_SECONDS = {'fast': 20, 'intraday': 30, 'swing': 60, 'us_open': 30}
+ENTRY_RETRY_COOLDOWN_SECONDS = {'scalp': 8, 'fast': 20, 'intraday': 30, 'swing': 60, 'us_open': 30}
 demo_clock_lock = threading.Lock()
 demo_clock_sample = None
 catalog_locks = {venue: threading.Lock() for venue in ('Binance', DEMO_VENUE)}
@@ -2278,10 +2287,12 @@ class DemoStrategy:
         cost_control = short_term
         take_multiple = FAST_TREND_TARGET if fast_trend else 2
         cost_cap = SHORT_COST_CAP if cost_control else Decimal('.75')
-        cooldown_ms = SHORT_REENTRY_COOLDOWN_BARS * STRATEGY_INTERVALS[mode]
+        scan_interval = {'scalp': 5, 'fast': 10}.get(mode, 30)
+        cooldown_bars = 1 if mode == 'scalp' else SHORT_REENTRY_COOLDOWN_BARS
+        cooldown_ms = cooldown_bars * STRATEGY_INTERVALS[mode]
         reentry_at = {}
         max_positions = self.FAST_MAX_POSITIONS if mode == 'fast' else self.MAX_POSITIONS
-        max_hold_hours = {'intraday': 4, 'swing': 48, 'us_open': 1.5}.get(mode)
+        max_hold_hours = {'scalp': .5, 'intraday': 4, 'swing': 48, 'us_open': 1.5}.get(mode)
         holdings = {}
         entry_attempts = {}
         peaks = {}
@@ -2570,7 +2581,7 @@ class DemoStrategy:
                         and not self.entries_paused.is_set()
                         and (prepare_at_start or len(holdings) < max_positions)
                         and (not holdings or time.monotonic() >= next_entry_scan)):
-                    next_entry_scan = time.monotonic() + (3 if pending_symbols else 10 if mode == 'fast' else 30)
+                    next_entry_scan = time.monotonic() + (3 if pending_symbols else scan_interval)
                     self.status = '正在核对模拟盘普通挂单'
                     open_orders = demo_signed('/fapi/v1/openOrders')
                     occupied = positions.keys() | pending_entries | {order['symbol'] for order in open_orders
@@ -2832,7 +2843,7 @@ class DemoStrategy:
                         if time_in_force == 'GTX':
                             maker_reason = '吃单成本偏高' if cost > stop_loss / 2 else '对手盘一档数量不足'
                             detail += f' · {maker_reason}，改为限价挂单'
-                        if fast_trend:
+                        if fast_trend or mode == 'scalp':
                             try:
                                 mark, planned_stop = entry_stop_preflight(
                                     symbol, reference, now, price, stop_loss, tick, direction)
@@ -2965,7 +2976,7 @@ class DemoStrategy:
                 if holdings or protection_errors:
                     self.wake.wait(2)
                 else:
-                    self.wake.wait(3 if pending_symbols else 10 if mode == 'fast' else 30)
+                    self.wake.wait(3 if pending_symbols else scan_interval)
             self.status = '已停止' + (' · 仍有持仓，请手动管理' if holdings else '')
         except HTTPError as error:
             endpoint = urlsplit(error.url or '').path
