@@ -105,7 +105,7 @@ button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid 
 </style><main><aside><div class="desk-brand"><strong>Quant Desk</strong><small>币安合约模拟盘</small>
 <small id="desk-version" class="desk-version" hidden>GitHub <a target="_blank" rel="noopener"></a></small></div>
 <p id="strategy-status" role="status">正在读取后台策略状态…</p>
-<label for="strategy-mode">策略</label>
+<label for="strategy-mode">策略 · <a id="strategy-details" href="./strategies">查看详情</a></label>
 <select id="strategy-mode" disabled><option value="swing">1 小时双向</option><option value="intraday">15 分钟双向</option><option value="fast">5 分钟双向</option><option value="us_open">美股双向测试</option></select>
 <div class="desk-sizing">
   <label for="strategy-sizing">单笔仓位</label>
@@ -427,6 +427,7 @@ const selectedAssets = new Set(Array.isArray(preferences?.assets) ? preferences.
   defaultAssets.filter(asset => !['SAMSUNG','XAU','BNB','ZEC','INTC'].includes(asset)));
 for (const asset of watchedAssets) addAssetCheckbox(asset, selectedAssets.has(asset));
 const strategyMode = el('strategy-mode');
+el('strategy-details').onclick = event => { event.currentTarget.href = './strategies?mode=' + encodeURIComponent(strategyMode.value); };
 const strategySizing = el('strategy-sizing');
 const strategyNotional = el('strategy-notional');
 strategySizing.value = preferences?.sizing === 'fixed' ? 'fixed' : 'capital';
@@ -1540,13 +1541,15 @@ summary{cursor:pointer;font-weight:600}details .scroll{margin-top:10px}
 </style>
 <main>
 <a id="backtest-return" href="./">← 返回交易仪表盘</a>
-<h1 id="backtest-title">历史回测</h1>
+<h1 id="backtest-title">历史回测</h1><a href="./strategies">策略库 ↗</a>
 <div id="backtest-list">
 <form id="backtest">
   <label>行情来源<select name="source"><option value="live">币安实盘</option><option value="demo">币安模拟盘</option></select></label>
-  <label>区间<select name="days"><option value="1">最近 1 天</option><option value="7" selected>最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option><option value="60">最近 60 天</option><option value="90">最近 90 天</option><option value="180">最近 180 天</option><option value="365">最近 365 天</option><option value="days">自定义天数</option><option value="custom">自定义日期</option></select></label>
+  <label>区间<select name="days"><option value="1">最近 1 天</option><option value="7" selected>最近 7 天</option><option value="14">最近 14 天</option><option value="30">最近 30 天</option><option value="60">最近 60 天</option><option value="90">最近 90 天</option><option value="180">最近 180 天</option><option value="365">最近 365 天</option><option value="all">全部可用历史</option><option value="days">自定义天数</option><option value="custom">自定义日期</option></select></label>
   <label id="custom-days" hidden>最近天数<input type="number" name="day_count" min="1" step="1" value="90" disabled></label>
   <div id="custom-range" hidden><label>开始日期<input type="date" name="start"></label><label>结束日期<input type="date" name="end"></label></div>
+  <label>回测策略<select name="mode"><option value="fast">5 分钟双向</option><option value="intraday">15 分钟双向</option><option value="swing">1 小时双向</option><option value="us_open">美股双向测试</option><option value="all">全部策略</option></select></label>
+  <label><input type="checkbox" name="compare" checked> 加入 5 分钟突破延续对照</label>
   <fieldset class="backtest-assets"><legend>回测标的</legend>
     <input id="search-assets" type="search" aria-label="搜索标的" placeholder="搜索标的">
     <button type="button" id="select-assets">选中搜索结果</button>
@@ -1555,10 +1558,10 @@ summary{cursor:pointer;font-weight:600}details .scroll{margin-top:10px}
   <label>开仓成交模型<select name="execution"><option value="taker">吃单</option><option value="maker">只挂单</option></select></label>
   <label>挂单费率（bp）<input type="number" name="maker_bps" min="0" max="100" step="any" value="2" required></label>
   <label>吃单费率（bp）<input type="number" name="taker_bps" min="0" max="100" step="any" value="5" required></label>
-  <label>吃单滑点（bp/边）<input type="number" name="slippage_bps" min="0" max="100" step="any" value="1" required></label>
+  <label>吃单滑点（bp/边）<input type="number" name="slippage_bps" min="0" max="100" step="any" value="0" required></label>
   <button type="submit">开始回测</button>
 </form>
-<p id="status" role="status">当前 5 分钟双向策略 · 各标的以 10,000 USDT 独立回放 · 北京时间</p>
+<p id="status" role="status">各标的以 10,000 USDT 独立回放 · 北京时间</p>
 <div class="panel">
   <h2>回测记录</h2>
   <button type="button" id="cancel-backtests">取消全部回测</button>
@@ -1573,7 +1576,7 @@ summary{cursor:pointer;font-weight:600}details .scroll{margin-top:10px}
 <p id="detail-status" role="status" hidden></p>
 <div id="results"></div>
 <details><summary>数据与成交假设</summary>
-  <p>只运行当前 5 分钟双向策略。信号使用已收盘的 5 分钟、15 分钟和 1 小时 K 线，持仓复评及止盈止损使用分钟级行情。历史覆盖不足会缩短区间，结果页显示实际区间。区间内有数据缺口会单独标记该标的失败。</p>
+  <p>各策略使用已收盘的 K 线生成信号，止盈止损使用分钟级行情。全历史从所选策略所需行情的共同覆盖起点开始。历史覆盖不足会缩短区间，结果页显示实际区间。区间内有数据缺口会单独标记该标的失败。</p>
   <p>1 bp = 0.01%。费率与滑点为可调估算，按标的和账户填写。吃单按下一分钟开盘价加滑点。只挂单以该开盘价向被动方向偏移 1 bp，分钟成交价穿过挂单价才记成交，挂单成交不加滑点。挂单成交当分钟按保守口径检查止损，下一分钟开始检查止盈。平仓按吃单计费和滑点，另计历史资金费。盘口排队和部分成交未建模。</p>
 </details>
 </main>
@@ -1653,7 +1656,7 @@ function render(data) {
   for (const r of data.results) {
     const review = element('div');
     review.className = 'panel';
-    review.append(element('h2','交易分布'), table(['方向','笔数','净盈亏 USDT','胜率'],
+    review.append(element('h2',r.name+' · 交易分布'), table(['方向','笔数','净盈亏 USDT','胜率'],
       [[1,'做多'],[-1,'做空']].map(([direction,label]) => {
         const trades = r.trades.filter(trade => trade.direction === direction);
         return [label,trades.length,trades.reduce((sum,trade) => sum + trade.net,0),
@@ -1664,7 +1667,7 @@ function render(data) {
     }
     results.append(review);
     const details=element('details');
-    details.open = true;
+    details.open = false;
     details.append(element('summary',r.name+' · 成交明细（'+r.count+'）'));
     if (r.trades.length) {
       const headings = ['标的','入场','出场','方向','入场价','出场价','净盈亏 USDT','退出原因'];
@@ -1737,6 +1740,8 @@ const history = document.getElementById('history');
 const previous = document.getElementById('history-prev');
 const next = document.getElementById('history-next');
 const route = new URLSearchParams(location.search);
+if ([...form.elements.mode.options].some(option => option.value === route.get('mode'))) form.elements.mode.value = route.get('mode');
+if (route.get('days') === 'all') form.elements.days.value = 'all';
 const detailId = route.get('id');
 let page = Number(route.get('page')) || 1, requestId = 0, historySnapshot = '';
 async function refreshHistory() {
@@ -1846,6 +1851,9 @@ form.onsubmit = async event => {
     for (const field of ['execution','maker_bps','taker_bps','slippage_bps']) {
       params.set(field, form.elements[field].value);
     }
+    const mode = form.elements.mode.value;
+    for (const key of mode === 'all' ? ['fast','intraday','swing','us_open'] : [mode]) params.append('mode', key);
+    if (form.elements.compare.checked) params.set('compare', '1');
     for (const asset of assets) params.append('asset', asset);
     const data = await fetchData('./backtest/jobs?'+params, {
       method:'POST', headers:{'X-Quant-Demo':'strategy'}
@@ -1864,3 +1872,103 @@ form.onsubmit = async event => {
 };
 </script></html>
 
+
+<!-- strategies-page -->
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>策略库 · Quant Desk</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#10161f;color:#edf4ff;font:15px/1.65 system-ui,sans-serif}
+main{max-width:1120px;margin:auto;padding:32px 20px 56px}a{color:#88c9ff}header{display:flex;justify-content:space-between;align-items:start;gap:20px;flex-wrap:wrap}h1,h2,p{margin:0 0 10px}h1{font-size:32px}nav{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0 20px}
+button,.link{font:inherit;color:inherit;background:#172233;border:1px solid #385471;border-radius:8px;padding:8px 13px;cursor:pointer;text-decoration:none}
+button[aria-pressed=true],button:hover,.link:hover{background:#234264;border-color:#91d3ff}button:focus-visible,a:focus-visible{outline:2px solid #fff;outline-offset:4px}
+.board{border:1px solid #314359;border-radius:14px;padding:28px;background:radial-gradient(circle,#28374a 1px,transparent 1px) 0 0/22px 22px,#131c29}
+.flow{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));list-style:none;padding:0;margin:0;gap:22px 36px}
+.flow li{position:relative;min-width:0}.flow button{width:100%;min-height:64px;border-color:var(--signal);box-shadow:0 0 12px color-mix(in srgb,var(--signal) 26%,transparent);text-align:left;font-weight:650}
+.flow li:nth-child(5){grid-row:2;grid-column:4}.flow li:nth-child(6){grid-row:2;grid-column:3}.flow li:nth-child(7){grid-row:2;grid-column:2}
+.edge{position:absolute;top:50%;left:100%;width:36px;height:2px;background:var(--signal);pointer-events:none}.edge::after{content:"";position:absolute;top:-3px;left:0;width:8px;height:8px;border-radius:100%;background:var(--signal);box-shadow:0 0 12px var(--signal);animation:travel 1.45s linear infinite}
+.flow li:nth-child(4) .edge{top:100%;left:50%;width:2px;height:22px}.flow li:nth-child(4) .edge::after{left:-3px;top:0;animation:down 1.45s linear infinite}
+.flow li:nth-child(5) .edge,.flow li:nth-child(6) .edge{left:auto;right:100%}.flow li:nth-child(5) .edge::after,.flow li:nth-child(6) .edge::after{animation-direction:reverse}
+@keyframes travel{from{transform:translateX(0)}to{transform:translateX(28px)}}@keyframes down{from{transform:translateY(0)}to{transform:translateY(14px)}}
+#snapshot p{margin-top:10px}
+@media(prefers-reduced-motion:reduce){.edge::after{animation:none}}
+@media(max-width:680px){.flow{grid-template-columns:1fr;gap:18px}.flow li:nth-child(n){grid-column:auto;grid-row:auto}.flow li:nth-child(n) .edge{top:100%;right:auto;left:50%;width:2px;height:18px}.flow li:nth-child(n) .edge::after{top:0;left:-3px;animation-name:down}}
+.note,small{color:#b1c4da}.detail,.research{padding:18px 0;border-bottom:1px solid #314359}.scroller{overflow:auto}table{width:100%;border-collapse:collapse;text-align:left}th,td{padding:6px 10px;border-bottom:1px solid #314359;white-space:nowrap}
+</style>
+<main>
+<header><div><a href="./">← 交易面板</a><h1>策略库</h1></div><a class="link" id="backtest" href="./backtest">打开历史回测 ↗</a></header>
+<nav aria-label="选择策略" id="modes"></nav>
+<section class="board" aria-label="策略信号流程"><ol class="flow" id="flow"></ol></section>
+<section class="detail" aria-live="polite"><h2 id="stage"></h2><p id="explanation"></p></section>
+<section class="research">
+<h2>理论与回测方法</h2>
+<p>趋势跟随研究为用历史价格方向过滤信号提供依据。Moskowitz、Ooi 和 Pedersen 验证的是月尺度动量，盘中突破与回踩仍需用本市场的历史数据检验。<br><a href="https://doi.org/10.1016/j.jfineco.2011.11.003">Time Series Momentum · Journal of Financial Economics</a> · <a href="https://www.aqr.com/insights/research/journal-article/a-century-of-evidence-on-trend-following-investing">AQR 长周期趋势跟随研究</a></p>
+<p>回放按已收盘的 K 线生成信号，以分钟级行情模拟执行。成交模型、手续费和滑点可分别配置。<br><a href="https://www.freqtrade.io/en/latest/lookahead-analysis/">Freqtrade · 未来数据检查</a> · <a href="https://www.quantconnect.com/docs/v2/writing-algorithms/live-trading/trading-and-orders">QuantConnect LEAN · 成交与成本模型</a></p>
+</section>
+<section class="research" id="snapshot">
+<h2>历史回放 · 17 个标的</h2>
+<p class="note">北京时间 2026/10/03 09:00 至 2026/11/01 08:00。每个标的独立使用 10,000 USDT，两边各收 5 bp，计入资金费，滑点为 0。净盈亏为独立结果加总。</p>
+<div class="scroller"><table><thead><tr><th>策略</th><th>标的</th><th>成交笔数</th><th>净盈亏 USDT</th><th>盈利标的</th></tr></thead><tbody><tr><td>5 分钟双向</td><td>17</td><td>722</td><td>-6,407.17</td><td>1</td></tr><tr><td>突破延续研究</td><td>17</td><td>758</td><td>-6,895.25</td><td>1</td></tr><tr><td>15 分钟双向</td><td>17</td><td>1073</td><td>-2,604.30</td><td>4</td></tr><tr><td>1 小时双向</td><td>17</td><td>271</td><td>+2,027.83</td><td>10</td></tr><tr><td>美股双向测试</td><td>11</td><td>833</td><td>-1,074.17</td><td>1</td></tr></tbody></table></div>
+<p>突破延续增加了成交笔数，但该样本的净亏损扩大。</p>
+<details><summary>按标的查看胜率、平均盈亏比和最大回撤</summary>
+<div class="scroller"><table><thead><tr><th>标的</th><th>策略</th><th>笔数</th><th>净盈亏 USDT</th><th>胜率</th><th>平均盈亏比</th><th>最大回撤</th></tr></thead><tbody><tr><td>AMZN</td><td>5 分钟双向</td><td>30</td><td>-170.87</td><td>30.0%</td><td>1.17</td><td>1.89%</td></tr><tr><td>AMZN</td><td>突破延续研究</td><td>32</td><td>-195.84</td><td>28.1%</td><td>1.19</td><td>2.14%</td></tr><tr><td>AMZN</td><td>15 分钟双向</td><td>63</td><td>-129.03</td><td>38.1%</td><td>1.30</td><td>1.54%</td></tr><tr><td>AMZN</td><td>1 小时双向</td><td>11</td><td>-359.86</td><td>18.2%</td><td>1.05</td><td>4.47%</td></tr><tr><td>AMZN</td><td>美股双向测试</td><td>80</td><td>-44.97</td><td>28.7%</td><td>2.08</td><td>1.15%</td></tr><tr><td>BTC</td><td>5 分钟双向</td><td>37</td><td>-443.50</td><td>27.0%</td><td>0.95</td><td>5.06%</td></tr><tr><td>BTC</td><td>突破延续研究</td><td>37</td><td>-385.58</td><td>29.7%</td><td>0.91</td><td>4.52%</td></tr><tr><td>BTC</td><td>15 分钟双向</td><td>71</td><td>-412.77</td><td>36.6%</td><td>0.93</td><td>4.58%</td></tr><tr><td>BTC</td><td>1 小时双向</td><td>17</td><td>-204.89</td><td>47.1%</td><td>0.71</td><td>4.49%</td></tr><tr><td>ETH</td><td>5 分钟双向</td><td>41</td><td>-703.58</td><td>22.0%</td><td>0.95</td><td>7.04%</td></tr><tr><td>ETH</td><td>突破延续研究</td><td>43</td><td>-729.40</td><td>20.9%</td><td>1.02</td><td>7.29%</td></tr><tr><td>ETH</td><td>15 分钟双向</td><td>63</td><td>+17.86</td><td>44.4%</td><td>1.28</td><td>2.36%</td></tr><tr><td>ETH</td><td>1 小时双向</td><td>22</td><td>+25.80</td><td>50.0%</td><td>1.03</td><td>2.61%</td></tr><tr><td>GOOGL</td><td>5 分钟双向</td><td>21</td><td>-144.59</td><td>28.6%</td><td>0.91</td><td>1.93%</td></tr><tr><td>GOOGL</td><td>突破延续研究</td><td>24</td><td>-182.76</td><td>25.0%</td><td>0.93</td><td>2.31%</td></tr><tr><td>GOOGL</td><td>15 分钟双向</td><td>66</td><td>-285.77</td><td>33.3%</td><td>1.24</td><td>3.80%</td></tr><tr><td>GOOGL</td><td>1 小时双向</td><td>15</td><td>-258.11</td><td>46.7%</td><td>0.58</td><td>3.47%</td></tr><tr><td>GOOGL</td><td>美股双向测试</td><td>81</td><td>-188.48</td><td>23.5%</td><td>1.45</td><td>2.21%</td></tr><tr><td>KORU</td><td>5 分钟双向</td><td>41</td><td>-402.27</td><td>29.3%</td><td>1.15</td><td>5.66%</td></tr><tr><td>KORU</td><td>突破延续研究</td><td>43</td><td>-447.63</td><td>27.9%</td><td>1.16</td><td>5.72%</td></tr><tr><td>KORU</td><td>15 分钟双向</td><td>46</td><td>-143.38</td><td>41.3%</td><td>1.15</td><td>2.36%</td></tr><tr><td>KORU</td><td>1 小时双向</td><td>12</td><td>-62.71</td><td>50.0%</td><td>0.84</td><td>2.92%</td></tr><tr><td>KORU</td><td>美股双向测试</td><td>64</td><td>-106.86</td><td>37.5%</td><td>1.21</td><td>1.99%</td></tr><tr><td>META</td><td>5 分钟双向</td><td>21</td><td>-268.33</td><td>19.0%</td><td>0.28</td><td>2.86%</td></tr><tr><td>META</td><td>突破延续研究</td><td>24</td><td>-299.61</td><td>16.7%</td><td>0.29</td><td>3.17%</td></tr><tr><td>META</td><td>15 分钟双向</td><td>58</td><td>-103.15</td><td>39.7%</td><td>1.26</td><td>2.38%</td></tr><tr><td>META</td><td>1 小时双向</td><td>12</td><td>-72.17</td><td>50.0%</td><td>0.81</td><td>3.45%</td></tr><tr><td>META</td><td>美股双向测试</td><td>71</td><td>-59.16</td><td>23.9%</td><td>2.32</td><td>0.87%</td></tr><tr><td>MU</td><td>5 分钟双向</td><td>37</td><td>-166.02</td><td>40.5%</td><td>1.03</td><td>2.48%</td></tr><tr><td>MU</td><td>突破延续研究</td><td>41</td><td>-326.49</td><td>36.6%</td><td>0.94</td><td>4.07%</td></tr><tr><td>MU</td><td>15 分钟双向</td><td>69</td><td>-201.08</td><td>47.8%</td><td>0.86</td><td>3.41%</td></tr><tr><td>MU</td><td>1 小时双向</td><td>16</td><td>+498.20</td><td>56.2%</td><td>1.53</td><td>3.45%</td></tr><tr><td>MU</td><td>美股双向测试</td><td>79</td><td>-90.68</td><td>49.4%</td><td>0.75</td><td>1.48%</td></tr><tr><td>NVDA</td><td>5 分钟双向</td><td>36</td><td>-209.89</td><td>33.3%</td><td>1.17</td><td>3.52%</td></tr><tr><td>NVDA</td><td>突破延续研究</td><td>38</td><td>-246.99</td><td>31.6%</td><td>1.18</td><td>3.68%</td></tr><tr><td>NVDA</td><td>15 分钟双向</td><td>59</td><td>+25.77</td><td>45.8%</td><td>1.25</td><td>2.66%</td></tr><tr><td>NVDA</td><td>1 小时双向</td><td>16</td><td>-178.45</td><td>50.0%</td><td>0.68</td><td>3.27%</td></tr><tr><td>NVDA</td><td>美股双向测试</td><td>78</td><td>-68.33</td><td>37.2%</td><td>1.21</td><td>1.42%</td></tr><tr><td>QQQ</td><td>5 分钟双向</td><td>33</td><td>-138.79</td><td>30.3%</td><td>1.29</td><td>2.24%</td></tr><tr><td>QQQ</td><td>突破延续研究</td><td>34</td><td>-118.73</td><td>35.3%</td><td>1.13</td><td>2.30%</td></tr><tr><td>QQQ</td><td>15 分钟双向</td><td>55</td><td>-332.00</td><td>30.9%</td><td>0.95</td><td>3.61%</td></tr><tr><td>QQQ</td><td>1 小时双向</td><td>10</td><td>+6.13</td><td>50.0%</td><td>1.03</td><td>2.48%</td></tr><tr><td>QQQ</td><td>美股双向测试</td><td>70</td><td>-126.98</td><td>25.7%</td><td>1.22</td><td>1.29%</td></tr><tr><td>SAMSUNG</td><td>5 分钟双向</td><td>69</td><td>-837.39</td><td>23.2%</td><td>1.28</td><td>8.62%</td></tr><tr><td>SAMSUNG</td><td>突破延续研究</td><td>74</td><td>-890.67</td><td>23.0%</td><td>1.29</td><td>9.40%</td></tr><tr><td>SAMSUNG</td><td>15 分钟双向</td><td>57</td><td>+57.37</td><td>47.4%</td><td>1.21</td><td>2.51%</td></tr><tr><td>SAMSUNG</td><td>1 小时双向</td><td>19</td><td>+216.61</td><td>57.9%</td><td>1.01</td><td>2.85%</td></tr><tr><td>SKHYNIX</td><td>5 分钟双向</td><td>81</td><td>-747.70</td><td>34.6%</td><td>0.95</td><td>10.21%</td></tr><tr><td>SKHYNIX</td><td>突破延续研究</td><td>82</td><td>-721.56</td><td>35.4%</td><td>0.96</td><td>9.96%</td></tr><tr><td>SKHYNIX</td><td>15 分钟双向</td><td>75</td><td>-31.09</td><td>46.7%</td><td>1.10</td><td>4.19%</td></tr><tr><td>SKHYNIX</td><td>1 小时双向</td><td>26</td><td>+687.57</td><td>57.7%</td><td>1.42</td><td>2.79%</td></tr><tr><td>SNDK</td><td>5 分钟双向</td><td>52</td><td>-217.39</td><td>38.5%</td><td>1.16</td><td>4.67%</td></tr><tr><td>SNDK</td><td>突破延续研究</td><td>56</td><td>-326.24</td><td>35.7%</td><td>1.14</td><td>5.53%</td></tr><tr><td>SNDK</td><td>15 分钟双向</td><td>72</td><td>-155.61</td><td>43.1%</td><td>1.12</td><td>2.60%</td></tr><tr><td>SNDK</td><td>1 小时双向</td><td>19</td><td>+495.17</td><td>57.9%</td><td>1.38</td><td>1.63%</td></tr><tr><td>SNDK</td><td>美股双向测试</td><td>83</td><td>-149.14</td><td>38.6%</td><td>1.02</td><td>2.03%</td></tr><tr><td>SOL</td><td>5 分钟双向</td><td>64</td><td>-1,014.63</td><td>21.9%</td><td>1.05</td><td>10.56%</td></tr><tr><td>SOL</td><td>突破延续研究</td><td>66</td><td>-1,071.87</td><td>21.2%</td><td>1.05</td><td>11.13%</td></tr><tr><td>SOL</td><td>15 分钟双向</td><td>66</td><td>-183.05</td><td>40.9%</td><td>1.17</td><td>2.91%</td></tr><tr><td>SOL</td><td>1 小时双向</td><td>22</td><td>+343.31</td><td>68.2%</td><td>0.77</td><td>3.01%</td></tr><tr><td>SOXL</td><td>5 分钟双向</td><td>47</td><td>-332.00</td><td>27.7%</td><td>1.53</td><td>4.66%</td></tr><tr><td>SOXL</td><td>突破延续研究</td><td>48</td><td>-352.29</td><td>27.1%</td><td>1.54</td><td>4.86%</td></tr><tr><td>SOXL</td><td>15 分钟双向</td><td>69</td><td>-396.15</td><td>42.0%</td><td>0.92</td><td>5.23%</td></tr><tr><td>SOXL</td><td>1 小时双向</td><td>15</td><td>+97.89</td><td>53.3%</td><td>1.08</td><td>2.76%</td></tr><tr><td>SOXL</td><td>美股双向测试</td><td>79</td><td>-124.53</td><td>39.2%</td><td>1.10</td><td>2.19%</td></tr><tr><td>SPCX</td><td>5 分钟双向</td><td>29</td><td>-119.10</td><td>34.5%</td><td>1.37</td><td>1.94%</td></tr><tr><td>SPCX</td><td>突破延续研究</td><td>31</td><td>-76.70</td><td>38.7%</td><td>1.30</td><td>1.94%</td></tr><tr><td>SPCX</td><td>15 分钟双向</td><td>63</td><td>-156.85</td><td>44.4%</td><td>1.02</td><td>3.44%</td></tr><tr><td>SPCX</td><td>1 小时双向</td><td>12</td><td>+532.60</td><td>66.7%</td><td>1.61</td><td>2.74%</td></tr><tr><td>SPCX</td><td>美股双向测试</td><td>77</td><td>-174.88</td><td>35.1%</td><td>1.11</td><td>2.39%</td></tr><tr><td>TSLA</td><td>5 分钟双向</td><td>33</td><td>+28.25</td><td>42.4%</td><td>1.48</td><td>1.20%</td></tr><tr><td>TSLA</td><td>突破延续研究</td><td>34</td><td>+15.39</td><td>41.2%</td><td>1.50</td><td>1.20%</td></tr><tr><td>TSLA</td><td>15 分钟双向</td><td>56</td><td>+178.14</td><td>50.0%</td><td>1.36</td><td>1.63%</td></tr><tr><td>TSLA</td><td>1 小时双向</td><td>14</td><td>+427.43</td><td>57.1%</td><td>1.74</td><td>1.59%</td></tr><tr><td>TSLA</td><td>美股双向测试</td><td>71</td><td>+59.82</td><td>40.8%</td><td>1.86</td><td>0.79%</td></tr><tr><td>XAU</td><td>5 分钟双向</td><td>50</td><td>-519.39</td><td>28.0%</td><td>0.90</td><td>5.60%</td></tr><tr><td>XAU</td><td>突破延续研究</td><td>51</td><td>-538.28</td><td>27.5%</td><td>0.91</td><td>5.79%</td></tr><tr><td>XAU</td><td>15 分钟双向</td><td>65</td><td>-353.52</td><td>33.8%</td><td>0.92</td><td>4.36%</td></tr><tr><td>XAU</td><td>1 小时双向</td><td>13</td><td>-166.70</td><td>38.5%</td><td>1.00</td><td>3.33%</td></tr></tbody></table></div>
+</details>
+</section>
+</main>
+<script>
+const strategies = {
+  fast: ['5 分钟双向','5m / 15m / 1h','5 分钟突破或回踩，15 分钟须确认趋势。美股另要求 1 小时同向。波动突增时等待突破后的回踩。','5× 杠杆，最多 5 个仓位。按止损距离和交易成本计算风险仓位。','根据结构和波动设置止损。持仓期间复评趋势并调整保护单。'],
+  continuation: ['突破延续研究','5m / 15m / 1h','保留 5 分钟基线。在高波动且无回踩时，新增连续两根 K 线守住突破位且收盘继续推进的机会。','沿用 5 分钟回放的仓位计算。','沿用基线的结构止损和退出规则。'],
+  intraday: ['15 分钟双向','15m / 1h / 4h','15 分钟寻找突破与回踩，1 小时确认方向，4 小时反向时拒绝。','按止损距离、成本和可用保证金计算名义仓位。','跟踪止损并检查最长 4 小时的持仓时间。'],
+  swing: ['1 小时双向','1h / 4h / 1d','1 小时寻找突破与回踩，4 小时确认方向，日线反向时拒绝。','按账户权益、保证金和止损风险计算名义仓位。','跟踪止损并检查最长 48 小时的持仓时间。'],
+  us_open: ['美股双向测试','15m / 1h / 4h','仅美股合约。使用 15 分钟信号、1 小时确认和 4 小时趋势过滤。','按止损距离与手续费估计控制单笔风险。','跟踪止损并检查最长 90 分钟的持仓时间。']
+};
+const titles = ['行情数据','数据处理','入场信号','策略分支','仓位管理','风险控制','交易引擎'];
+const colors = ['#538fff','#3ebcde','#4dc9ba','#f89751','#f0bd58','#f7839f','#9f9aff'];
+const params = new URLSearchParams(location.search);
+let active = Object.hasOwn(strategies,params.get('mode')) ? params.get('mode') : 'fast';
+let selected = 0;
+const byId = id => document.getElementById(id);
+const button = (label, pressed, action) => {
+  const el = document.createElement('button');
+  el.type = 'button'; el.textContent = label; el.setAttribute('aria-pressed',pressed); el.onclick = action;
+  return el;
+};
+function render() {
+  const [name, frames, entry, size, risk] = strategies[active];
+  const mode = active === 'continuation' ? 'fast' : active;
+  byId('backtest').href = './backtest?' + new URLSearchParams({mode,days:'all'});
+  const details = [
+    '币安合约成交 K 线、标记价格与历史资金费。信号周期 ' + frames + '。',
+    '只读取已经收盘的 K 线。回测检查所需周期的预热和连续覆盖，缺口会报告为失败。',
+    entry, name + '。' + (active === 'continuation' ? '仅用于历史回测对照。' : '可在交易面板选用。'),
+    size, risk,
+    active === 'continuation' ? '通过历史回放模拟成交和止盈止损。' : '在币安模拟盘提交委托并核对成交及保护单。'
+  ];
+  byId('modes').replaceChildren(...Object.entries(strategies).map(([key,[label]]) => button(label,key === active,() => {
+    active=key; selected=0;
+    history.replaceState(null,'','?'+new URLSearchParams({mode:active}));
+    render();
+    byId('modes').querySelector('[aria-pressed=true]').focus();
+  })));
+  function show(index) {
+    selected = index;
+    byId('stage').textContent = titles[index];
+    byId('explanation').textContent = details[index];
+    [...byId('flow').querySelectorAll('button')].forEach((el,i) => el.setAttribute('aria-pressed', i === index));
+  }
+  byId('flow').replaceChildren(...titles.map((title,i) => {
+    const li = document.createElement('li');
+    li.style.setProperty('--signal',colors[i]);
+    li.append(button(title,i === selected,() => show(i)));
+    if (i < titles.length-1) {
+      const edge = document.createElement('span'); edge.className='edge'; edge.setAttribute('aria-hidden','true'); li.append(edge);
+    }
+    return li;
+  }));
+  show(selected);
+}
+render();
+</script>
+</html>
