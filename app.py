@@ -2346,7 +2346,7 @@ class DemoStrategy:
         cost_control = short_term
         take_multiple = FAST_TREND_TARGET if fast_trend else 2
         cost_cap = SHORT_COST_CAP if cost_control else Decimal('.75')
-        scan_interval = {'scalp': 5, 'fast': 3}.get(mode, 30)
+        scan_interval = {'scalp': 5, 'fast': 10}.get(mode, 30)
         cooldown_bars = 1 if mode == 'scalp' else SHORT_REENTRY_COOLDOWN_BARS
         cooldown_ms = cooldown_bars * STRATEGY_INTERVALS[mode]
         reentry_at = {}
