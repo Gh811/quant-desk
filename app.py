@@ -36,7 +36,6 @@ from decimal import Decimal
 
 
 US_EQUITY_ASSETS = set('SNDK SOXL KORU MU NVDA QQQ GOOGL SPCX META TSLA AMZN INTC CRCL'.split())
-US_EQUITY_SAME_SIDE_LIMIT = 2
 HOUR = 3600000
 
 
@@ -484,11 +483,6 @@ def replay_portfolio(mode, markets, start, end, fee, slippage, event_at=None, *,
                 if (mode == 'fast' and asset in FAST_CORRELATED_ASSETS and
                         any(other in FAST_CORRELATED_ASSETS and p['direction'] == direction for other, p in positions.items())):
                     continue
-                if fast_trend and asset in us_assets and sum(
-                        other in us_assets and p['direction'] == direction for other, p in positions.items()
-                ) >= US_EQUITY_SAME_SIDE_LIMIT:
-                    entry_checks['美股同向仓位已满'] += 1
-                    continue
                 opening = Decimal(str(markets[asset][0]['1m'][index][0][1]))
                 entry = opening * (1 + direction*entry_slip)
                 if maker_fee is not None:
@@ -868,16 +862,6 @@ def entry_retry_block(previous, current, cooldown_seconds, *, max_ioc_upgrade=De
     if price == last_price and not upgrade and cost >= last_cost * Decimal('.9'):
         return '同价委托已尝试，等待成交条件改善'
     return None
-
-
-def us_equity_exposure(direction, positions, pending, open_orders, listed):
-    side = entry_side(direction)
-    symbols = {symbol for symbol, position in positions.items() if direction*Decimal(position['positionAmt']) > 0}
-    symbols.update(order['symbol'] for order in pending
-                   if not order.get('reduce_only') and order.get('side') in {None, side})
-    symbols.update(order['symbol'] for order in open_orders
-                   if not order.get('reduceOnly') and order.get('side') == side)
-    return {symbol for symbol in symbols if equity_kind(symbol, listed.get(symbol)) == 'us'}
 
 
 def demo_entry_cost(symbol, direction, funding_window):
@@ -2708,12 +2692,6 @@ class DemoStrategy:
                                     or any(order['symbol'] in peers and not order.get('reduceOnly')
                                            and order.get('side') == same_side for order in open_orders)):
                                 checks[symbol[:-4]] = '跳过 · BTC / ETH / SOL 已有同向持仓或开仓单'
-                                self.checks = checks.copy()
-                                continue
-                        if fast_trend and equity_kind(symbol, item) == 'us':
-                            active = us_equity_exposure(direction, positions, pending, open_orders, listed)
-                            if len(active) >= US_EQUITY_SAME_SIDE_LIMIT:
-                                checks[symbol[:-4]] = f'跳过 · 美股同向持仓或开仓挂单已达 {len(active)} 个'
                                 self.checks = checks.copy()
                                 continue
                         try:
